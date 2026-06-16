@@ -1,0 +1,1246 @@
+package com.librats;
+
+import android.util.Log;
+
+/**
+ * LibRats Android client wrapper providing peer-to-peer networking capabilities.
+ * 
+ * This class provides a Java interface to the native LibRats C library,
+ * enabling Android applications to participate in peer-to-peer networks
+ * with features like direct connections, NAT traversal, encryption, 
+ * file transfer, and service discovery.
+ */
+public class RatsClient {
+    private static final String TAG = "RatsClient";
+    
+    static {
+        try {
+            System.loadLibrary("rats_jni");
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "Failed to load native library", e);
+            throw e;
+        }
+    }
+    
+    private long nativeClientPtr = 0;
+    
+    // Error codes
+    public static final int SUCCESS = 0;
+    public static final int ERROR_INVALID_HANDLE = -1;
+    public static final int ERROR_INVALID_PARAMETER = -2;
+    public static final int ERROR_NOT_RUNNING = -3;
+    public static final int ERROR_OPERATION_FAILED = -4;
+    public static final int ERROR_PEER_NOT_FOUND = -5;
+    public static final int ERROR_MEMORY_ALLOCATION = -6;
+    public static final int ERROR_JSON_PARSE = -7;
+    
+    /**
+     * Creates a new RatsClient instance.
+     * 
+     * @param listenPort The port to listen on for incoming connections (0 for automatic)
+     */
+    public RatsClient(int listenPort) {
+        nativeClientPtr = nativeCreate(listenPort);
+        if (nativeClientPtr == 0) {
+            throw new RuntimeException("Failed to create native RatsClient");
+        }
+    }
+    
+    /**
+     * Starts the client and begins listening for connections.
+     * 
+     * @return SUCCESS on success, error code on failure
+     */
+    public int start() {
+        return nativeStart(nativeClientPtr);
+    }
+    
+    /**
+     * Stops the client and closes all connections.
+     */
+    public void stop() {
+        if (nativeClientPtr != 0) {
+            nativeStop(nativeClientPtr);
+        }
+    }
+    
+    /**
+     * Destroys the client and releases all resources.
+     * This should be called when the client is no longer needed.
+     */
+    public void destroy() {
+        if (nativeClientPtr != 0) {
+            nativeDestroy(nativeClientPtr);
+            nativeClientPtr = 0;
+        }
+    }
+    
+    @Override
+    protected void finalize() throws Throwable {
+        destroy();
+        super.finalize();
+    }
+    
+    /**
+     * Connects to a peer.
+     * 
+     * @param host The hostname or IP address of the peer
+     * @param port The port number of the peer
+     * @return 1 on success, 0 on failure
+     */
+    public int connect(String host, int port) {
+        return nativeConnect(nativeClientPtr, host, port);
+    }
+    
+    /**
+     * Sends a string message to a specific peer.
+     * 
+     * @param peerId The ID of the target peer
+     * @param message The message to send
+     * @return SUCCESS on success, error code on failure
+     */
+    public int sendString(String peerId, String message) {
+        return nativeSendString(nativeClientPtr, peerId, message);
+    }
+    
+    /**
+     * Broadcasts a string message to all connected peers.
+     * 
+     * @param message The message to broadcast
+     * @return Number of peers the message was sent to
+     */
+    public int broadcastString(String message) {
+        return nativeBroadcastString(nativeClientPtr, message);
+    }
+    
+    /**
+     * Sends binary data to a specific peer.
+     * 
+     * @param peerId The ID of the target peer
+     * @param data The binary data to send
+     * @return SUCCESS on success, error code on failure
+     */
+    public int sendBinary(String peerId, byte[] data) {
+        return nativeSendBinary(nativeClientPtr, peerId, data);
+    }
+    
+    /**
+     * Broadcasts binary data to all connected peers.
+     * 
+     * @param data The binary data to broadcast
+     * @return Number of peers the data was sent to
+     */
+    public int broadcastBinary(byte[] data) {
+        return nativeBroadcastBinary(nativeClientPtr, data);
+    }
+    
+    /**
+     * Sends a JSON message to a specific peer.
+     * 
+     * @param peerId The ID of the target peer
+     * @param jsonStr The JSON string to send
+     * @return SUCCESS on success, error code on failure
+     */
+    public int sendJson(String peerId, String jsonStr) {
+        return nativeSendJson(nativeClientPtr, peerId, jsonStr);
+    }
+    
+    /**
+     * Broadcasts a JSON message to all connected peers.
+     * 
+     * @param jsonStr The JSON string to broadcast
+     * @return Number of peers the message was sent to
+     */
+    public int broadcastJson(String jsonStr) {
+        return nativeBroadcastJson(nativeClientPtr, jsonStr);
+    }
+    
+    /**
+     * Gets the number of currently connected peers.
+     * 
+     * @return The number of connected peers
+     */
+    public int getPeerCount() {
+        return nativeGetPeerCount(nativeClientPtr);
+    }
+    
+    /**
+     * Gets the port this client is listening on.
+     * 
+     * @return The listen port number
+     */
+    public int getListenPort() {
+        return nativeGetListenPort(nativeClientPtr);
+    }
+    
+    /**
+     * Gets this client's peer ID.
+     * 
+     * @return The peer ID string
+     */
+    public String getOurPeerId() {
+        return nativeGetOurPeerId(nativeClientPtr);
+    }
+    
+    /**
+     * Gets connection statistics as a JSON string.
+     * 
+     * @return JSON string containing connection statistics
+     */
+    public String getConnectionStatisticsJson() {
+        return nativeGetConnectionStatisticsJson(nativeClientPtr);
+    }
+    
+    /**
+     * Gets the IDs of all connected peers.
+     * 
+     * @return Array of peer ID strings
+     */
+    public String[] getPeerIds() {
+        return nativeGetPeerIds(nativeClientPtr);
+    }
+    
+    /**
+     * Enables or disables encryption for this client.
+     * 
+     * @param enabled true to enable encryption, false to disable
+     * @return SUCCESS on success, error code on failure
+     */
+    public int setEncryptionEnabled(boolean enabled) {
+        return nativeSetEncryptionEnabled(nativeClientPtr, enabled);
+    }
+    
+    /**
+     * Checks if encryption is enabled for this client.
+     * 
+     * @return true if encryption is enabled, false otherwise
+     */
+    public boolean isEncryptionEnabled() {
+        return nativeIsEncryptionEnabled(nativeClientPtr);
+    }
+    
+    
+    /**
+     * Starts DHT discovery on the specified port.
+     * 
+     * @param dhtPort The port to use for DHT discovery
+     * @return SUCCESS on success, error code on failure
+     */
+    public int startDhtDiscovery(int dhtPort) {
+        return nativeStartDhtDiscovery(nativeClientPtr, dhtPort);
+    }
+    
+    /**
+     * Stops DHT discovery.
+     */
+    public void stopDhtDiscovery() {
+        nativeStopDhtDiscovery(nativeClientPtr);
+    }
+    
+    /**
+     * Checks if DHT discovery is running.
+     * 
+     * @return true if DHT is running, false otherwise
+     */
+    public boolean isDhtRunning() {
+        return nativeIsDhtRunning(nativeClientPtr);
+    }
+    
+    /**
+     * Starts mDNS discovery with the specified service name.
+     * 
+     * @param serviceName The service name to advertise/discover
+     * @return SUCCESS on success, error code on failure
+     */
+    public int startMdnsDiscovery(String serviceName) {
+        return nativeStartMdnsDiscovery(nativeClientPtr, serviceName);
+    }
+    
+    /**
+     * Stops mDNS discovery.
+     */
+    public void stopMdnsDiscovery() {
+        nativeStopMdnsDiscovery(nativeClientPtr);
+    }
+    
+    /**
+     * Checks if mDNS discovery is running.
+     * 
+     * @return true if mDNS is running, false otherwise
+     */
+    public boolean isMdnsRunning() {
+        return nativeIsMdnsRunning(nativeClientPtr);
+    }
+    
+    /**
+     * Sends a file to a peer.
+     * 
+     * @param peerId The ID of the target peer
+     * @param filePath The local path of the file to send
+     * @param remoteFilename The filename as it should appear on the remote peer
+     * @return The transfer ID on success, null on failure
+     */
+    public String sendFile(String peerId, String filePath, String remoteFilename) {
+        return nativeSendFile(nativeClientPtr, peerId, filePath, remoteFilename);
+    }
+    
+    /**
+     * Accepts an incoming file transfer.
+     * 
+     * @param transferId The transfer ID of the incoming file
+     * @param localPath The local path where the file should be saved
+     * @return SUCCESS on success, error code on failure
+     */
+    public int acceptFileTransfer(String transferId, String localPath) {
+        return nativeAcceptFileTransfer(nativeClientPtr, transferId, localPath);
+    }
+    
+    /**
+     * Rejects an incoming file transfer.
+     * 
+     * @param transferId The transfer ID of the incoming file
+     * @param reason The reason for rejection
+     * @return SUCCESS on success, error code on failure
+     */
+    public int rejectFileTransfer(String transferId, String reason) {
+        return nativeRejectFileTransfer(nativeClientPtr, transferId, reason);
+    }
+
+    // ===================== GOSSIPSUB FUNCTIONALITY =====================
+    
+    /**
+     * Checks if GossipSub is available.
+     * 
+     * @return true if GossipSub is available, false otherwise
+     */
+    public boolean isGossipsubAvailable() {
+        return nativeIsGossipsubAvailable(nativeClientPtr);
+    }
+    
+    /**
+     * Checks if GossipSub is running.
+     * 
+     * @return true if GossipSub is running, false otherwise
+     */
+    public boolean isGossipsubRunning() {
+        return nativeIsGossipsubRunning(nativeClientPtr);
+    }
+    
+    /**
+     * Subscribes to a GossipSub topic.
+     * 
+     * @param topic The topic name to subscribe to
+     * @return SUCCESS on success, error code on failure
+     */
+    public int subscribeToTopic(String topic) {
+        return nativeSubscribeToTopic(nativeClientPtr, topic);
+    }
+    
+    /**
+     * Unsubscribes from a GossipSub topic.
+     * 
+     * @param topic The topic name to unsubscribe from
+     * @return SUCCESS on success, error code on failure
+     */
+    public int unsubscribeFromTopic(String topic) {
+        return nativeUnsubscribeFromTopic(nativeClientPtr, topic);
+    }
+    
+    /**
+     * Checks if subscribed to a GossipSub topic.
+     * 
+     * @param topic The topic name to check
+     * @return true if subscribed, false otherwise
+     */
+    public boolean isSubscribedToTopic(String topic) {
+        return nativeIsSubscribedToTopic(nativeClientPtr, topic);
+    }
+    
+    /**
+     * Gets all subscribed topics.
+     * 
+     * @return Array of subscribed topic names
+     */
+    public String[] getSubscribedTopics() {
+        return nativeGetSubscribedTopics(nativeClientPtr);
+    }
+    
+    /**
+     * Publishes a message to a GossipSub topic.
+     * 
+     * @param topic The topic to publish to
+     * @param message The message to publish
+     * @return SUCCESS on success, error code on failure
+     */
+    public int publishToTopic(String topic, String message) {
+        return nativePublishToTopic(nativeClientPtr, topic, message);
+    }
+    
+    /**
+     * Publishes a JSON message to a GossipSub topic.
+     * 
+     * @param topic The topic to publish to
+     * @param jsonStr The JSON message to publish
+     * @return SUCCESS on success, error code on failure
+     */
+    public int publishJsonToTopic(String topic, String jsonStr) {
+        return nativePublishJsonToTopic(nativeClientPtr, topic, jsonStr);
+    }
+    
+    /**
+     * Gets peers subscribed to a topic.
+     * 
+     * @param topic The topic name
+     * @return Array of peer IDs subscribed to the topic
+     */
+    public String[] getTopicPeers(String topic) {
+        return nativeGetTopicPeers(nativeClientPtr, topic);
+    }
+    
+    /**
+     * Gets mesh peers for a topic.
+     * 
+     * @param topic The topic name
+     * @return Array of peer IDs in the topic mesh
+     */
+    public String[] getTopicMeshPeers(String topic) {
+        return nativeGetTopicMeshPeers(nativeClientPtr, topic);
+    }
+    
+    /**
+     * Gets GossipSub statistics as JSON.
+     * 
+     * @return JSON string containing GossipSub statistics
+     */
+    public String getGossipsubStatisticsJson() {
+        return nativeGetGossipsubStatisticsJson(nativeClientPtr);
+    }
+    
+    // ===================== NAT TRAVERSAL AND STUN =====================
+    
+    /**
+     * Discovers public IP using STUN and adds it to the ignore list.
+     * 
+     * @param stunServer STUN server hostname (null for default)
+     * @param stunPort STUN server port (0 for default)
+     * @return SUCCESS on success, error code on failure
+     */
+    public int discoverAndIgnorePublicIp(String stunServer, int stunPort) {
+        return nativeDiscoverAndIgnorePublicIp(nativeClientPtr, stunServer, stunPort);
+    }
+    
+    /**
+     * Gets the discovered public IP address.
+     * 
+     * @return The public IP address or null if not discovered
+     */
+    public String getPublicIp() {
+        return nativeGetPublicIp(nativeClientPtr);
+    }
+    
+    /**
+     * Detects NAT type.
+     * 
+     * @return NAT type as integer value
+     */
+    public int detectNatType() {
+        return nativeDetectNatType(nativeClientPtr);
+    }
+    
+    /**
+     * Gets NAT characteristics as JSON.
+     * 
+     * @return JSON string containing NAT characteristics
+     */
+    public String getNatCharacteristicsJson() {
+        return nativeGetNatCharacteristicsJson(nativeClientPtr);
+    }
+    
+    /**
+     * Adds an IP address to the ignore list.
+     * 
+     * @param ipAddress IP address to ignore
+     */
+    public void addIgnoredAddress(String ipAddress) {
+        nativeAddIgnoredAddress(nativeClientPtr, ipAddress);
+    }
+    
+    /**
+     * Gets NAT traversal statistics as JSON.
+     * 
+     * @return JSON string containing NAT traversal statistics
+     */
+    public String getNatTraversalStatisticsJson() {
+        return nativeGetNatTraversalStatisticsJson(nativeClientPtr);
+    }
+    
+    // ===================== ICE (NAT TRAVERSAL) API =====================
+    
+    // ICE connection states
+    public static final int ICE_STATE_NEW = 0;
+    public static final int ICE_STATE_GATHERING = 1;
+    public static final int ICE_STATE_CHECKING = 2;
+    public static final int ICE_STATE_CONNECTED = 3;
+    public static final int ICE_STATE_COMPLETED = 4;
+    public static final int ICE_STATE_FAILED = 5;
+    public static final int ICE_STATE_DISCONNECTED = 6;
+    public static final int ICE_STATE_CLOSED = 7;
+    
+    // ICE gathering states
+    public static final int ICE_GATHERING_NEW = 0;
+    public static final int ICE_GATHERING_GATHERING = 1;
+    public static final int ICE_GATHERING_COMPLETE = 2;
+    
+    /**
+     * Checks if ICE is available.
+     * 
+     * @return true if ICE is available, false otherwise
+     */
+    public boolean isIceAvailable() {
+        return nativeIsIceAvailable(nativeClientPtr);
+    }
+    
+    /**
+     * Adds a STUN server for NAT traversal.
+     * 
+     * @param host STUN server hostname or IP
+     * @param port STUN server port (default: 3478)
+     */
+    public void addStunServer(String host, int port) {
+        nativeAddStunServer(nativeClientPtr, host, port);
+    }
+    
+    /**
+     * Adds a TURN server for relay-based NAT traversal.
+     * 
+     * @param host TURN server hostname or IP
+     * @param port TURN server port
+     * @param username TURN username
+     * @param password TURN password
+     */
+    public void addTurnServer(String host, int port, String username, String password) {
+        nativeAddTurnServer(nativeClientPtr, host, port, username, password);
+    }
+    
+    /**
+     * Clears all ICE (STUN/TURN) servers.
+     */
+    public void clearIceServers() {
+        nativeClearIceServers(nativeClientPtr);
+    }
+    
+    /**
+     * Starts gathering ICE candidates.
+     * 
+     * @return true if gathering started successfully
+     */
+    public boolean gatherIceCandidates() {
+        return nativeGatherIceCandidates(nativeClientPtr);
+    }
+    
+    /**
+     * Gets local ICE candidates as JSON string.
+     * 
+     * @return JSON array of ICE candidates
+     */
+    public String getIceCandidatesJson() {
+        return nativeGetIceCandidatesJson(nativeClientPtr);
+    }
+    
+    /**
+     * Checks if ICE candidate gathering is complete.
+     * 
+     * @return true if gathering is complete
+     */
+    public boolean isIceGatheringComplete() {
+        return nativeIsIceGatheringComplete(nativeClientPtr);
+    }
+    
+    /**
+     * Gets the public address discovered via STUN.
+     * 
+     * @return "ip:port" string or null if not discovered
+     */
+    public String getIcePublicAddress() {
+        return nativeGetIcePublicAddress(nativeClientPtr);
+    }
+    
+    /**
+     * Performs a simple STUN binding request to discover public address.
+     * 
+     * @param stunServer STUN server hostname (null for default)
+     * @param port STUN server port (0 for default)
+     * @param timeoutMs Timeout in milliseconds
+     * @return "ip:port" string or null on failure
+     */
+    public String discoverPublicAddress(String stunServer, int port, int timeoutMs) {
+        return nativeDiscoverPublicAddress(nativeClientPtr, stunServer, port, timeoutMs);
+    }
+    
+    /**
+     * Adds a remote ICE candidate from SDP.
+     * 
+     * @param candidateSdp Candidate as SDP attribute string
+     */
+    public void addRemoteIceCandidate(String candidateSdp) {
+        nativeAddRemoteIceCandidate(nativeClientPtr, candidateSdp);
+    }
+    
+    /**
+     * Adds remote ICE candidates from SDP attribute lines.
+     * 
+     * @param sdpLines Array of SDP candidate lines
+     */
+    public void addRemoteIceCandidatesFromSdp(String[] sdpLines) {
+        nativeAddRemoteIceCandidatesFromSdp(nativeClientPtr, sdpLines);
+    }
+    
+    /**
+     * Signals end of remote ICE candidates (trickle ICE complete).
+     */
+    public void endOfRemoteIceCandidates() {
+        nativeEndOfRemoteIceCandidates(nativeClientPtr);
+    }
+    
+    /**
+     * Starts ICE connectivity checks.
+     */
+    public void startIceChecks() {
+        nativeStartIceChecks(nativeClientPtr);
+    }
+    
+    /**
+     * Gets current ICE connection state.
+     * 
+     * @return ICE connection state constant
+     */
+    public int getIceConnectionState() {
+        return nativeGetIceConnectionState(nativeClientPtr);
+    }
+    
+    /**
+     * Gets ICE gathering state.
+     * 
+     * @return ICE gathering state constant
+     */
+    public int getIceGatheringState() {
+        return nativeGetIceGatheringState(nativeClientPtr);
+    }
+    
+    /**
+     * Checks if ICE is connected.
+     * 
+     * @return true if ICE connection is established
+     */
+    public boolean isIceConnected() {
+        return nativeIsIceConnected(nativeClientPtr);
+    }
+    
+    /**
+     * Gets the selected ICE candidate pair as JSON.
+     * 
+     * @return JSON object with local and remote candidates
+     */
+    public String getIceSelectedPairJson() {
+        return nativeGetIceSelectedPairJson(nativeClientPtr);
+    }
+    
+    /**
+     * Closes ICE manager and releases resources.
+     */
+    public void closeIce() {
+        nativeCloseIce(nativeClientPtr);
+    }
+    
+    /**
+     * Restarts ICE (re-gather candidates and restart checks).
+     */
+    public void restartIce() {
+        nativeRestartIce(nativeClientPtr);
+    }
+    
+    // ===================== ENHANCED ENCRYPTION API =====================
+    
+    /**
+     * Initializes encryption system.
+     * 
+     * @param enable Whether to enable encryption
+     * @return SUCCESS on success, error code on failure
+     */
+    public int initializeEncryption(boolean enable) {
+        return nativeInitializeEncryption(nativeClientPtr, enable);
+    }
+    
+    /**
+     * Checks if a specific peer connection is encrypted.
+     * 
+     * @param peerId The peer ID to check
+     * @return true if peer connection is encrypted
+     */
+    public boolean isPeerEncrypted(String peerId) {
+        return nativeIsPeerEncrypted(nativeClientPtr, peerId);
+    }
+    
+    /**
+     * Sets a custom Noise Protocol static keypair.
+     * 
+     * @param privateKeyHex 64-char hex string (32-byte private key)
+     * @return SUCCESS on success, error code on failure
+     */
+    public int setNoiseStaticKeypair(String privateKeyHex) {
+        return nativeSetNoiseStaticKeypair(nativeClientPtr, privateKeyHex);
+    }
+    
+    /**
+     * Gets our Noise Protocol static public key.
+     * 
+     * @return 64-char hex string (32-byte public key) or null
+     */
+    public String getNoiseStaticPublicKey() {
+        return nativeGetNoiseStaticPublicKey(nativeClientPtr);
+    }
+    
+    /**
+     * Gets the remote peer's Noise static public key.
+     * 
+     * @param peerId Peer ID to query
+     * @return 64-char hex string or null if not available
+     */
+    public String getPeerNoisePublicKey(String peerId) {
+        return nativeGetPeerNoisePublicKey(nativeClientPtr, peerId);
+    }
+    
+    /**
+     * Gets the handshake hash for a peer connection (for channel binding).
+     * 
+     * @param peerId Peer ID to query
+     * @return 64-char hex string or null if not available
+     */
+    public String getPeerHandshakeHash(String peerId) {
+        return nativeGetPeerHandshakeHash(nativeClientPtr, peerId);
+    }
+    
+    
+    // ===================== AUTOMATIC DISCOVERY =====================
+    
+    /**
+     * Starts automatic peer discovery.
+     */
+    public void startAutomaticPeerDiscovery() {
+        nativeStartAutomaticPeerDiscovery(nativeClientPtr);
+    }
+    
+    /**
+     * Stops automatic peer discovery.
+     */
+    public void stopAutomaticPeerDiscovery() {
+        nativeStopAutomaticPeerDiscovery(nativeClientPtr);
+    }
+    
+    /**
+     * Checks if automatic discovery is running.
+     * 
+     * @return true if automatic discovery is running, false otherwise
+     */
+    public boolean isAutomaticDiscoveryRunning() {
+        return nativeIsAutomaticDiscoveryRunning(nativeClientPtr);
+    }
+    
+    /**
+     * Gets the discovery hash for current protocol configuration.
+     * 
+     * @return Discovery hash string
+     */
+    public String getDiscoveryHash() {
+        return nativeGetDiscoveryHash(nativeClientPtr);
+    }
+    
+    /**
+     * Gets the well-known RATS peer discovery hash.
+     * 
+     * @return Standard RATS discovery hash
+     */
+    public static String getRatsPeerDiscoveryHash() {
+        return nativeGetRatsPeerDiscoveryHash();
+    }
+    
+    // ===================== ADVANCED LOGGING API =====================
+    
+    /**
+     * Sets the log file path.
+     * 
+     * @param filePath Path to the log file
+     */
+    public void setLogFilePath(String filePath) {
+        nativeSetLogFilePath(nativeClientPtr, filePath);
+    }
+    
+    /**
+     * Gets the current log file path.
+     * 
+     * @return Current log file path
+     */
+    public String getLogFilePath() {
+        return nativeGetLogFilePath(nativeClientPtr);
+    }
+    
+    /**
+     * Enables or disables colored log output.
+     * 
+     * @param enabled true to enable colors, false to disable
+     */
+    public void setLogColorsEnabled(boolean enabled) {
+        nativeSetLogColorsEnabled(nativeClientPtr, enabled);
+    }
+    
+    /**
+     * Checks if colored log output is enabled.
+     * 
+     * @return true if colors are enabled, false otherwise
+     */
+    public boolean isLogColorsEnabled() {
+        return nativeIsLogColorsEnabled(nativeClientPtr);
+    }
+    
+    /**
+     * Enables or disables timestamps in log output.
+     * 
+     * @param enabled true to enable timestamps, false to disable
+     */
+    public void setLogTimestampsEnabled(boolean enabled) {
+        nativeSetLogTimestampsEnabled(nativeClientPtr, enabled);
+    }
+    
+    /**
+     * Checks if timestamps are enabled in log output.
+     * 
+     * @return true if timestamps are enabled, false otherwise
+     */
+    public boolean isLogTimestampsEnabled() {
+        return nativeIsLogTimestampsEnabled(nativeClientPtr);
+    }
+    
+    /**
+     * Sets log file rotation size.
+     * 
+     * @param maxSizeBytes Maximum size in bytes before log rotation
+     */
+    public void setLogRotationSize(long maxSizeBytes) {
+        nativeSetLogRotationSize(nativeClientPtr, maxSizeBytes);
+    }
+    
+    /**
+     * Sets the number of log files to retain during rotation.
+     * 
+     * @param count Number of old log files to keep
+     */
+    public void setLogRetentionCount(int count) {
+        nativeSetLogRetentionCount(nativeClientPtr, count);
+    }
+    
+    /**
+     * Clears/resets the current log file.
+     */
+    public void clearLogFile() {
+        nativeClearLogFile(nativeClientPtr);
+    }
+    
+    // ===================== CONFIGURATION PERSISTENCE =====================
+    
+    /**
+     * Loads configuration from files.
+     * 
+     * @return SUCCESS on success, error code on failure
+     */
+    public int loadConfiguration() {
+        return nativeLoadConfiguration(nativeClientPtr);
+    }
+    
+    /**
+     * Saves configuration to files.
+     * 
+     * @return SUCCESS on success, error code on failure
+     */
+    public int saveConfiguration() {
+        return nativeSaveConfiguration(nativeClientPtr);
+    }
+    
+    /**
+     * Sets the directory where data files will be stored.
+     * 
+     * @param directoryPath Path to directory
+     * @return SUCCESS on success, error code on failure
+     */
+    public int setDataDirectory(String directoryPath) {
+        return nativeSetDataDirectory(nativeClientPtr, directoryPath);
+    }
+    
+    /**
+     * Gets the current data directory path.
+     * 
+     * @return Current data directory path
+     */
+    public String getDataDirectory() {
+        return nativeGetDataDirectory(nativeClientPtr);
+    }
+    
+    /**
+     * Loads saved peers and attempts to reconnect.
+     * 
+     * @return Number of connection attempts made
+     */
+    public int loadAndReconnectPeers() {
+        return nativeLoadAndReconnectPeers(nativeClientPtr);
+    }
+    
+    /**
+     * Loads historical peers from a file.
+     * 
+     * @return true if successful, false otherwise
+     */
+    public boolean loadHistoricalPeers() {
+        return nativeLoadHistoricalPeers(nativeClientPtr);
+    }
+    
+    /**
+     * Saves current peers to a historical file.
+     * 
+     * @return true if successful, false otherwise
+     */
+    public boolean saveHistoricalPeers() {
+        return nativeSaveHistoricalPeers(nativeClientPtr);
+    }
+    
+    /**
+     * Clears all historical peers.
+     */
+    public void clearHistoricalPeers() {
+        nativeClearHistoricalPeers(nativeClientPtr);
+    }
+    
+    /**
+     * Gets all historical peer IDs.
+     * 
+     * @return Array of historical peer ID strings
+     */
+    public String[] getHistoricalPeerIds() {
+        return nativeGetHistoricalPeerIds(nativeClientPtr);
+    }
+    
+    // ===================== ADVANCED FILE TRANSFER =====================
+    
+    /**
+     * Sends an entire directory to a peer. Directory transfers are always recursive.
+     * Use {@link #acceptFileTransfer} / {@link #rejectFileTransfer} on the receiving
+     * side to handle the incoming offer.
+     *
+     * @param peerId Target peer ID
+     * @param directoryPath Local directory path to send
+     * @param remoteDirectoryName Optional remote directory name
+     * @return Transfer ID on success, null on failure
+     */
+    public String sendDirectory(String peerId, String directoryPath, String remoteDirectoryName) {
+        return nativeSendDirectory(nativeClientPtr, peerId, directoryPath, remoteDirectoryName);
+    }
+
+    /**
+     * Pauses an active file transfer.
+     * 
+     * @param transferId Transfer to pause
+     * @return SUCCESS on success, error code on failure
+     */
+    public int pauseFileTransfer(String transferId) {
+        return nativePauseFileTransfer(nativeClientPtr, transferId);
+    }
+    
+    /**
+     * Resumes a paused file transfer.
+     * 
+     * @param transferId Transfer to resume
+     * @return SUCCESS on success, error code on failure
+     */
+    public int resumeFileTransfer(String transferId) {
+        return nativeResumeFileTransfer(nativeClientPtr, transferId);
+    }
+    
+    /**
+     * Gets file transfer progress information as JSON.
+     * 
+     * @param transferId Transfer to query
+     * @return Progress information as JSON or null if not found
+     */
+    public String getFileTransferProgressJson(String transferId) {
+        return nativeGetFileTransferProgressJson(nativeClientPtr, transferId);
+    }
+    
+    /**
+     * Gets file transfer statistics as JSON.
+     * 
+     * @return JSON string containing transfer statistics
+     */
+    public String getFileTransferStatisticsJson() {
+        return nativeGetFileTransferStatisticsJson(nativeClientPtr);
+    }
+    
+    /**
+     * Gets all validated peer IDs.
+     * 
+     * @return Array of validated peer ID strings
+     */
+    public String[] getValidatedPeerIds() {
+        return nativeGetValidatedPeerIds(nativeClientPtr);
+    }
+    
+    // Callback setters
+    public void setConnectionCallback(ConnectionCallback callback) {
+        nativeSetConnectionCallback(nativeClientPtr, callback);
+    }
+    
+    public void setStringCallback(StringMessageCallback callback) {
+        nativeSetStringCallback(nativeClientPtr, callback);
+    }
+    
+    public void setBinaryCallback(BinaryMessageCallback callback) {
+        nativeSetBinaryCallback(nativeClientPtr, callback);
+    }
+    
+    public void setJsonCallback(JsonMessageCallback callback) {
+        nativeSetJsonCallback(nativeClientPtr, callback);
+    }
+    
+    public void setDisconnectCallback(DisconnectCallback callback) {
+        nativeSetDisconnectCallback(nativeClientPtr, callback);
+    }
+    
+    // GossipSub callback setters
+    public void setTopicMessageCallback(String topic, TopicMessageCallback callback) {
+        nativeSetTopicMessageCallback(nativeClientPtr, topic, callback);
+    }
+    
+    public void setTopicJsonMessageCallback(String topic, TopicJsonMessageCallback callback) {
+        nativeSetTopicJsonMessageCallback(nativeClientPtr, topic, callback);
+    }
+    
+    public void setTopicPeerJoinedCallback(String topic, TopicPeerJoinedCallback callback) {
+        nativeSetTopicPeerJoinedCallback(nativeClientPtr, topic, callback);
+    }
+    
+    public void setTopicPeerLeftCallback(String topic, TopicPeerLeftCallback callback) {
+        nativeSetTopicPeerLeftCallback(nativeClientPtr, topic, callback);
+    }
+    
+    public void clearTopicCallbacks(String topic) {
+        nativeClearTopicCallbacks(nativeClientPtr, topic);
+    }
+    
+    // File transfer callback setters
+
+    /**
+     * Sets the callback fired for every incoming transfer offer (file or directory).
+     * Respond by calling {@link #acceptFileTransfer} or {@link #rejectFileTransfer}.
+     */
+    public void setFileRequestCallback(FileRequestCallback callback) {
+        nativeSetFileRequestCallback(nativeClientPtr, callback);
+    }
+
+    /**
+     * Sets the callback fired with progress updates for file and directory transfers.
+     */
+    public void setFileProgressCallback(FileProgressCallback callback) {
+        nativeSetFileProgressCallback(nativeClientPtr, callback);
+    }
+    
+    // Static utility methods
+    public static String getVersionString() {
+        return nativeGetVersionString();
+    }
+    
+    public static int[] getVersion() {
+        return nativeGetVersion();
+    }
+    
+    public static String getGitDescribe() {
+        return nativeGetGitDescribe();
+    }
+    
+    public static int getAbi() {
+        return nativeGetAbi();
+    }
+    
+    /**
+     * Enable or disable console logging.
+     * When disabled, log messages will not be printed to stdout/stderr.
+     * File logging (if enabled) will still work.
+     * @param enabled Whether to enable console logging (default: true)
+     */
+    public static void setConsoleLoggingEnabled(boolean enabled) {
+        nativeSetConsoleLoggingEnabled(enabled);
+    }
+    
+    /**
+     * Check if console logging is currently enabled.
+     * @return true if console logging is enabled
+     */
+    public static boolean isConsoleLoggingEnabled() {
+        return nativeIsConsoleLoggingEnabled();
+    }
+    
+    public static void setLoggingEnabled(boolean enabled) {
+        nativeSetLoggingEnabled(enabled);
+    }
+    
+    public static void setLogLevel(String level) {
+        nativeSetLogLevel(level);
+    }
+    
+    // Native method declarations
+    private static native String nativeGetVersionString();
+    private static native int[] nativeGetVersion();
+    private static native String nativeGetGitDescribe();
+    private static native int nativeGetAbi();
+    private static native void nativeSetConsoleLoggingEnabled(boolean enabled);
+    private static native boolean nativeIsConsoleLoggingEnabled();
+    private static native void nativeSetLoggingEnabled(boolean enabled);
+    private static native void nativeSetLogLevel(String level);
+    
+    private native long nativeCreate(int listenPort);
+    private native void nativeDestroy(long clientPtr);
+    private native int nativeStart(long clientPtr);
+    private native void nativeStop(long clientPtr);
+    
+    private native int nativeConnect(long clientPtr, String host, int port);
+    private native int nativeSendString(long clientPtr, String peerId, String message);
+    private native int nativeBroadcastString(long clientPtr, String message);
+    private native int nativeSendBinary(long clientPtr, String peerId, byte[] data);
+    private native int nativeBroadcastBinary(long clientPtr, byte[] data);
+    private native int nativeSendJson(long clientPtr, String peerId, String jsonStr);
+    private native int nativeBroadcastJson(long clientPtr, String jsonStr);
+    
+    private native int nativeGetPeerCount(long clientPtr);
+    private native int nativeGetListenPort(long clientPtr);
+    private native String nativeGetOurPeerId(long clientPtr);
+    private native String nativeGetConnectionStatisticsJson(long clientPtr);
+    private native String[] nativeGetPeerIds(long clientPtr);
+    
+    private native int nativeSetEncryptionEnabled(long clientPtr, boolean enabled);
+    private native boolean nativeIsEncryptionEnabled(long clientPtr);
+    
+    private native int nativeStartDhtDiscovery(long clientPtr, int dhtPort);
+    private native void nativeStopDhtDiscovery(long clientPtr);
+    private native boolean nativeIsDhtRunning(long clientPtr);
+    
+    private native int nativeStartMdnsDiscovery(long clientPtr, String serviceName);
+    private native void nativeStopMdnsDiscovery(long clientPtr);
+    private native boolean nativeIsMdnsRunning(long clientPtr);
+    
+    private native String nativeSendFile(long clientPtr, String peerId, String filePath, String remoteFilename);
+    private native int nativeAcceptFileTransfer(long clientPtr, String transferId, String localPath);
+    private native int nativeRejectFileTransfer(long clientPtr, String transferId, String reason);
+    
+    private native void nativeSetConnectionCallback(long clientPtr, ConnectionCallback callback);
+    private native void nativeSetStringCallback(long clientPtr, StringMessageCallback callback);
+    private native void nativeSetBinaryCallback(long clientPtr, BinaryMessageCallback callback);
+    private native void nativeSetJsonCallback(long clientPtr, JsonMessageCallback callback);
+    private native void nativeSetDisconnectCallback(long clientPtr, DisconnectCallback callback);
+    
+    // GossipSub native methods
+    private native boolean nativeIsGossipsubAvailable(long clientPtr);
+    private native boolean nativeIsGossipsubRunning(long clientPtr);
+    private native int nativeSubscribeToTopic(long clientPtr, String topic);
+    private native int nativeUnsubscribeFromTopic(long clientPtr, String topic);
+    private native boolean nativeIsSubscribedToTopic(long clientPtr, String topic);
+    private native String[] nativeGetSubscribedTopics(long clientPtr);
+    private native int nativePublishToTopic(long clientPtr, String topic, String message);
+    private native int nativePublishJsonToTopic(long clientPtr, String topic, String jsonStr);
+    private native String[] nativeGetTopicPeers(long clientPtr, String topic);
+    private native String[] nativeGetTopicMeshPeers(long clientPtr, String topic);
+    private native String nativeGetGossipsubStatisticsJson(long clientPtr);
+    
+    // GossipSub callback setters
+    private native void nativeSetTopicMessageCallback(long clientPtr, String topic, TopicMessageCallback callback);
+    private native void nativeSetTopicJsonMessageCallback(long clientPtr, String topic, TopicJsonMessageCallback callback);
+    private native void nativeSetTopicPeerJoinedCallback(long clientPtr, String topic, TopicPeerJoinedCallback callback);
+    private native void nativeSetTopicPeerLeftCallback(long clientPtr, String topic, TopicPeerLeftCallback callback);
+    private native void nativeClearTopicCallbacks(long clientPtr, String topic);
+    
+    // NAT traversal and STUN
+    private native int nativeDiscoverAndIgnorePublicIp(long clientPtr, String stunServer, int stunPort);
+    private native String nativeGetPublicIp(long clientPtr);
+    private native int nativeDetectNatType(long clientPtr);
+    private native String nativeGetNatCharacteristicsJson(long clientPtr);
+    private native void nativeAddIgnoredAddress(long clientPtr, String ipAddress);
+    private native String nativeGetNatTraversalStatisticsJson(long clientPtr);
+    
+    // ICE (NAT Traversal) API
+    private native boolean nativeIsIceAvailable(long clientPtr);
+    private native void nativeAddStunServer(long clientPtr, String host, int port);
+    private native void nativeAddTurnServer(long clientPtr, String host, int port, String username, String password);
+    private native void nativeClearIceServers(long clientPtr);
+    private native boolean nativeGatherIceCandidates(long clientPtr);
+    private native String nativeGetIceCandidatesJson(long clientPtr);
+    private native boolean nativeIsIceGatheringComplete(long clientPtr);
+    private native String nativeGetIcePublicAddress(long clientPtr);
+    private native String nativeDiscoverPublicAddress(long clientPtr, String stunServer, int port, int timeoutMs);
+    private native void nativeAddRemoteIceCandidate(long clientPtr, String candidateSdp);
+    private native void nativeAddRemoteIceCandidatesFromSdp(long clientPtr, String[] sdpLines);
+    private native void nativeEndOfRemoteIceCandidates(long clientPtr);
+    private native void nativeStartIceChecks(long clientPtr);
+    private native int nativeGetIceConnectionState(long clientPtr);
+    private native int nativeGetIceGatheringState(long clientPtr);
+    private native boolean nativeIsIceConnected(long clientPtr);
+    private native String nativeGetIceSelectedPairJson(long clientPtr);
+    private native void nativeCloseIce(long clientPtr);
+    private native void nativeRestartIce(long clientPtr);
+    
+    // Enhanced Encryption API
+    private native int nativeInitializeEncryption(long clientPtr, boolean enable);
+    private native boolean nativeIsPeerEncrypted(long clientPtr, String peerId);
+    private native int nativeSetNoiseStaticKeypair(long clientPtr, String privateKeyHex);
+    private native String nativeGetNoiseStaticPublicKey(long clientPtr);
+    private native String nativeGetPeerNoisePublicKey(long clientPtr, String peerId);
+    private native String nativeGetPeerHandshakeHash(long clientPtr, String peerId);
+    
+    
+    // Automatic discovery
+    private native void nativeStartAutomaticPeerDiscovery(long clientPtr);
+    private native void nativeStopAutomaticPeerDiscovery(long clientPtr);
+    private native boolean nativeIsAutomaticDiscoveryRunning(long clientPtr);
+    private native String nativeGetDiscoveryHash(long clientPtr);
+    private static native String nativeGetRatsPeerDiscoveryHash();
+    
+    // Advanced logging API
+    private native void nativeSetLogFilePath(long clientPtr, String filePath);
+    private native String nativeGetLogFilePath(long clientPtr);
+    private native void nativeSetLogColorsEnabled(long clientPtr, boolean enabled);
+    private native boolean nativeIsLogColorsEnabled(long clientPtr);
+    private native void nativeSetLogTimestampsEnabled(long clientPtr, boolean enabled);
+    private native boolean nativeIsLogTimestampsEnabled(long clientPtr);
+    private native void nativeSetLogRotationSize(long clientPtr, long maxSizeBytes);
+    private native void nativeSetLogRetentionCount(long clientPtr, int count);
+    private native void nativeClearLogFile(long clientPtr);
+    
+    // Configuration persistence
+    private native int nativeLoadConfiguration(long clientPtr);
+    private native int nativeSaveConfiguration(long clientPtr);
+    private native int nativeSetDataDirectory(long clientPtr, String directoryPath);
+    private native String nativeGetDataDirectory(long clientPtr);
+    private native int nativeLoadAndReconnectPeers(long clientPtr);
+    private native boolean nativeLoadHistoricalPeers(long clientPtr);
+    private native boolean nativeSaveHistoricalPeers(long clientPtr);
+    private native void nativeClearHistoricalPeers(long clientPtr);
+    private native String[] nativeGetHistoricalPeerIds(long clientPtr);
+    
+    // Advanced file transfer
+    private native String nativeSendDirectory(long clientPtr, String peerId, String directoryPath, String remoteDirectoryName);
+    private native int nativePauseFileTransfer(long clientPtr, String transferId);
+    private native int nativeResumeFileTransfer(long clientPtr, String transferId);
+    private native String nativeGetFileTransferProgressJson(long clientPtr, String transferId);
+    private native String nativeGetFileTransferStatisticsJson(long clientPtr);
+
+    // File transfer callback setters
+    private native void nativeSetFileRequestCallback(long clientPtr, FileRequestCallback callback);
+    private native void nativeSetFileProgressCallback(long clientPtr, FileProgressCallback callback);
+    
+    // Peer validation info
+    private native String[] nativeGetValidatedPeerIds(long clientPtr);
+}

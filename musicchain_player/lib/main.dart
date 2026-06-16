@@ -1,0 +1,161 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:provider/provider.dart';
+
+import 'src/ffi/native_library.dart';
+import 'src/providers/player_provider.dart';
+import 'src/providers/wallet_provider.dart';
+import 'src/providers/library_provider.dart';
+import 'src/providers/download_provider.dart';
+import 'src/services/librats_discovery.dart';
+import 'src/services/rats_client.dart';
+import 'src/services/player_server.dart';
+import 'src/services/swarm_registry.dart';
+import 'src/services/audio_stream_proxy.dart';
+import 'src/services/library_service.dart';
+import 'src/services/library_scanner.dart';
+import 'src/services/background_scanner.dart';
+import 'src/services/wallet_service.dart';
+import 'src/services/offline_play_log/heartbeat_capture.dart';
+import 'src/services/offline_play_log/network_transition_watcher.dart';
+import 'src/services/offline_play_log/sensor_capture.dart';
+import 'src/services/offline_play_log/offline_submit_service.dart';
+import 'src/screens/home_screen.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  MediaKit.ensureInitialized();
+
+  // Initialize native library
+  await NativeLibrary.initialize();
+
+  // Bring up the librats client — connects to the VPS rendezvous so this
+  // player joins the mesh and can stream to/from other players' libraries.
+  // Failures here are non-fatal (offline mode still shows the local library)
+  // so we just log and continue.
+  // Warm up the local library so the My Library tab can render its
+  // folder list / entries on first frame even if the rats stack later
+  // fails to come up.
+  try {
+    await LibraryService.instance.ensureLoaded();
+  } catch (e) {
+    // ignore: avoid_print
+    print('[library] init failed: $e');
+  }
+
+  try {
+    final rats = await RatsClient.initialize();
+    // ignore: avoid_print
+    print('[rats] connected; own_peer_id=${rats.ownPeerId} '
+          'public=${rats.publicAddress}');
+
+    // Hook the player-side server for incoming stream.open / library.list
+    // requests from other peers.
+    await PlayerServer.initialize();
+
+    // Offline play-proof bundle pipeline. See
+    // docs/offline_play_proof.md for the threat model + wire format.
+    // We bring up the capture layer here so HeartbeatService can mirror
+    // every beat into the persistent log, then the transition watcher
+    // and sensor capture, then the submitter (which holds its own
+    // wallet handle so it can sign bundles independent of the UI's
+    // WalletProvider lifecycle).
+    try {
+      await HeartbeatCapture.instance.init();
+      await NetworkTransitionWatcher.instance.start();
+      await SensorCapture.instance.start();
+      // Submit service signs with the player's wallet. We instantiate a
+      // dedicated WalletService and kick its keychain-cached auto-load
+      // so the signing key is ready by the time the first bundle ticks.
+      final submitWallet = WalletService();
+      unawaited(submitWallet.tryAutoLoad());
+      await OfflineSubmitService.instance.start(wallet: submitWallet);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[offline-play-log] init failed: $e');
+    }
+
+    // Spin up the SwarmRegistry: tracks the local-library content hashes
+    // we hold, announces each to the librats DHT, and resolves DHT
+    // queries so PieceDownloader can find peer sources without going
+    // through the VPS swarm-locate fallback.
+    await SwarmRegistry.initialize();
+
+    // Pre-bind the loopback HTTP proxy that bridges swarm streams into
+    // media_kit. Doing it now avoids paying the HttpServer.bind cost on
+    // the first Play tap.
+    await AudioStreamProxy.instance.ensureStarted();
+
+    // When the VPS handshake is re-established (after a VPS or full-node
+    // restart), re-submit our library so the full node's in-memory swarm
+    // map gets repopulated. Without this, other players asking the home
+    // node "who has X?" get an empty list and the song appears unfetchable.
+    rats.onVpsReconnected = () {
+      // ignore: avoid_print
+      print('[rats] VPS reconnected — re-announcing library to full node');
+      unawaited(LibraryScanner.instance.reAnnounce());
+    };
+  } catch (e) {
+    // ignore: avoid_print
+    print('[rats] init failed: $e');
+  }
+
+  // Background scanning currently only has an Android workmanager backend.
+  // On other platforms the package throws UnimplementedError; we'd just
+  // crash startup if we let that propagate.
+  if (Platform.isAndroid) {
+    try {
+      await BackgroundScanner.initialize();
+    } catch (e) {
+      // ignore: avoid_print
+      print('[bgscan] init failed: $e');
+    }
+  }
+
+  runApp(const MusicChainApp());
+}
+
+class MusicChainApp extends StatelessWidget {
+  const MusicChainApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => WalletProvider()),
+        ChangeNotifierProvider(create: (_) => LibraryProvider()),
+        ChangeNotifierProvider(create: (_) => PlayerProvider()),
+        ChangeNotifierProvider.value(value: LibraryService.instance),
+        ChangeNotifierProvider.value(value: DownloadProvider.instance),
+        ChangeNotifierProvider(create: (_) {
+          final disc = LibratsDiscovery();
+          // Whenever the auto-selected full node changes (first discovery
+          // or it cycled to a different node), re-announce our library so
+          // the full node's swarm map picks us back up.
+          disc.onAutoNodeChanged = (nodePid) {
+            // ignore: avoid_print
+            print('[rats] auto-node changed to '
+                  '${nodePid.substring(0, 12)} — re-announcing library');
+            unawaited(LibraryScanner.instance.reAnnounce());
+          };
+          return disc;
+        }),
+      ],
+      child: MaterialApp(
+        title: 'MusicChain',
+        theme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: const Color(0xFF6200EE),
+            brightness: Brightness.dark,
+          ),
+          useMaterial3: true,
+        ),
+        home: const HomeScreen(),
+        debugShowCheckedModeBanner: false,
+      ),
+    );
+  }
+}

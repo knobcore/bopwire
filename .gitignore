@@ -1,0 +1,131 @@
+# --------------------------------------------------------------------
+# Root-level dirs that aren't part of the repo (vendored downloads,
+# scratch trees, prebuilt toolchains). Listed explicitly so the two
+# project dirs (musicchain/, musicchain_player/) include all their
+# files by default — a blanket `*` ignore swallows subdirectory
+# contents even with `!musicchain/` unignores.
+# --------------------------------------------------------------------
+/android-ndk-r27c/
+/android-ndk-r27c-windows.zip
+/chromaprint-1.5.1/
+/chromaprint-1.5.1.tar.gz
+/chromaprint-android-arm64/
+/downloads/
+/dist/
+/kissfft-130/
+/kissfft-130.tar.gz
+/openssl-android/
+/releases/
+/*.zip
+/*.tar.gz
+/*.tgz
+
+# --------------------------------------------------------------------
+# musicchain core (C++): build outputs + vendored vcpkg + runtime state
+# --------------------------------------------------------------------
+musicchain/build/
+musicchain/build-*/
+musicchain/vcpkg_installed/
+musicchain/.cache/
+musicchain/.vs/
+musicchain/.vscode/
+musicchain/data/
+musicchain/blocks/
+musicchain/blockchain.db/
+musicchain/keys/
+musicchain/audio/
+musicchain/*.log
+musicchain/*.err
+musicchain/peers.rats
+musicchain/peers_ever.rats
+musicchain/rats_file_transfers/
+musicchain/CMakeCache.txt
+musicchain/CMakeFiles/
+musicchain/cmake_install.cmake
+musicchain/install_manifest.txt
+musicchain/compile_commands.json
+
+# --------------------------------------------------------------------
+# Vendored deps: keep librats source, drop the patched backup +
+# msh3 (we're back on plain librats per the 2026-06-03 revert).
+# --------------------------------------------------------------------
+musicchain/deps/librats-patched-backup/
+musicchain/deps/msh3/
+
+# Build artifacts inside librats itself
+musicchain/deps/librats/build/
+musicchain/deps/librats/build-*/
+musicchain/deps/librats/CMakeCache.txt
+musicchain/deps/librats/CMakeFiles/
+musicchain/deps/librats/lib/
+musicchain/deps/librats/bin/
+
+# --------------------------------------------------------------------
+# Flutter player: build output, IDE state, Gradle cache, ephemeral
+# --------------------------------------------------------------------
+musicchain_player/build/
+musicchain_player/.dart_tool/
+musicchain_player/.flutter-plugins
+musicchain_player/.flutter-plugins-dependencies
+musicchain_player/.packages
+musicchain_player/.pub-cache/
+musicchain_player/.pub/
+musicchain_player/.idea/
+musicchain_player/.vscode/
+
+# Android Gradle
+musicchain_player/android/.gradle/
+musicchain_player/android/build/
+musicchain_player/android/app/build/
+musicchain_player/android/.idea/
+musicchain_player/android/local.properties
+musicchain_player/android/key.properties
+
+# iOS / macOS / Linux / Windows ephemeral
+musicchain_player/ios/Pods/
+musicchain_player/ios/Flutter/.last_build_id
+musicchain_player/ios/Flutter/Generated.xcconfig
+musicchain_player/ios/Flutter/flutter_export_environment.sh
+musicchain_player/macos/Pods/
+musicchain_player/macos/Flutter/ephemeral/
+musicchain_player/linux/flutter/ephemeral/
+musicchain_player/windows/flutter/ephemeral/
+
+# Local runtime data
+musicchain_player/rats_file_transfers/
+musicchain_player/dht_routing_*.json
+musicchain_player/dht_routing.json
+musicchain_player/offline_play_log.db
+musicchain_player/peers.rats
+musicchain_player/peers_ever.rats
+musicchain_player/config.json
+musicchain_player/*.zip
+musicchain_player/*.apk
+
+# Editor / OS scratch
+musicchain_player/*.lock
+
+# --------------------------------------------------------------------
+# Common cross-cutting binary outputs
+# --------------------------------------------------------------------
+**/*.o
+**/*.obj
+**/*.exe
+**/*.dll
+**/*.so
+**/*.so.*
+**/*.dylib
+**/*.lib
+**/*.a
+**/*.pdb
+**/*.exp
+**/*.ilk
+**/*.apk
+**/*.aab
+**/*.aar
+**/*.jar
+**/*.class
+
+# DS_Store / Thumbs
+**/.DS_Store
+**/Thumbs.db

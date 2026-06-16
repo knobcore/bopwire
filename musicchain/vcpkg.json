@@ -1,0 +1,25 @@
+{
+  "name": "musicchain",
+  "version": "0.1.0",
+  "dependencies": [
+    "openssl",
+    {
+      "name": "ffmpeg",
+      "features": ["avcodec", "avformat", "swresample", "swscale"]
+    },
+    "chromaprint",
+    "libogg",
+    "libvorbis",
+    "opus",
+    "opusfile",
+    "leveldb",
+    "libuv",
+    "nlohmann-json",
+    {
+      "name": "curl",
+      "features": ["ssl"]
+    },
+    "miniupnpc",
+    "pdcurses"
+  ]
+}

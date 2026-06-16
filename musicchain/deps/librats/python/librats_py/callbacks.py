@@ -1,0 +1,40 @@
+"""
+Callback type definitions for librats Python bindings.
+"""
+
+from typing import Callable, Optional, Any
+from ctypes import CFUNCTYPE, POINTER, c_void_p, c_char_p, c_int, c_size_t
+
+# C callback function types
+ConnectionCallbackType = CFUNCTYPE(None, c_void_p, c_char_p)
+StringCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_char_p)
+BinaryCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_void_p, c_size_t)
+JsonCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_char_p)
+DisconnectCallbackType = CFUNCTYPE(None, c_void_p, c_char_p)
+PeerDiscoveredCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_int, c_char_p)
+MessageCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_char_p)
+FileProgressCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_int, c_char_p)
+# Incoming transfer offers (file or directory) arrive through this unified type.
+FileRequestCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_char_p, c_char_p, c_char_p)
+TopicMessageCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_char_p, c_char_p)
+TopicJsonMessageCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_char_p, c_char_p)
+TopicPeerJoinedCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_char_p)
+TopicPeerLeftCallbackType = CFUNCTYPE(None, c_void_p, c_char_p, c_char_p)
+PeersFoundCallbackType = CFUNCTYPE(None, c_void_p, POINTER(c_char_p), c_int)
+
+# Python callback type hints
+ConnectionCallback = Optional[Callable[[str], None]]
+StringCallback = Optional[Callable[[str, str], None]]
+BinaryCallback = Optional[Callable[[str, bytes], None]]
+JsonCallback = Optional[Callable[[str, dict], None]]
+DisconnectCallback = Optional[Callable[[str], None]]
+PeerDiscoveredCallback = Optional[Callable[[str, int, str], None]]
+MessageCallback = Optional[Callable[[str, Any], None]]
+FileProgressCallback = Optional[Callable[[str, int, str], None]]
+# (peer_id, transfer_id, remote_path, filename); remote_path is always empty.
+FileRequestCallback = Optional[Callable[[str, str, str, str], None]]
+TopicMessageCallback = Optional[Callable[[str, str, str], None]]
+TopicJsonMessageCallback = Optional[Callable[[str, str, dict], None]]
+TopicPeerJoinedCallback = Optional[Callable[[str, str], None]]
+TopicPeerLeftCallback = Optional[Callable[[str, str], None]]
+PeersFoundCallback = Optional[Callable[[list], None]]
