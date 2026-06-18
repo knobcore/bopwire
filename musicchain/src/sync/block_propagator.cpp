@@ -419,7 +419,19 @@ std::vector<Hash256> BlockPropagator::hashes_after_locator(
         if (hh.has_value()) { fork_height = *hh; found_fork = true; break; }
     }
     std::vector<Hash256> out;
-    if (!found_fork) return out;
+    if (!found_fork) {
+        // Empty locator OR peer has nothing in common with our chain
+        // (the brand-new VPS case — its tip is the zero hash, so
+        // build_locator returns []). Send hashes from height 0
+        // inclusive so the bootstrapping peer gets genesis first.
+        for (uint32_t hi = 0;
+             hi <= tip.height && out.size() < kMaxInvCount;
+             ++hi) {
+            if (auto bh = chain_.get_block_hash(hi)) out.push_back(*bh);
+            else break;
+        }
+        return out;
+    }
     for (uint32_t hi = fork_height + 1;
          hi <= tip.height && out.size() < kMaxInvCount;
          ++hi) {
