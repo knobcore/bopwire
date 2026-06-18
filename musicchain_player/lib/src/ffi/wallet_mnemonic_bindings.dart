@@ -10,25 +10,37 @@
 //
 // Keeping this in a separate file means a future ffigen regeneration
 // of bindings.dart doesn't clobber these or vice versa.
+//
+// Note on the FFI lookup style below: Dart's `lookup<NativeFunction<F>>`
+// requires F to be a concrete, instantiated function type at compile
+// time. A generic helper that takes F as a type parameter trips
+// G1DE28886. So each symbol resolves itself inline with its concrete
+// NativeFunction<...> type.
 
 import 'dart:ffi';
 import 'package:ffi/ffi.dart';
 
 import 'native_library.dart';
 
-typedef _CharRet = Pointer<Utf8> Function();
-typedef _IntFromCharPtr = Int Function(Pointer<Utf8>);
-typedef _DartIntFromCharPtr = int Function(Pointer<Utf8>);
-typedef _WalletFromTwoCharPtrs =
+typedef _CharRetC                = Pointer<Utf8> Function();
+typedef _CharRetDart             = Pointer<Utf8> Function();
+typedef _IntFromCharPtrC         = Int Function(Pointer<Utf8>);
+typedef _IntFromCharPtrDart      = int Function(Pointer<Utf8>);
+typedef _WalletFromTwoCharPtrsC  =
     Pointer<Void> Function(Pointer<Utf8>, Pointer<Utf8>);
-typedef _CharRetFromWalletPtr = Pointer<Utf8> Function(Pointer<Void>);
+typedef _WalletFromTwoCharPtrsDart =
+    Pointer<Void> Function(Pointer<Utf8>, Pointer<Utf8>);
+typedef _CharRetFromWalletPtrC   =
+    Pointer<Utf8> Function(Pointer<Void>);
+typedef _CharRetFromWalletPtrDart =
+    Pointer<Utf8> Function(Pointer<Void>);
 
 class WalletMnemonicBindings {
-  static final _lib = NativeLibrary.bindings;
-
   /// Generate a fresh 12-word BIP39 mnemonic. Caller frees with mc_free.
   static String? bip39Generate12() {
-    final fn = _resolve<_CharRet, _CharRet>('mc_bip39_generate_12');
+    final fn = _lookupSym<_CharRetC, _CharRetDart>(
+        'mc_bip39_generate_12',
+        (ptr) => ptr.asFunction<_CharRetDart>());
     if (fn == null) return null;
     final ptr = fn();
     if (ptr.address == 0) return null;
@@ -39,13 +51,15 @@ class WalletMnemonicBindings {
 
   /// Returns true if the mnemonic passes BIP39 wordlist + checksum.
   static bool bip39Validate(String mnemonic) {
-    final fn = _resolve<_IntFromCharPtr, _DartIntFromCharPtr>('mc_bip39_validate');
+    final fn = _lookupSym<_IntFromCharPtrC, _IntFromCharPtrDart>(
+        'mc_bip39_validate',
+        (ptr) => ptr.asFunction<_IntFromCharPtrDart>());
     if (fn == null) return false;
-    final ptr = mnemonic.toNativeUtf8();
+    final p = mnemonic.toNativeUtf8();
     try {
-      return fn(ptr) == 1;
+      return fn(p) == 1;
     } finally {
-      calloc.free(ptr);
+      calloc.free(p);
     }
   }
 
@@ -53,27 +67,28 @@ class WalletMnemonicBindings {
   /// passphrase may be empty.
   static Pointer<Void>? walletFromMnemonic(String mnemonic,
                                             {String passphrase = ''}) {
-    final fn = _resolve<_WalletFromTwoCharPtrs, _WalletFromTwoCharPtrs>(
-        'mc_wallet_from_mnemonic');
+    final fn = _lookupSym<_WalletFromTwoCharPtrsC, _WalletFromTwoCharPtrsDart>(
+        'mc_wallet_from_mnemonic',
+        (ptr) => ptr.asFunction<_WalletFromTwoCharPtrsDart>());
     if (fn == null) return null;
-    final mnemonicPtr = mnemonic.toNativeUtf8();
-    final passphrasePtr = passphrase.toNativeUtf8();
+    final m = mnemonic.toNativeUtf8();
+    final p = passphrase.toNativeUtf8();
     try {
-      final handle = fn(mnemonicPtr, passphrasePtr);
+      final handle = fn(m, p);
       if (handle.address == 0) return null;
       return handle;
     } finally {
-      calloc.free(mnemonicPtr);
-      calloc.free(passphrasePtr);
+      calloc.free(m);
+      calloc.free(p);
     }
   }
 
-  /// 0x-prefixed lowercase 40-hex Ethereum / Base address derived from
-  /// the same secp256k1 key the wallet already holds. Caller does NOT
-  /// free — we handle that internally.
+  /// 0x-prefixed EIP-55-checksummed 40-hex Ethereum / Base address.
+  /// Caller does NOT free — we handle that internally.
   static String? walletGetEthAddress(Pointer<Void> wallet) {
-    final fn = _resolve<_CharRetFromWalletPtr, _CharRetFromWalletPtr>(
-        'mc_wallet_get_eth_address');
+    final fn = _lookupSym<_CharRetFromWalletPtrC, _CharRetFromWalletPtrDart>(
+        'mc_wallet_get_eth_address',
+        (ptr) => ptr.asFunction<_CharRetFromWalletPtrDart>());
     if (fn == null) return null;
     final ptr = fn(wallet);
     if (ptr.address == 0) return null;
@@ -84,14 +99,20 @@ class WalletMnemonicBindings {
 
   // ---- Internals --------------------------------------------------
 
-  /// Returns null if the symbol isn't exported by the loaded DLL — lets
-  /// the app degrade gracefully when running against an older mc_rats
-  /// build that pre-dates these exports.
-  static T? _resolve<N extends Function, T extends Function>(String name) {
+  /// Look up a symbol with a concrete NativeFunction<NativeT> type and
+  /// run the caller-supplied converter to its Dart function shape.
+  /// Returns null on any failure so the UI degrades to "feature not
+  /// available" rather than crashing.
+  ///
+  /// NativeT is constrained to Function but Dart will only accept this
+  /// helper when callers instantiate it with a concrete NativeFunction
+  /// signature at the call site — which is what the wrappers above do.
+  static DartT? _lookupSym<NativeT extends Function, DartT extends Function>(
+      String name,
+      DartT Function(Pointer<NativeFunction<NativeT>>) convert) {
     try {
-      final lookup = NativeLibrary.lib;
-      final ptr = lookup.lookup<NativeFunction<N>>(name);
-      return ptr.asFunction<T>();
+      final ptr = NativeLibrary.lib.lookup<NativeFunction<NativeT>>(name);
+      return convert(ptr);
     } catch (_) {
       return null;
     }

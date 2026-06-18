@@ -22,6 +22,7 @@
 #include <wally_core.h>
 #include <wally_bip39.h>
 #include <wally_bip32.h>
+#include <wally_crypto.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -317,25 +318,29 @@ uint32_t mc_compute_checksum(const int16_t* samples, int count) {
     return h;
 }
 
-/* ---- Audio / fingerprint stubs (player handles audio in Dart) ------- */
-mc_decoder_t mc_decoder_open(const uint8_t* d, size_t l) {(void)d;(void)l;return NULL;}
-void         mc_decoder_free(mc_decoder_t dc){(void)dc;}
-int          mc_decoder_get_sample_rate(mc_decoder_t dc){(void)dc;return 0;}
-int          mc_decoder_get_channels(mc_decoder_t dc){(void)dc;return 0;}
-uint32_t     mc_decoder_get_duration_ms(mc_decoder_t dc){(void)dc;return 0;}
-int          mc_decoder_read(mc_decoder_t dc, int16_t* b, int n){(void)dc;(void)b;(void)n;return -1;}
-int          mc_decoder_seek(mc_decoder_t dc, uint32_t p){(void)dc;(void)p;return -1;}
-uint32_t     mc_decoder_position_ms(mc_decoder_t dc){(void)dc;return 0;}
-mc_fingerprint_t mc_fingerprint_generate(const int16_t* s, int n, int r, int c){(void)s;(void)n;(void)r;(void)c;return NULL;}
-mc_fingerprint_t mc_fingerprint_from_compressed(const char* b){(void)b;return NULL;}
-void         mc_fingerprint_free(mc_fingerprint_t fp){(void)fp;}
-char*        mc_fingerprint_get_compressed(mc_fingerprint_t fp){(void)fp;return NULL;}
-double       mc_fingerprint_compare(mc_fingerprint_t a, mc_fingerprint_t b){(void)a;(void)b;return 0.0;}
-int          mc_block_find_separator(const uint8_t* b, size_t l, size_t* o){(void)b;(void)l;(void)o;return -1;}
-int          mc_block_extract_audio(const uint8_t* bd, size_t bl, uint8_t** o, size_t* ol){(void)bd;(void)bl;(void)o;(void)ol;return -1;}
-char*        mc_bytes_to_hex(const uint8_t* d, size_t n) { return bytes_to_hex_alloc(d, n); }
-int          mc_detect_format(const uint8_t* d, size_t l){(void)d;(void)l;return 0;}
-int          mc_validate_audio(const uint8_t* d, size_t l, char** e){(void)d;(void)l;(void)e;return 0;}
-uint32_t     mc_audio_duration_ms(const uint8_t* d, size_t l){(void)d;(void)l;return 0;}
-int          mc_validate_ogg(const uint8_t* d, size_t l, char** e){(void)d;(void)l;(void)e;return 0;}
-uint32_t     mc_ogg_duration_ms(const uint8_t* d, size_t l){(void)d;(void)l;return 0;}
+/* ---- Audio / fingerprint stubs (player handles audio in Dart) -------
+ *
+ * Signatures mirror include/musicchain.h exactly. The mc_validate_ogg /
+ * mc_ogg_duration_ms exports live as `static inline` in the header and
+ * MUST NOT appear here — defining them would collide with the inline
+ * version the Dart FFI bindings.dart pulls in.
+ */
+mc_decoder_t  mc_decoder_open(const uint8_t* d, size_t l)             { (void)d; (void)l; return NULL; }
+void          mc_decoder_free(mc_decoder_t dc)                        { (void)dc; }
+int           mc_decoder_get_sample_rate(mc_decoder_t dc)             { (void)dc; return 0; }
+int           mc_decoder_get_channels(mc_decoder_t dc)                { (void)dc; return 0; }
+uint32_t      mc_decoder_get_duration_ms(mc_decoder_t dc)             { (void)dc; return 0; }
+int           mc_decoder_read(mc_decoder_t dc, int16_t* b, int n)     { (void)dc; (void)b; (void)n; return -1; }
+int           mc_decoder_seek(mc_decoder_t dc, uint32_t p)            { (void)dc; (void)p; return -1; }
+uint32_t      mc_decoder_position_ms(mc_decoder_t dc)                 { (void)dc; return 0; }
+mc_fingerprint_t mc_fingerprint_generate(const uint8_t* d, size_t l)  { (void)d; (void)l; return NULL; }
+mc_fingerprint_t mc_fingerprint_from_compressed(const char* b)        { (void)b; return NULL; }
+void          mc_fingerprint_free(mc_fingerprint_t fp)                { (void)fp; }
+char*         mc_fingerprint_get_compressed(mc_fingerprint_t fp)      { (void)fp; return NULL; }
+float         mc_fingerprint_compare(mc_fingerprint_t a, mc_fingerprint_t b) { (void)a; (void)b; return 0.0f; }
+int64_t       mc_block_find_separator(const uint8_t* b, size_t l)     { (void)b; (void)l; return -1; }
+int           mc_block_extract_audio(const uint8_t* bd, size_t bl, uint8_t** o, size_t* ol) { (void)bd; (void)bl; (void)o; (void)ol; return -1; }
+char*         mc_bytes_to_hex(const uint8_t* d, size_t n)             { return bytes_to_hex_alloc(d, n); }
+int           mc_detect_format(const uint8_t* d, size_t l)            { (void)d; (void)l; return 0; }
+int           mc_validate_audio(const uint8_t* d, size_t l, char** e) { (void)d; (void)l; (void)e; return 0; }
+uint32_t      mc_audio_duration_ms(const uint8_t* d, size_t l)        { (void)d; (void)l; return 0; }

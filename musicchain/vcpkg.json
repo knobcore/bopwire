@@ -21,6 +21,13 @@
       "features": ["ssl"]
     },
     "miniupnpc",
-    "pdcurses"
+    {
+      "name":     "pdcurses",
+      "platform": "windows"
+    },
+    {
+      "name":     "ncurses",
+      "platform": "!windows"
+    }
   ]
 }

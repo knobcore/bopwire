@@ -26,6 +26,12 @@ JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Strip Windows PATH (mingw/msys64) so find_package doesn't try to use
+# Win32 cmake configs in a Linux build. See build-node-linux.sh comment.
+PATH="$(echo "$PATH" | tr ':' '\n' | grep -vE '^/mnt/c/' | paste -sd: -)"
+export PATH
+unset CMAKE_PREFIX_PATH
+
 if [ "$CLEAN" = "1" ]; then rm -rf "$BUILD_DIR"; fi
 
 if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
@@ -33,6 +39,7 @@ if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
         -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
         -DVCPKG_TARGET_TRIPLET=x64-linux \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_IGNORE_PATH=/mnt/c/msys64 \
         -DMC_MINI_NODE_ONLY=ON
 fi
 

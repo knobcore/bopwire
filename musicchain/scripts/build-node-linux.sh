@@ -27,6 +27,17 @@ JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Strip any Windows PATH entries WSL inherits. Without this, cmake's
+# find_package() will discover Windows mingw / msys64 toolchain configs
+# (e.g. /mnt/c/msys64/mingw64/lib/cmake/CURL) and try to use Win32-only
+# headers in our Linux build — which fails with "Only Win32 target is
+# supported!" deep inside <sys/cdefs.h>. We also clear CMAKE_PREFIX_PATH
+# and add CMAKE_IGNORE_PATH so vcpkg + the system Linux toolchain are
+# the only sources of headers and libs.
+PATH="$(echo "$PATH" | tr ':' '\n' | grep -vE '^/mnt/c/' | paste -sd: -)"
+export PATH
+unset CMAKE_PREFIX_PATH
+
 if [ "$CLEAN" = "1" ]; then
     echo "[clean] removing $BUILD_DIR"
     rm -rf "$BUILD_DIR"
@@ -37,7 +48,8 @@ if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
     "$CMAKE" -S . -B "$BUILD_DIR" \
         -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
         -DVCPKG_TARGET_TRIPLET=x64-linux \
-        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_IGNORE_PATH=/mnt/c/msys64
 fi
 
 echo "[build] $CMAKE --build $BUILD_DIR -j$JOBS"
