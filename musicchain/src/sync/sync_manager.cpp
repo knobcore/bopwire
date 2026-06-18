@@ -42,6 +42,42 @@ void SyncManager::stop() {
     if (worker_.joinable()) worker_.join();
 }
 
+void SyncManager::set_mini_node_peer_id(const std::string& peer_id) {
+    std::lock_guard<std::mutex> lk(discovery_mu_);
+    mini_peer_id_ = peer_id;
+}
+
+void SyncManager::discover_full_nodes() {
+    std::string mini;
+    {
+        std::lock_guard<std::mutex> lk(discovery_mu_);
+        mini = mini_peer_id_;
+    }
+    if (mini.empty()) return;
+    auto reply = rpc(mini, "routes.get", "");
+    if (!reply) return;
+    try {
+        auto body = nlohmann::json::parse(*reply);
+        // routes_json builds { "self_load": ..., "wallet": ..., "peers": [ ... ] }
+        // but on the home-node side it may be a flat array — handle both.
+        const auto& peers = body.contains("peers") ? body["peers"] : body;
+        if (!peers.is_array()) return;
+        std::vector<DiscoveredFull> next;
+        for (const auto& p : peers) {
+            if (!p.is_object()) continue;
+            DiscoveredFull d;
+            d.node_id        = p.value("node_id", std::string{});
+            d.rats_peer_id   = p.value("rats_peer_id", std::string{});
+            d.public_address = p.value("public_address", std::string{});
+            d.reachability   = p.value("reachability", std::string{"unknown"});
+            if (d.rats_peer_id.empty()) continue;
+            next.push_back(std::move(d));
+        }
+        std::lock_guard<std::mutex> lk(discovery_mu_);
+        discovered_.swap(next);
+    } catch (...) { /* keep last known */ }
+}
+
 void SyncManager::on_rpc_reply(const std::string& /*peer_id*/,
                                 const std::string& reply_json) {
     std::string req_id;
@@ -75,12 +111,41 @@ SyncManager::rpc(const std::string& peer_id,
         try { req["body"] = json::parse(body_json); }
         catch (...) { req["body"] = body_json; }
     }
+    // Relay wrap: if peer_id is a discovered full node (not the mini-node
+    // itself), tunnel the request through the mini-node via relay.forward.
+    // The mini-node generates a fresh inner req_id, remembers the
+    // originator + our req_id, forwards to the target, and routes the
+    // reply back to us with our original req_id intact. The wrap is
+    // transparent to the rest of SyncManager.
+    std::string send_to_peer = peer_id;
+    json        out_req      = req;
+    {
+        std::lock_guard<std::mutex> lk(discovery_mu_);
+        if (!mini_peer_id_.empty() && peer_id != mini_peer_id_) {
+            bool is_discovered = false;
+            for (const auto& d : discovered_) {
+                if (d.rats_peer_id == peer_id) { is_discovered = true; break; }
+            }
+            if (is_discovered) {
+                out_req = {
+                    {"req_id", req_id},
+                    {"type",   "relay.forward"},
+                    {"body",   {
+                        {"target_peer_id", peer_id},
+                        {"type",           verb},
+                        {"body",           req["body"]}
+                    }}
+                };
+                send_to_peer = mini_peer_id_;
+            }
+        }
+    }
     {
         std::lock_guard<std::mutex> lk(pending_mu_);
         pending_[req_id] = PendingRpc{};
     }
-    rats_send_message(rats_.client(), peer_id.c_str(),
-                      kMcRequestType, req.dump().c_str());
+    rats_send_message(rats_.client(), send_to_peer.c_str(),
+                      kMcRequestType, out_req.dump().c_str());
 
     std::unique_lock<std::mutex> lk(pending_mu_);
     const bool got = pending_cv_.wait_for(lk,
@@ -225,10 +290,21 @@ void SyncManager::run_pass() {
     // can pick a different peer. Multi-peer striped download is a
     // future optimisation — sequential is correct + fits a normal
     // boot-time sync window.
-    const auto peer_ids = rats_.peer_ids();
+    // Phase 1: ask the mini-node who the other full nodes are. With one
+    // mini-node + one home node + this VPS, this is the only way the VPS
+    // discovers the home node — direct librats peer_ids() shows just the
+    // mini-node itself, which has no chain.
+    discover_full_nodes();
+    std::vector<std::string> peer_ids;
+    {
+        std::lock_guard<std::mutex> lk(discovery_mu_);
+        for (const auto& d : discovered_) {
+            if (!d.rats_peer_id.empty()) peer_ids.push_back(d.rats_peer_id);
+        }
+    }
     std::cout << "[sync] startup pass: local height="
               << chain_.tip().height
-              << ", peers connected=" << peer_ids.size()
+              << ", discovered full nodes=" << peer_ids.size()
               << ", min_required=" << min_peers_ << "\n";
     if (peer_ids.size() < min_peers_) {
         std::cout << "[sync] not enough peers — deferred (eclipse-safe)\n";

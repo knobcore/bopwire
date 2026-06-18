@@ -53,6 +53,15 @@ public:
     void on_rpc_reply(const std::string& peer_id,
                       const std::string& reply_json);
 
+    // node_main hands us the mini-node's librats peer_id once the rats
+    // link handshakes (and the wallet field from the routes.get
+    // response so credit attribution still works). Without it
+    // SyncManager has no idea which connected librats peer is a relay
+    // vs a full node, and run_pass falls back to "query every peer
+    // directly" — which silently fails because the mini-node has no
+    // chain to answer chain.tip with.
+    void set_mini_node_peer_id(const std::string& peer_id);
+
 private:
     void run_pass();
 
@@ -92,6 +101,21 @@ private:
     uint32_t          min_peers_;
     std::thread       worker_;
     std::atomic<bool> running_{false};
+
+    // Discovery state: the mini-node's librats peer_id once we know it,
+    // plus the latest routes.get response decoded into (full_node_peer_id,
+    // public_address, reachability, ...) tuples. discover_full_nodes()
+    // populates this; run_pass() consumes it.
+    mutable std::mutex                       discovery_mu_;
+    std::string                              mini_peer_id_;
+    struct DiscoveredFull {
+        std::string node_id;
+        std::string rats_peer_id;
+        std::string public_address;
+        std::string reachability;
+    };
+    std::vector<DiscoveredFull>              discovered_;
+    void discover_full_nodes();
 
     // Request correlation. Each outbound RPC stashes its req_id here so
     // the inbound reply path can hand the JSON back to the waiting

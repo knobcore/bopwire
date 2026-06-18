@@ -584,6 +584,24 @@ fuzzy_ok: ;
         std::cout << "[sync] min_peers=" << min_sync_peers
                   << " (override with MUSICCHAIN_MIN_SYNC_PEERS)\n";
         static mc::SyncManager sync(chain, rats, min_sync_peers);
+        // Background thread: once librats has the mini-node validated as
+        // a peer, hand its peer_id to SyncManager. SyncManager uses it as
+        // its relay anchor for routes.get + relay.forward to other full
+        // nodes. Re-checks every 10 s so a transient librats reconnect
+        // doesn't permanently break discovery.
+        std::thread([&rats]() {
+            std::string last;
+            while (true) {
+                auto pids = rats.peer_ids();
+                if (!pids.empty() && pids.front() != last) {
+                    last = pids.front();
+                    sync.set_mini_node_peer_id(last);
+                    std::cout << "[sync] mini-node peer set: "
+                              << last.substr(0, 12) << "…\n";
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+            }
+        }).detach();
         rats_on_message(rats.client(), "musicchain.reply",
             [](void* /*user*/, const char* peer_id,
                 const char* message_data) {

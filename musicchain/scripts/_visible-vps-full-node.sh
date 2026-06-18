@@ -29,12 +29,20 @@ sshpass -e ssh -tt \
     -o StrictHostKeyChecking=accept-new \
     -o UserKnownHostsFile=/dev/null \
     "$VPS_USER@$VPS_HOST" \
-    "cd /opt/musicchain && \
-     killall -9 musicchain-node 2>/dev/null; sleep 1; \
-     mkdir -p /var/lib/musicchain/blockchain.db /var/lib/musicchain/blocks /var/lib/musicchain/keys /var/lib/musicchain/logs /var/lib/musicchain/audio && \
+    "killall -9 musicchain-node 2>/dev/null; sleep 1; \
+     echo '[vps] pulling + rebuilding from latest main'; \
+     cd /opt/musicchain-src && git fetch --depth 1 origin main && git reset --hard FETCH_HEAD && \
+     cd musicchain && bash scripts/build-node-linux.sh && \
+     mkdir -p /opt/musicchain /var/lib/musicchain/blockchain.db /var/lib/musicchain/blocks /var/lib/musicchain/keys /var/lib/musicchain/logs /var/lib/musicchain/audio && \
+     for f in musicchain-node musicchain-mini-node libmusicchain.so libmc_rats.so libmc_rats.so.1 libmc_rats.so.1.0.0.0 full-node.config.json mini-node.config.json; do \
+       src=build-linux/Release/\$f; \
+       if [ -f \"\$src\" ] || [ -L \"\$src\" ]; then cp -af \"\$src\" /opt/musicchain/; fi; \
+     done && \
+     chmod +x /opt/musicchain/musicchain-node && \
      sed -i -E 's|\"data_dir\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"data_dir\": \"/var/lib/musicchain\"|' /opt/musicchain/full-node.config.json && \
      sed -i -E 's/\"tui_mode\"[[:space:]]*:[[:space:]]*(true|false)/\"tui_mode\": true/g' /opt/musicchain/full-node.config.json && \
-     export TERM=xterm-256color && \
+     cd /opt/musicchain && \
+     export TERM=xterm-256color MUSICCHAIN_MIN_SYNC_PEERS=1 && \
      LD_LIBRARY_PATH=/opt/musicchain ./musicchain-node start --config /opt/musicchain/full-node.config.json --tui"
 rc=$?
 unset SSHPASS
