@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "../core/block.h"
 #include "../storage/database.h"
 #include <leveldb/write_batch.h>

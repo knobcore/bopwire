@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "block.h"
 #include <vector>
 

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 #include "../core/chain.h"
 #include "../storage/database.h"

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "../core/transaction.h"
 #include "../storage/database.h"
 #include "ledger.h"

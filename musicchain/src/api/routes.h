@@ -1,5 +1,6 @@
 #pragma once
 // Route parsing utilities shared between server and routes implementation.
+#include <cstdint>
 #include <string>
 #include <vector>
 

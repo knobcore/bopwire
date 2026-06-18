@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "block.h"
 #include "transaction.h"
 #include "../storage/database.h"

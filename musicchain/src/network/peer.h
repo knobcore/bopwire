@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "messages.h"
 #include <uv.h>
 #include <functional>
