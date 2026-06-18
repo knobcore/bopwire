@@ -11,11 +11,13 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 extern "C" { typedef void* rats_client_t; }
 
 namespace mc { class BlockPropagator; }
+namespace mc::net { class RelayCreditTracker; }
 
 namespace mc::api {
 
@@ -52,6 +54,16 @@ public:
     /// block.hello on connect and clean up state on drop.
     void set_block_propagator(BlockPropagator* bp) { propagator_ = bp; }
 
+    /// Plug a RelayCreditTracker in. The stream.open handler (the one
+    /// binary-traffic verb the post-pivot full node exposes — chat /
+    /// mod / routes are control-plane and don't qualify per the
+    /// tracker's scope docstring) increments the count for the
+    /// mini-node that relayed the request whenever it can resolve the
+    /// mini-node's wallet via peer_to_wallet_. Mini-nodes self-identify
+    /// over `mini.hello`, carrying a `wallet` field set by the
+    /// musicchain mini-node patch.
+    void set_relay_tracker(net::RelayCreditTracker* rt) { relay_tracker_ = rt; }
+
     /// Read-only handle to the in-memory swarm index so the full node
     /// TUI can render live song-count / member stats without going
     /// through an RPC round trip.
@@ -77,6 +89,18 @@ private:
     mc::crypto::KeyPair         keypair_;
     rats_client_t               client_ = nullptr;
     BlockPropagator*            propagator_ = nullptr;
+    net::RelayCreditTracker*    relay_tracker_ = nullptr;
+
+    /// Mini-node librats peer_id → mini-node wallet (20-byte raw EVM
+    /// address). Populated when a peer pushes `mini.hello` with a
+    /// `wallet` field; consulted by the stream.open handler to credit
+    /// the right wallet for a relayed payload delivery. Empty entries
+    /// (peer connected but never sent mini.hello, or self-identified
+    /// without a wallet — e.g. another full node or a player) skip the
+    /// credit silently so we never mint rewards into a placeholder
+    /// address.
+    std::mutex                                  peer_to_wallet_mu_;
+    std::unordered_map<std::string, Address>    peer_to_wallet_;
 
     static void on_request_cb(void* user_data, const char* peer_id,
                               const char* message_data);

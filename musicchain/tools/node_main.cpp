@@ -609,6 +609,9 @@ fuzzy_ok: ;
         // the founder seed — before that we can't sign a RELAY_REWARD
         // since only the founder can issue them.
         static mc::net::RelayCreditTracker relay_tracker(db);
+        // Wire the API layer so it bumps the tracker on every relayed
+        // stream.open. peer→wallet identity arrives via mini.hello.
+        rats_api.set_relay_tracker(&relay_tracker);
         relay_tracker.start(
             [&chain, &db, &candidates, &cfg](const mc::Address& mini_addr, uint64_t count) {
                 // Read the founder seed off disk on every sweep so the

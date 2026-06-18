@@ -639,10 +639,19 @@ void send_reply(const char* peer_id, const std::string& reply_json) {
 
 void send_mini_hello(const std::string& peer_id) {
     if (!g_client || peer_id.empty()) return;
+    // Body carries the mini-node's wallet address so the full node can
+    // attribute relay credits (RelayRewardTx target) to the right
+    // wallet via RelayCreditTracker. Empty wallet falls through to a
+    // bodyless hello — older full nodes ignore the field; newer ones
+    // skip credit accounting for this peer until a wallet shows up.
+    nlohmann::json body = nlohmann::json::object();
+    if (!g_wallet_address_hex.empty()) {
+        body["wallet"] = g_wallet_address_hex;
+    }
     nlohmann::json req = {
         {"req_id", new_relay_req_id()},
         {"type",   kMiniHelloType},
-        {"body",   nlohmann::json::object()},
+        {"body",   body},
     };
     rats_send_message(g_client, peer_id.c_str(), kRequestType,
                       req.dump().c_str());

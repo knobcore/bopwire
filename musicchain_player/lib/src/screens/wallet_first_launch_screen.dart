@@ -13,6 +13,10 @@
 // On completion, calls the onComplete callback so the host
 // (HomeScreen / login router) can swap to the main app surface.
 
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -90,6 +94,45 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
       _error             = null;
       _step              = _Step.pickIdentity;
     });
+  }
+
+  Future<void> _saveMnemonicToFile() async {
+    final mnemonic = _generatedMnemonic;
+    if (mnemonic == null || mnemonic.isEmpty) return;
+    final body = '$mnemonic\n\n'
+        'Keep this file offline. Anyone with these 12 words can spend '
+        'from your wallet.\n';
+    try {
+      // On Android/iOS, file_picker's saveFile uses the `bytes`
+      // parameter to write through the system file picker (the app
+      // can't reach the chosen path directly from its sandbox). On
+      // desktop the picker just returns the chosen path and we write
+      // ourselves. Belt-and-braces: pass bytes AND fall back to a
+      // manual File write — on desktop the manual write is the real
+      // one; on mobile it'll throw a permission error which we eat.
+      final pickedPath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save recovery phrase',
+        fileName:    'musicchain-recovery-phrase.txt',
+        bytes:       Uint8List.fromList(utf8.encode(body)),
+      );
+      if (pickedPath == null) return; // user cancelled
+      try {
+        await File(pickedPath).writeAsString(body, flush: true);
+      } catch (_) {
+        // Mobile sandbox — the bytes path handled the actual write.
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Saved to $pickedPath'),
+        duration: const Duration(seconds: 4),
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Save failed: $e'),
+        duration: const Duration(seconds: 4),
+      ));
+    }
   }
 
   Future<void> _finish() async {
@@ -207,16 +250,29 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
           ),
         ),
         const SizedBox(height: 12),
-        TextButton.icon(
-          onPressed: () {
-            Clipboard.setData(ClipboardData(text: _generatedMnemonic!));
-            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-              content: Text('Copied to clipboard. Paste somewhere safe.'),
-              duration: Duration(seconds: 3),
-            ));
-          },
-          icon: const Icon(Icons.copy),
-          label: const Text('Copy to clipboard'),
+        Row(
+          children: [
+            Expanded(
+              child: TextButton.icon(
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: _generatedMnemonic!));
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('Copied to clipboard. Paste somewhere safe.'),
+                    duration: Duration(seconds: 3),
+                  ));
+                },
+                icon: const Icon(Icons.copy),
+                label: const Text('Copy to clipboard'),
+              ),
+            ),
+            Expanded(
+              child: TextButton.icon(
+                onPressed: _saveMnemonicToFile,
+                icon: const Icon(Icons.save_alt),
+                label: const Text('Save to a file'),
+              ),
+            ),
+          ],
         ),
         const Spacer(),
         ElevatedButton(

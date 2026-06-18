@@ -4,6 +4,7 @@
 #include "../moderation/mod_action.h"
 #include "../util/traffic.h"
 #include "../sync/block_propagator.h"
+#include "../net/relay_credit_tracker.h"
 
 // mc_rats_quic.h was the old stub. We now link the real librats and
 // consume its C bindings header so functions like rats_get_peer_info_json
@@ -145,6 +146,13 @@ void RatsApi::on_peer_disconnected_cb(void* user_data, const char* peer_id) {
     if (self && peer_id && *peer_id) {
         self->swarm_.mark_peer_offline(peer_id);
         if (self->propagator_) self->propagator_->on_peer_disconnected(peer_id);
+        // Drop the mini-node wallet cache entry so a re-connect under a
+        // fresh peer_id can re-identify and we don't keep a stale entry
+        // pinned forever.
+        {
+            std::lock_guard<std::mutex> lk(self->peer_to_wallet_mu_);
+            self->peer_to_wallet_.erase(peer_id);
+        }
     }
     // NOTE: do NOT rats_string_free here. The disconnect callback wrapper
     // in deps/librats/src/librats_c.cpp does NOT strdup peer_id (unlike
@@ -346,6 +354,37 @@ void RatsApi::handle_request(const std::string& peer_id,
             reply = wrap_handler_result(req_id,
                 http_.verb_session_complete(in.value("session_id", ""),
                                             in.dump()));
+        }
+        // ---- mini-node identity (relay credit attribution) --------------
+        //
+        // Mini-nodes push `mini.hello` to every fresh full-node peer.
+        // The body carries the mini-node's EVM-style wallet address so
+        // when the full node later sees a relayed binary-traffic verb
+        // (stream.open today; song.audio/song.get pre-pivot) it can
+        // credit the right wallet via RelayCreditTracker::increment.
+        // Players and non-mini full nodes either don't send mini.hello
+        // or send it without a wallet field — both branches are
+        // harmless and just leave peer_to_wallet_ empty for them.
+        else if (type == "mini.hello") {
+            const std::string wallet_hex = in.value("wallet", std::string());
+            if (!wallet_hex.empty()) {
+                Address addr{};
+                // parse_address is case-insensitive hex, so it accepts
+                // EIP-55 checksummed forms ("0xAbCd…") as well as plain
+                // lowercase. We don't verify the checksum here — a
+                // malformed mini-node identity at worst means we lose
+                // the credit for that peer's relays until they reconnect
+                // with a clean address.
+                if (crypto::parse_address(wallet_hex, addr)) {
+                    std::lock_guard<std::mutex> lk(peer_to_wallet_mu_);
+                    peer_to_wallet_[peer_id] = addr;
+                    std::cout << "[rats-api] mini.hello: peer "
+                              << peer_id.substr(0, 12) << "… wallet "
+                              << wallet_hex.substr(0, 10) << "…\n";
+                }
+            }
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body",   json::object()}};
         }
         // ---- audio streaming (swarm only) -------------------------------
         // The full node never holds audio bytes under the post-pivot
@@ -1333,6 +1372,32 @@ void RatsApi::handle_request(const std::string& peer_id,
         reply = {{"req_id", req_id},
                  {"status", "server_error"},
                  {"error",  e.what()}};
+    }
+
+    // Relay credit accounting. Only counts binary-traffic verbs that
+    // the mini-node tunneled on our behalf — stream.open today, future
+    // additions go in the verb check below alongside it. Skipped when:
+    //   * the request wasn't relayed (originator_peer_id is empty)
+    //   * the dispatch failed (status != "ok")
+    //   * we don't know the mini-node's wallet yet (mini.hello hasn't
+    //     landed for this peer, or it was a non-mini full-node/player)
+    if (relay_tracker_ && (type == "stream.open")) {
+        const std::string origin = env.value("originator_peer_id",
+                                              std::string());
+        const std::string status = reply.value("status", std::string());
+        if (!origin.empty() && status == "ok") {
+            Address mini_addr{};
+            bool have_wallet = false;
+            {
+                std::lock_guard<std::mutex> lk(peer_to_wallet_mu_);
+                auto it = peer_to_wallet_.find(peer_id);
+                if (it != peer_to_wallet_.end()) {
+                    mini_addr   = it->second;
+                    have_wallet = true;
+                }
+            }
+            if (have_wallet) relay_tracker_->increment(mini_addr, 1);
+        }
     }
 
     send_reply(peer_id, reply.dump());
