@@ -133,3 +133,11 @@ vcpkg-linux/
 musicchain_player/apk-build2.tail
 musicchain_player/apk-build.log
 musicchain_player/android/.kotlin/
+
+# --------------------------------------------------------------------
+# VPS / infra scripts — these reference operator-specific host paths,
+# IPs, and config layouts that don't belong in a public repo. Keep
+# them local-only; rebuild from the deploy guide if you need to.
+# --------------------------------------------------------------------
+musicchain/scripts/_visible-vps-*.sh
+musicchain/scripts/deploy-vps.sh
