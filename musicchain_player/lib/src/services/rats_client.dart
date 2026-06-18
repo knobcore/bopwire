@@ -978,6 +978,9 @@ class RatsClient {
     // is wrong any time librats also handed us a full-node DHT peer).
     if (type == 'mini.hello') {
       _miniNodePeerIds.add(peerId);
+      // ignore: avoid_print
+      print('[rats] mini.hello from ${peerId.substring(0, peerId.length < 12 ? peerId.length : 12)}'
+            '… (wallet=${(inner['wallet'] as String? ?? '').isNotEmpty})');
       // Ack so the mini-node logs a clean request/reply pair.
       final ack = jsonEncode({
         'req_id': reqId,

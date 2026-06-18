@@ -131,19 +131,31 @@ class MusicChainApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => PlayerProvider()),
         ChangeNotifierProvider.value(value: LibraryService.instance),
         ChangeNotifierProvider.value(value: DownloadProvider.instance),
-        ChangeNotifierProvider(create: (_) {
-          final disc = LibratsDiscovery();
-          // Whenever the auto-selected full node changes (first discovery
-          // or it cycled to a different node), re-announce our library so
-          // the full node's swarm map picks us back up.
-          disc.onAutoNodeChanged = (nodePid) {
-            // ignore: avoid_print
-            print('[rats] auto-node changed to '
-                  '${nodePid.substring(0, 12)} — re-announcing library');
-            unawaited(LibraryScanner.instance.reAnnounce());
-          };
-          return disc;
-        }),
+        ChangeNotifierProvider(
+          // Eager. Without lazy:false the provider only constructs the
+          // LibratsDiscovery the first time some widget watches it. The
+          // login screen (shown when the user has a saved wallet on
+          // disk) doesn't watch it, so the discovery loop never starts
+          // and the player sits with no full-node handshake until the
+          // user navigates to a screen that DOES watch. Wallet
+          // first-launch banner needs the discovery state live; that
+          // alone is reason enough to construct on app start.
+          lazy: false,
+          create: (_) {
+            final disc = LibratsDiscovery();
+            // Whenever the auto-selected full node changes (first
+            // discovery or it cycled to a different node), re-announce
+            // our library so the full node's swarm map picks us back
+            // up.
+            disc.onAutoNodeChanged = (nodePid) {
+              // ignore: avoid_print
+              print('[rats] auto-node changed to '
+                    '${nodePid.substring(0, 12)} — re-announcing library');
+              unawaited(LibraryScanner.instance.reAnnounce());
+            };
+            return disc;
+          },
+        ),
       ],
       child: MaterialApp(
         title: 'MusicChain',

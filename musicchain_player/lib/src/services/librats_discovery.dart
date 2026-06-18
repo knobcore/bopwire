@@ -79,7 +79,13 @@ class LibratsDiscovery extends ChangeNotifier {
 
     try {
       final rats = RatsClient.instance;
+      // ignore: avoid_print
+      print('[discovery] refresh: validatedPeers=${rats.validatedPeerIds.length} '
+            'mini=${rats.firstMiniNodePeerId ?? "<none>"} '
+            'targetingMiniNode=${rats.firstMiniNodePeerId != null}');
       final list = await rats.requestRoutes();
+      // ignore: avoid_print
+      print('[discovery] refresh: got ${list.length} routes from mini-node');
       routes
         ..clear()
         ..addEntries(list
@@ -230,6 +236,8 @@ class LibratsDiscovery extends ChangeNotifier {
                     '(selected: $via)';
       }
     } catch (e) {
+      // ignore: avoid_print
+      print('[discovery] refresh: FAILED — $e');
       lastError = e.toString();
       vpsStatus = 'VPS error: $e';
     } finally {
