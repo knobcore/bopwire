@@ -270,6 +270,10 @@ nlohmann::json BlockPropagator::handle_request(const std::string& peer_id,
             }
         }
         const auto out = hashes_after_locator(locator);
+        std::cerr << "[bp] block.getblocks from " << peer_id.substr(0, 12)
+                  << " locator_size=" << locator.size()
+                  << " returning_hashes=" << out.size()
+                  << " our_tip=" << chain_.tip().height << "\n";
         // Send the hashes back as a separate block.inv push (NOT in the
         // reply body — the rats_api reply lane is single-shot and the
         // requester's BlockPropagator only listens for inbound
@@ -279,6 +283,8 @@ nlohmann::json BlockPropagator::handle_request(const std::string& peer_id,
             json inv_body = {{"hashes", json::array()}};
             for (const auto& h : out) inv_body["hashes"].push_back(crypto::to_hex(h));
             send_request(peer_id, "block.inv", inv_body);
+            std::cerr << "[bp] sent block.inv to " << peer_id.substr(0, 12)
+                      << " with " << out.size() << " hashes\n";
         }
         return json::object();
     }
@@ -422,9 +428,11 @@ std::vector<Hash256> BlockPropagator::hashes_after_locator(
     if (!found_fork) {
         // Empty locator OR peer has nothing in common with our chain
         // (the brand-new VPS case — its tip is the zero hash, so
-        // build_locator returns []). Send hashes from height 0
-        // inclusive so the bootstrapping peer gets genesis first.
-        for (uint32_t hi = 0;
+        // build_locator returns []). Send hashes from height 1
+        // (genesis) onward — heights are 1-indexed; height 0 has no
+        // block, so starting at 0 would `else break` on the first
+        // iteration and yield an empty list.
+        for (uint32_t hi = 1;
              hi <= tip.height && out.size() < kMaxInvCount;
              ++hi) {
             if (auto bh = chain_.get_block_hash(hi)) out.push_back(*bh);
