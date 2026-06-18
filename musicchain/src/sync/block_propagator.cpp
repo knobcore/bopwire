@@ -1,7 +1,7 @@
 #include "block_propagator.h"
 
 #include "../audio/fingerprint.h"      // base64
-#include "../consensus/candidate.h"    // REQUIRED_CONFIRMATIONS
+#include "../consensus/candidate.h"    // MAX_CONFIRMATIONS, dynamic_quorum
 #include "../crypto/hash.h"            // to_hex / parse_hash256
 #include "../crypto/signature.h"
 #include "../network/rats_link.h"
@@ -470,18 +470,26 @@ bool BlockPropagator::ingest_block_bytes(const std::vector<uint8_t>& bytes,
         return false;
     }
 
-    // Confirmation quorum (same five-step rule SyncManager used).
-    std::set<Hash256> seen;
-    uint32_t valid_sigs = 0;
-    for (const auto& c : block.header.confirmations) {
-        if (!seen.insert(c.validator_id).second) continue;
-        if (crypto::verify_ecdsa(block.hash(), c.signature, c.pubkey))
-            ++valid_sigs;
-    }
-    if (valid_sigs < REQUIRED_CONFIRMATIONS) {
-        std::cerr << "[bp] block has only " << valid_sigs
-                  << " valid confirmations — discarding\n";
-        return false;
+    // Confirmation quorum — same rule Chain::rebuild_derived_state uses:
+    // genesis (prev_hash==zero) is solo-self-signed and exempt;
+    // everything past it needs at least one valid signature. The
+    // network-appropriate quorum (dynamic_quorum based on peer count
+    // at mint time) is enforced by the producer when assembling the
+    // block; receivers can't reconstruct the peer count the producer
+    // saw, so we only verify authenticity here.
+    const bool is_genesis = (block.header.prev_hash == Hash256{});
+    if (!is_genesis) {
+        std::set<Hash256> seen;
+        uint32_t valid_sigs = 0;
+        for (const auto& c : block.header.confirmations) {
+            if (!seen.insert(c.validator_id).second) continue;
+            if (crypto::verify_ecdsa(block.hash(), c.signature, c.pubkey))
+                ++valid_sigs;
+        }
+        if (valid_sigs < 1) {
+            std::cerr << "[bp] block has no valid signatures — discarding\n";
+            return false;
+        }
     }
 
     {

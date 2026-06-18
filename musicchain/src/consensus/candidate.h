@@ -20,7 +20,25 @@ namespace mc::crypto{ struct KeyPair; }
 
 namespace mc {
 
-static constexpr uint32_t REQUIRED_CONFIRMATIONS  = 3;
+/// Maximum confirmation quorum the network ever demands. A healthy
+/// network (>=4 reachable validators in addition to self) holds blocks
+/// to MAX_CONFIRMATIONS distinct signatures before final.
+static constexpr uint32_t MAX_CONFIRMATIONS       = 5;
+
+/// Compute the quorum required for a block given the current peer
+/// count seen by the producer. Solo mode (peer_count==0) lands at 1
+/// (just the producer's own signature); each additional reachable peer
+/// raises the bar by one until MAX_CONFIRMATIONS caps it. This is what
+/// candidate.cpp's producer loops and BlockCandidate::is_final use; the
+/// chain layer + BlockPropagator's ingest accept any block with >=1
+/// valid signature, since they don't know the peer count that was in
+/// effect when the block was minted.
+inline uint32_t dynamic_quorum(size_t peer_count) {
+    const uint64_t want = static_cast<uint64_t>(peer_count) + 1;
+    return want > MAX_CONFIRMATIONS ? MAX_CONFIRMATIONS
+                                     : static_cast<uint32_t>(want);
+}
+
 static constexpr uint32_t BLOCK_TIMEOUT_SECONDS   = 300;
 
 // If no song-bearing block lands within this window, the chain produces
@@ -62,9 +80,16 @@ struct BlockCandidate {
     Block                       block;
     std::vector<Confirmation>   received_confirmations;
     uint64_t                    created_at_ms;
+    /// Confirmation quorum required for is_final(). Producer sets this
+    /// from `dynamic_quorum(network.peer_count())` at mint time so the
+    /// wait predicate fires the moment the smallest network-appropriate
+    /// quorum lands. Defaults to MAX_CONFIRMATIONS so a candidate
+    /// missing this field (deserialized from an older format) never
+    /// becomes prematurely final.
+    uint32_t                    required_quorum = MAX_CONFIRMATIONS;
 
     bool is_expired() const;
-    bool is_final()   const { return received_confirmations.size() >= REQUIRED_CONFIRMATIONS; }
+    bool is_final()   const { return received_confirmations.size() >= required_quorum; }
 };
 
 class CandidateManager {

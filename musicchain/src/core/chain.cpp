@@ -934,11 +934,15 @@ bool Chain::rebuild_derived_state() {
                     ++valid_sigs;
             }
             // h == 1 is the genesis-bootstrap window (solo self-sign was
-            // allowed). Past that, demand REQUIRED_CONFIRMATIONS.
-            if (h > 1 && valid_sigs < REQUIRED_CONFIRMATIONS) {
+            // allowed). Past that, demand at least one valid signature.
+            // The exact quorum a block needed at mint time is
+            // dynamic_quorum(peer_count_at_that_time) — values the chain
+            // can't reconstruct during a replay — so the replay check
+            // only verifies authenticity (>=1 valid sig). The producer
+            // enforces the dynamic quorum at commit time.
+            if (h > 1 && valid_sigs < 1) {
                 std::cerr << "[chain] replay: block " << h
-                          << " has only " << valid_sigs
-                          << " valid confirmations — stopping\n";
+                          << " has no valid confirmations — stopping\n";
                 quorum_ok = false;
             }
         }

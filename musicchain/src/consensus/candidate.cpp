@@ -210,8 +210,12 @@ bool CandidateManager::commit_block(
     if (chain.tip().height == 0) {
         auto block_hash_bytes = block.hash();
         std::vector<Confirmation> sigs;
-        sigs.reserve(REQUIRED_CONFIRMATIONS);
-        for (uint32_t i = 0; i < REQUIRED_CONFIRMATIONS; ++i) {
+        // Genesis fast path: solo self-sign once, regardless of peer
+        // count. Genesis is always 1 sig per consensus rules; the chain
+        // layer exempts it from the multi-sig quorum check.
+        const uint32_t quorum = 1;
+        sigs.reserve(quorum);
+        for (uint32_t i = 0; i < quorum; ++i) {
             Confirmation c;
             // Distinct validator_id per pass so any future multi-node
             // verifier doesn't reject the block for "duplicate
@@ -269,18 +273,29 @@ bool CandidateManager::commit_block(
     // MULTI-NODE PATH: full confirmation dance.
     std::string block_hash_hex = crypto::to_hex(block.hash());
 
+    // Compute the quorum this block needs based on currently-reachable
+    // peers. Solo (0 peers) → 1 sig; each additional peer raises the
+    // bar by one until MAX_CONFIRMATIONS caps it. The result is stored
+    // on the BlockCandidate so is_final()'s predicate fires at exactly
+    // the right count — without a per-block value, a network that
+    // recently grew or shrank would either wait too long or finalize
+    // too early.
+    const uint32_t quorum = dynamic_quorum(network.peer_count());
+
     BlockCandidate candidate;
-    candidate.block          = block;
-    candidate.created_at_ms  = now_ms_c();
+    candidate.block           = block;
+    candidate.created_at_ms   = now_ms_c();
+    candidate.required_quorum = quorum;
     add_candidate(block_hash_hex, candidate);
 
     bool confirmed = false;
     auto deadline  = std::chrono::steady_clock::now()
                    + std::chrono::seconds(BLOCK_TIMEOUT_SECONDS);
 
-    // Solo mode: self-sign REQUIRED_CONFIRMATIONS times so the block
-    // becomes final immediately. Once a real validator set exists this
-    // branch goes away and we always wait on confirm_cv_.
+    // Solo mode: self-sign `quorum` times so the block becomes final
+    // immediately. With dynamic_quorum the solo case lands at quorum=1
+    // (just the producer's signature). Once a real validator set
+    // exists this branch goes away and we always wait on confirm_cv_.
     //
     // Bug fix #5: the loop used to set validator_id = cfg.node_id on
     // every confirmation, but `add_confirmation` rejects duplicates by
@@ -291,7 +306,7 @@ bool CandidateManager::commit_block(
     // doesn't kick in.
     if (network.peer_count() == 0) {
         auto block_hash_bytes = block.hash();
-        for (uint32_t i = 0; i < REQUIRED_CONFIRMATIONS; ++i) {
+        for (uint32_t i = 0; i < quorum; ++i) {
             Confirmation self_conf;
             // Derive a distinct validator_id per pass. Format:
             //   sha256("solo:" || node_id || u32_be(i))
