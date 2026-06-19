@@ -231,7 +231,20 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         if (cfg.api_port == 9334 && file_cfg.api_port != 9334) cfg.api_port = file_cfg.api_port;
         if (cfg.rats_port == 8080 && file_cfg.rats_port != 8080) cfg.rats_port = file_cfg.rats_port;
         if (cfg.max_peers == 125 && file_cfg.max_peers != 125) cfg.max_peers = file_cfg.max_peers;
+        if (cfg.max_sessions == 10000 && file_cfg.max_sessions != 10000)
+            cfg.max_sessions = file_cfg.max_sessions;
+        // validator_enabled defaults to true; only the explicit file
+        // value should be able to turn it off. Without this merge the
+        // file's false gets silently discarded and every full node
+        // ends up minting heartbeats — chain forks at every tick.
+        if (cfg.validator_enabled && !file_cfg.validator_enabled)
+            cfg.validator_enabled = false;
+        if (cfg.log_level == "info" && file_cfg.log_level != "info")
+            cfg.log_level = file_cfg.log_level;
         if (cfg.seed_nodes.empty())    cfg.seed_nodes    = file_cfg.seed_nodes;
+        if (cfg.sync_seeds.empty())    cfg.sync_seeds    = file_cfg.sync_seeds;
+        if (cfg.dht_bootstrap_hash.empty())
+            cfg.dht_bootstrap_hash = file_cfg.dht_bootstrap_hash;
         if (cfg.registry_url.empty())  cfg.registry_url  = file_cfg.registry_url;
         // tui_mode: file value wins unless CLI explicitly passed --no-tui /
         // --tui (handled before this block flipped tui_mode away from the
