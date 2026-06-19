@@ -4,24 +4,28 @@
 //   1. Choose between "create new" and "restore from existing seed."
 //   2. (Create path) Display a freshly-generated 12-word mnemonic; user
 //      acknowledges they've written it down before continuing.
-//   3. Pick a username (optional) + a local-only unlock password. The
-//      keypair is derived from the BIP39 seed, persisted to disk
-//      encrypted under the password, and the mnemonic itself is
-//      stashed in the platform keyring for one-tap auto-unlock on
-//      subsequent app launches.
+//   3. Pick a username (optional). The keypair is derived from the
+//      BIP39 seed, persisted to disk encrypted under the mnemonic
+//      itself (the recovery phrase is the only credential — no
+//      separate unlock password), and the mnemonic is stashed in the
+//      platform keyring for one-tap auto-unlock on subsequent app
+//      launches.
 //
 // On completion, calls the onComplete callback so the host
 // (HomeScreen / login router) can swap to the main app surface.
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
+import '../models/wallet.dart';
 import '../services/librats_discovery.dart';
+import '../services/rats_client.dart';
 import '../services/wallet_service.dart';
 
 class WalletFirstLaunchScreen extends StatefulWidget {
@@ -45,7 +49,6 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
   String? _generatedMnemonic;
   final _restoreController  = TextEditingController();
   final _usernameController = TextEditingController();
-  final _passwordController = TextEditingController();
   bool _busy = false;
   String? _error;
 
@@ -53,7 +56,6 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
   void dispose() {
     _restoreController.dispose();
     _usernameController.dispose();
-    _passwordController.dispose();
     super.dispose();
   }
 
@@ -139,33 +141,128 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
 
   Future<void> _finish() async {
     final mnemonic = _generatedMnemonic;
-    final password = _passwordController.text;
     final username = _usernameController.text.trim();
     if (mnemonic == null || mnemonic.isEmpty) {
       setState(() => _error = 'No mnemonic available. Restart the wallet setup.');
-      return;
-    }
-    if (password.length < 6) {
-      setState(() => _error = 'Pick an unlock password of at least 6 characters.');
       return;
     }
     setState(() {
       _busy = true;
       _error = null;
     });
+    // ignore: avoid_print
+    print('[wallet-setup] _finish: deriving keypair + persisting');
     try {
-      await widget.walletService.createWalletFromMnemonic(
+      // The mnemonic IS the only credential. We pass it to WalletService
+      // as the password too because the on-disk encrypted key file still
+      // wants one — the encryption is just stopping a casual reader of
+      // the device's app data from spending; the actual recovery secret
+      // is the 12 words, which the user already wrote down. No more
+      // separate password to remember.
+      final info = await widget.walletService.createWalletFromMnemonic(
         mnemonic: mnemonic,
-        password: password,
+        password: mnemonic,
         username: username,
       );
+      // ignore: avoid_print
+      print('[wallet-setup] _finish: wallet persisted addr=${info.address}');
+
+      // Best-effort on-chain username registration. Connection might
+      // not be up yet (user can create the wallet locally regardless);
+      // failures just log and continue — the registration retries
+      // automatically the next time the user opens the profile / does
+      // anything that pings the chain. We don't block the wallet flow
+      // on it.
+      if (username.isNotEmpty) {
+        await _tryRegisterUsername(info, username);
+      }
+
+      // ignore: avoid_print
+      print('[wallet-setup] _finish: calling onComplete');
       widget.onComplete();
-    } catch (e) {
+      // ignore: avoid_print
+      print('[wallet-setup] _finish: onComplete returned');
+    } catch (e, st) {
+      // ignore: avoid_print
+      print('[wallet-setup] _finish: FAILED — $e\n$st');
       setState(() {
         _busy  = false;
         _error = 'Wallet setup failed: $e';
       });
     }
+  }
+
+  Future<void> _tryRegisterUsername(WalletInfo info, String username) async {
+    try {
+      final disc = context.read<LibratsDiscovery>();
+      final homePid = disc.autoSelectedRatsPeerId;
+      if (homePid.isEmpty) {
+        // ignore: avoid_print
+        print('[wallet-setup] register skipped — no full node yet');
+        return;
+      }
+      final rats = RatsClient.instance;
+      // 1. Fetch nonce.
+      final nonceReply = await rats.request(homePid, 'wallet.nonce',
+          {'address': info.address},
+          timeout: const Duration(seconds: 6));
+      final nonce =
+          ((nonceReply as Map?) ?? const {})['nonce'] as int? ?? 0;
+      // 2. Build sign_message preimage. Mirrors UsernameTx::sign_message
+      //    in src/core/transaction.cpp:
+      //       u32 LE  MC_CHAIN_ID (19779)
+      //       u8      name length
+      //       bytes   name
+      //       20      owner address
+      //       33      owner pubkey (compressed)
+      //       u64 LE  nonce
+      const int chainId = 19779;
+      final nameBytes = utf8.encode(username);
+      final addrBytes = _hexToBytes(info.address);
+      final pkBytes   = _hexToBytes(info.publicKey);
+      if (addrBytes.length != 20 || pkBytes.length != 33) {
+        // ignore: avoid_print
+        print('[wallet-setup] register skipped — addr=${addrBytes.length} pk=${pkBytes.length} (bad lengths)');
+        return;
+      }
+      final bb = BytesBuilder(copy: false);
+      for (int s = 0; s < 4; ++s)  bb.addByte((chainId >> (8 * s)) & 0xff);
+      bb.addByte(nameBytes.length);
+      bb.add(nameBytes);
+      bb.add(addrBytes);
+      bb.add(pkBytes);
+      for (int s = 0; s < 8; ++s)  bb.addByte((nonce >> (8 * s)) & 0xff);
+      final preimage = bb.toBytes();
+      // 3. Sign locally — mc_wallet_sign hashes (sha256) + secp256k1
+      //    signs, returning a 64-byte sig as 128 hex chars.
+      final sigHex = widget.walletService.sign(preimage);
+      // 4. Submit.
+      final result = await rats.request(homePid, 'username.register', {
+        'name':          username,
+        'owner_address': info.address,
+        'owner_pubkey':  info.publicKey,
+        'nonce':         nonce,
+        'signature':     sigHex,
+      }, timeout: const Duration(seconds: 6));
+      // ignore: avoid_print
+      print('[wallet-setup] username.register OK: $result');
+    } catch (e) {
+      // ignore: avoid_print
+      print('[wallet-setup] username register failed (will retry later): $e');
+    }
+  }
+
+  Uint8List _hexToBytes(String hex) {
+    String s = hex;
+    if (s.startsWith('0x') || s.startsWith('0X')) s = s.substring(2);
+    if (s.length % 2 != 0) {
+      throw FormatException('odd-length hex: ${s.length}');
+    }
+    final out = Uint8List(s.length ~/ 2);
+    for (int i = 0; i < out.length; ++i) {
+      out[i] = int.parse(s.substring(i * 2, i * 2 + 2), radix: 16);
+    }
+    return out;
   }
 
   @override
@@ -398,32 +495,27 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
   }
 
   Widget _buildPickIdentity({required bool connected}) {
-    // Gate Finish on having a live full-node handshake. The first
-    // operation right after _finish (username register + initial
-    // library announce) needs to reach a full node; running it before
-    // discovery completes drops every tx on the floor.
-    final canFinish = !_busy && connected;
-    final String buttonLabel;
-    if (_busy) {
-      buttonLabel = 'Setting up…';
-    } else if (!connected) {
-      buttonLabel = 'Waiting for full node connection…';
-    } else {
-      buttonLabel = 'Finish setup';
-    }
+    // Wallet creation is purely local — derive keypair from BIP39,
+    // write the encrypted file, stash the mnemonic in the keyring.
+    // None of that needs a live network. If the connection happens to
+    // be up we also fire username.register from inside _finish so the
+    // chain learns the new account; if not, the registration retries
+    // on the next reconnect (see WalletProvider's pending-register
+    // queue). Either way the user can move past this screen.
+    final canFinish = !_busy;
+    final buttonLabel = _busy ? 'Setting up…' : 'Create account';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const Text(
-          'Pick a username and an unlock password',
+          'Pick a username',
           style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
         ),
         const SizedBox(height: 8),
         const Text(
           'Username is optional — leave blank to be visible only by your '
-          'wallet address. The unlock password is local; it encrypts the '
-          'wallet file on this device so a thief who gets your unlocked '
-          'phone can\'t spend.',
+          'wallet address. Your 12-word recovery phrase is the only thing '
+          'you ever need to sign back in on another device, no password.',
         ),
         const SizedBox(height: 24),
         TextField(
@@ -432,15 +524,6 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
           decoration: const InputDecoration(
             border: OutlineInputBorder(),
             labelText: 'Username (3–30 chars, a-z 0-9 _, optional)',
-          ),
-        ),
-        const SizedBox(height: 12),
-        TextField(
-          controller: _passwordController,
-          obscureText: true,
-          decoration: const InputDecoration(
-            border: OutlineInputBorder(),
-            labelText: 'Unlock password (min 6 chars)',
           ),
         ),
         if (_error != null) ...[

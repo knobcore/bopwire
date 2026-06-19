@@ -32,12 +32,10 @@ class WalletLoginScreen extends StatefulWidget {
 }
 
 class _WalletLoginScreenState extends State<WalletLoginScreen> {
-  final _passwordController = TextEditingController();
   final _mnemonicController = TextEditingController();
   String _savedUsername = '';
   bool _busy = false;
   String? _error;
-  bool _showMnemonicPath = false;
 
   @override
   void initState() {
@@ -52,30 +50,8 @@ class _WalletLoginScreenState extends State<WalletLoginScreen> {
 
   @override
   void dispose() {
-    _passwordController.dispose();
     _mnemonicController.dispose();
     super.dispose();
-  }
-
-  Future<void> _loginWithPassword() async {
-    setState(() {
-      _busy = true;
-      _error = null;
-    });
-    try {
-      final info = await widget.walletService.loadWallet(_passwordController.text);
-      if (info == null) {
-        throw Exception('Wrong password — try again or use your recovery phrase.');
-      }
-      widget.onLoggedIn();
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _busy = false;
-          _error = e.toString().replaceFirst('Exception: ', '');
-        });
-      }
-    }
   }
 
   Future<void> _loginWithMnemonic() async {
@@ -89,14 +65,13 @@ class _WalletLoginScreenState extends State<WalletLoginScreen> {
       _error = null;
     });
     try {
-      // Same call path as first-launch restore: derive the keypair from
-      // the mnemonic, persist under a fresh local password. We default
-      // the password to the mnemonic's first word for now so the user
-      // doesn't get a third prompt — they can change it in settings.
-      final firstWord = mnemonic.split(' ').first;
+      // The mnemonic IS the password — same as first-launch. Derives
+      // the keypair, encrypts the on-disk key file under the mnemonic,
+      // and stashes the mnemonic in the platform keyring so the next
+      // app launch auto-unlocks without prompting.
       await widget.walletService.createWalletFromMnemonic(
         mnemonic: mnemonic,
-        password: firstWord, // see comment above; fine for MVP
+        password: mnemonic,
       );
       widget.onLoggedIn();
     } catch (e) {
@@ -123,10 +98,10 @@ class _WalletLoginScreenState extends State<WalletLoginScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Log in')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
+      appBar: AppBar(title: const Text('Sign in')),
+      body: SafeArea(
         child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -156,78 +131,41 @@ class _WalletLoginScreenState extends State<WalletLoginScreen> {
                 ),
               ],
               const SizedBox(height: 24),
-              if (!_showMnemonicPath) ...[
-                const Text(
-                  'Unlock with your password',
-                  style: TextStyle(fontWeight: FontWeight.w600),
+              const Text(
+                'Sign in with your recovery phrase',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Type the 12 words from any device that uses the same '
+                'wallet. We derive the keypair locally; no part of the '
+                'phrase leaves the device.',
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _mnemonicController,
+                maxLines: 3,
+                autocorrect: false,
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                  hintText: 'word1 word2 word3 …',
                 ),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: _passwordController,
-                  obscureText: true,
-                  onSubmitted: (_) => _loginWithPassword(),
-                  decoration: const InputDecoration(
-                    border: OutlineInputBorder(),
-                    labelText: 'Password',
-                  ),
-                ),
-                if (_error != null) ...[
-                  const SizedBox(height: 12),
-                  Text(_error!, style: const TextStyle(color: Colors.redAccent)),
-                ],
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: _busy ? null : _loginWithPassword,
-                  child: _busy
-                      ? const CircularProgressIndicator()
-                      : const Text('Unlock'),
-                ),
-                const SizedBox(height: 16),
-                TextButton(
-                  onPressed: () =>
-                      setState(() => _showMnemonicPath = true),
-                  child: const Text(
-                      'Use my 12-word recovery phrase instead'),
-                ),
-              ] else ...[
-                const Text(
-                  'Restore from recovery phrase',
-                  style: TextStyle(fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  'Type the 12 words from any device that uses the same '
-                  'wallet. We derive the keypair locally; no part of the '
-                  'phrase leaves the device.',
-                ),
+              ),
+              if (_error != null) ...[
                 const SizedBox(height: 12),
-                TextField(
-                  controller: _mnemonicController,
-                  maxLines: 3,
-                  autocorrect: false,
-                  decoration: const InputDecoration(
-                    border: OutlineInputBorder(),
-                    hintText: 'word1 word2 word3 …',
-                  ),
-                ),
-                if (_error != null) ...[
-                  const SizedBox(height: 12),
-                  Text(_error!, style: const TextStyle(color: Colors.redAccent)),
-                ],
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: _busy ? null : _loginWithMnemonic,
-                  child: _busy
-                      ? const CircularProgressIndicator()
-                      : const Text('Restore'),
-                ),
-                const SizedBox(height: 16),
-                TextButton(
-                  onPressed: () =>
-                      setState(() => _showMnemonicPath = false),
-                  child: const Text('Back to password'),
-                ),
+                Text(_error!, style: const TextStyle(color: Colors.redAccent)),
               ],
+              const SizedBox(height: 16),
+              ElevatedButton(
+                onPressed: _busy ? null : _loginWithMnemonic,
+                child: _busy
+                    ? const SizedBox(
+                        height: 20,
+                        width:  20,
+                        child:  CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Sign in'),
+              ),
               const Divider(height: 48),
               TextButton.icon(
                 onPressed: _signOut,

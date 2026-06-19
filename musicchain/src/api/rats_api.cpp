@@ -5,6 +5,7 @@
 #include "../util/traffic.h"
 #include "../sync/block_propagator.h"
 #include "../net/relay_credit_tracker.h"
+#include "../core/transaction.h"
 
 // mc_rats_quic.h was the old stub. We now link the real librats and
 // consume its C bindings header so functions like rats_get_peer_info_json
@@ -341,6 +342,71 @@ void RatsApi::handle_request(const std::string& peer_id,
         } else if (type == "wallet.escrow_balance") {
             reply = wrap_handler_result(req_id,
                 http_.verb_wallet_escrow_balance(in.value("address", "")));
+        }
+        // ---- account registration ---------------------------------------
+        //
+        // The player signs a UsernameTx preimage locally (sign_message in
+        // src/core/transaction.cpp — chain_id || u8 name_len || name ||
+        // owner || pubkey || nonce, LE everywhere) and sends it here.
+        // Server-side we reconstruct the UsernameTx, run verify_signature
+        // against the signing_hash + pubkey, then queue + wake the
+        // producer. No password needed — the BIP39 mnemonic is the
+        // whole credential, the chain only sees the public address and
+        // a signature over it.
+        else if (type == "username.register") {
+            try {
+                const std::string name     = in.value("name", "");
+                const std::string addr_hex = in.value("owner_address", "");
+                const std::string pk_hex   = in.value("owner_pubkey",  "");
+                const uint64_t    nonce    = in.value("nonce", uint64_t{0});
+                const std::string sig_hex  = in.value("signature", "");
+                if (name.empty() || addr_hex.empty() || pk_hex.empty() ||
+                    sig_hex.empty()) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error",  "missing required field"}};
+                } else {
+                    UsernameTx tx{};
+                    tx.name  = name;
+                    tx.nonce = nonce;
+                    bool malformed = false;
+                    if (!crypto::parse_address(addr_hex, tx.owner)) malformed = true;
+                    auto pk_bytes  = crypto::from_hex(pk_hex);
+                    auto sig_bytes = crypto::from_hex(sig_hex);
+                    if (pk_bytes.size() != 33 || sig_bytes.size() != 64)
+                        malformed = true;
+                    if (malformed) {
+                        reply = {{"req_id", req_id}, {"status", "invalid"},
+                                 {"error",  "bad address / pubkey / signature hex"}};
+                    } else {
+                        std::copy(pk_bytes.begin(),  pk_bytes.end(),
+                                  tx.owner_pubkey.begin());
+                        std::copy(sig_bytes.begin(), sig_bytes.end(),
+                                  tx.signature.begin());
+                        if (!tx.verify_signature()) {
+                            reply = {{"req_id", req_id}, {"status", "invalid"},
+                                     {"error",  "signature did not verify"}};
+                        } else {
+                            const auto h   = tx.tx_hash();
+                            const auto raw = tx.serialize();
+                            if (!db_.put_pending_tx(h, raw)) {
+                                reply = {{"req_id", req_id}, {"status", "rejected"},
+                                         {"error",  "could not queue tx"}};
+                            } else {
+                                candidates_.wake();
+                                reply = {{"req_id", req_id}, {"status", "ok"},
+                                         {"body",   {{"tx_hash",
+                                                      crypto::to_hex(h)}}}};
+                                std::cout << "[rats-api] username.register: "
+                                          << name << " queued for "
+                                          << addr_hex.substr(0, 10) << "…\n";
+                            }
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                reply = {{"req_id", req_id}, {"status", "server_error"},
+                         {"error",  e.what()}};
+            }
         }
         // ---- session control --------------------------------------------
         else if (type == "session.start") {
