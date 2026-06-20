@@ -707,13 +707,17 @@ void RatsApi::handle_request(const std::string& peer_id,
                         reg.track_number             = static_cast<uint16_t>(
                             in.value("track_number", 0));
                         // artist_address optional — leave zero if absent.
-                        const std::string aa_hex     = in.value("artist_address",
-                                                                std::string());
-                        if (aa_hex.size() == 40) {
-                            auto raw = crypto::from_hex(aa_hex);
-                            if (raw.size() == 20) {
-                                std::copy(raw.begin(), raw.end(),
-                                          reg.artist_address.begin());
+                        // Accept any form parse_address() handles: bare
+                        // 40-hex, 0x-prefixed, EIP-55 mixed-case. Older
+                        // clients that omit the field land at zero and
+                        // the artist share routes through the unclaimed
+                        // escrow (see compute_mint_outputs).
+                        const std::string aa_hex = in.value("artist_address",
+                                                            std::string());
+                        if (!aa_hex.empty()) {
+                            Address parsed{};
+                            if (crypto::parse_address(aa_hex, parsed)) {
+                                reg.artist_address = parsed;
                             }
                         }
                         reg.announcing_peer_id       = announcing_pid;

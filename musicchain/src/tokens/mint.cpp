@@ -10,6 +10,7 @@ std::vector<MintOutput> compute_mint_outputs(const PlayProof& proof,
                                               const Hash256& /*serving_node_id*/,
                                               const Address& serving_node_address) {
     std::vector<MintOutput> outputs;
+    const Address zero_addr{};
 
     if (play_count < FULL_REWARD_THRESHOLD) {
         // Pre-10k tier:
@@ -33,12 +34,16 @@ std::vector<MintOutput> compute_mint_outputs(const PlayProof& proof,
                                        portion});
             }
         } else {
+            // Songs registered without an artist_address (older player
+            // builds that omitted the field) land here with all-zero
+            // artist_address; escrow_address_for(zero) is a deterministic
+            // "unclaimed" escrow that a moderator can release once the
+            // artist is identified.
             outputs.push_back({crypto::escrow_address_for(song.artist_address),
                                artist_share});
         }
         outputs.push_back({serving_node_address, node_share});
 
-        Address zero_addr{};
         if (discoverer_share > 0 && proof.player_address != zero_addr)
             outputs.push_back({proof.player_address, discoverer_share});
 
@@ -59,8 +64,14 @@ std::vector<MintOutput> compute_mint_outputs(const PlayProof& proof,
                 if (portion > 0)
                     outputs.push_back({rs.address, portion});
             }
-        } else {
+        } else if (song.artist_address != zero_addr) {
             outputs.push_back({song.artist_address, artist_share});
+        } else {
+            // No artist registered AND we're past 10k plays so escrow is
+            // gone: route through the deterministic unclaimed escrow so a
+            // late claim still has somewhere to release from.
+            outputs.push_back({crypto::escrow_address_for(song.artist_address),
+                               artist_share});
         }
         outputs.push_back({serving_node_address, node_share});
     }

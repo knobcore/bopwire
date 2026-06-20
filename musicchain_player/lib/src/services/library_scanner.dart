@@ -76,6 +76,25 @@ class LibraryScanner {
   LibraryScanner._();
   static final LibraryScanner instance = LibraryScanner._();
 
+  // Plain 40-hex (no 0x prefix) wallet address the user currently has
+  // loaded. WalletProvider sets this whenever a wallet is created /
+  // imported / auto-loaded so the next fingerprint.submit attaches it
+  // as the artist_address — the chain then credits future play royalties
+  // to this wallet instead of the zero address (which is what happened
+  // when the field was omitted).
+  static String _artistAddress = '';
+  // ignore: avoid_setters_without_getters
+  static set artistAddress(String addr) {
+    // Strip 0x prefix if the caller passed an EIP-55 form. The chain's
+    // rats_api fingerprint.submit handler requires exactly 40 hex chars
+    // (rats_api.cpp line "if (aa_hex.size() == 40)").
+    var v = addr;
+    if (v.length == 42 && (v.startsWith('0x') || v.startsWith('0X'))) {
+      v = v.substring(2);
+    }
+    _artistAddress = v;
+  }
+
   /// Prompt for the storage permissions LibraryScanner needs. Safe to call
   /// from UI before opening the system folder picker so the user grants
   /// "All files access" once instead of finding the picker empty.
@@ -398,6 +417,7 @@ class LibraryScanner {
             'bitrate':          existingByPath.bitrate,
             'duration_ms':      existingByPath.durationMs,
             'audio_format':     existingByPath.audioFormat,
+            if (_artistAddress.isNotEmpty) 'artist_address': _artistAddress,
           }, timeout: const Duration(seconds: 10));
           final m = (reply is Map<String, dynamic>) ? reply : const {};
           if (m['matched'] == true) {
@@ -479,6 +499,7 @@ class LibraryScanner {
         'track_number':     trackNumber,
         'bitrate':          bitrate,
         'audio_format':     fmt,
+        if (_artistAddress.isNotEmpty) 'artist_address': _artistAddress,
       }, timeout: const Duration(seconds: 20));
 
       final m = (reply as Map<String, dynamic>?) ?? const {};

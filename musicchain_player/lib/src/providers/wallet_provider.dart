@@ -7,6 +7,7 @@ import '../models/wallet.dart';
 import '../services/wallet_service.dart';
 import '../services/node_client.dart';
 import '../services/node_service.dart';
+import '../services/library_scanner.dart';
 
 class WalletProvider extends ChangeNotifier {
   WalletProvider() {
@@ -44,10 +45,38 @@ class WalletProvider extends ChangeNotifier {
       final info = await _service.tryAutoLoad();
       if (info != null) {
         _info = info;
+        LibraryScanner.artistAddress = info.address;
         notifyListeners();
         unawaited(refreshBalance());
       }
     } catch (_) { /* no saved wallet or stale keyring entry — ignore */ }
+  }
+
+  /// Re-run the auto-load path. Used after the wallet first-launch flow
+  /// finishes — WalletService just wrote a fresh keypair to disk, but
+  /// this provider was constructed at app startup BEFORE that write
+  /// happened, so `_info` is still null. Without this nudge the wallet
+  /// screen renders its `!hasWallet` spinner forever. Idempotent: safe
+  /// to call at any time.
+  Future<void> reload() async {
+    await _tryAutoLoad();
+  }
+
+  /// Adopt a freshly-derived WalletInfo without round-tripping through
+  /// disk. The encrypted-save / encrypted-load path on the C++ side
+  /// (mc_wallet_save writes unencrypted, mc_wallet_load expects
+  /// encrypted — see musicchain/src/capi/capi.cpp comment "Save
+  /// unencrypted for simplicity") makes auto-load fail every time
+  /// after a sign-in. This path lets the create/login flows publish
+  /// the WalletInfo straight into the provider so the Wallet tab
+  /// renders immediately, while the persisted encrypted-load bug gets
+  /// fixed separately.
+  void setWallet(WalletInfo info) {
+    _info  = info;
+    _error = null;
+    LibraryScanner.artistAddress = info.address;
+    notifyListeners();
+    unawaited(refreshBalance());
   }
 
   // Try to load existing wallet on startup
@@ -57,7 +86,10 @@ class WalletProvider extends ChangeNotifier {
     try {
       _info  = await _service.loadWallet(password);
       _error = null;
-      if (_info != null) await refreshBalance();
+      if (_info != null) {
+        LibraryScanner.artistAddress = _info!.address;
+        await refreshBalance();
+      }
     } catch (e) {
       _error = e.toString();
     }
