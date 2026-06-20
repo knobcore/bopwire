@@ -184,10 +184,17 @@ std::vector<uint8_t> bip39_mnemonic_to_seed(const std::string& mnemonic,
 
 std::optional<KeyPair> bip39_mnemonic_to_keypair(
     const std::string& mnemonic, const std::string& passphrase) {
+    // NOTE: legacy fallback file — not linked. The CMake target list
+    // pulls wally_bip39.cpp which does proper BIP32 derivation
+    // (m/44'/19779'/0'/0/0 → child priv → keypair_from_priv_bytes).
+    // This stub is kept only so the file still compiles after
+    // keypair_from_seed was removed. If you re-enable this file you
+    // also need to add BIP32 derivation here or you'll ship the
+    // wrong address for every existing libwally-derived wallet.
     auto seed = bip39_mnemonic_to_seed(mnemonic, passphrase);
     if (seed.size() != 64) return std::nullopt;
     try {
-        return keypair_from_seed(seed.data(), 32);
+        return keypair_from_priv_bytes(seed.data());
     } catch (...) {
         return std::nullopt;
     }

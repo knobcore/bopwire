@@ -2,8 +2,6 @@ import 'dart:ffi';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:path_provider/path_provider.dart';
-import 'dart:io';
 
 import '../ffi/native_library.dart';
 import '../ffi/wallet_mnemonic_bindings.dart';
@@ -11,15 +9,12 @@ import '../models/wallet.dart';
 
 class WalletService {
   static const _secureStorage = FlutterSecureStorage();
-  static const _walletPathKey     = 'mc_wallet_path';
-  // Stored alongside the path so the next app launch can auto-load
-  // without prompting. flutter_secure_storage backs onto Keychain on
-  // iOS / KeyStore on Android / DPAPI on Windows, so the password
-  // doesn't sit in plain prefs.
-  static const _walletPasswordKey = 'mc_wallet_password';
-  // The 12-word BIP39 mnemonic. Stored encrypted via the platform
-  // keyring (same backing as the password) so a device wipe doesn't
-  // leave it recoverable from a cold disk image.
+  // The 12-word BIP39 mnemonic. The recovery secret lives ONLY here —
+  // platform secure storage (Keychain / KeyStore / DPAPI). The legacy
+  // disk-save path that wrote the 32 priv-key bytes to a plain file
+  // was removed because the file sat right next to the mnemonic-
+  // protected entry and could be read by any process with data-dir
+  // access. On launch we rederive via mc_wallet_from_mnemonic.
   static const _walletMnemonicKey = 'mc_wallet_mnemonic';
   // Username the user picked at wallet creation. Cached locally so the
   // login screen can pre-fill it; the canonical record is on chain.
@@ -31,46 +26,22 @@ class WalletService {
   bool get hasWallet => _walletHandle != null;
   WalletInfo? get info => _cachedInfo;
 
-  /// True when a wallet file exists on disk (regardless of whether we've
-  /// loaded it into memory yet). Used by the auto-load path to decide
-  /// whether prompting the user for a password is even necessary.
+  /// True when a mnemonic exists in platform secure storage. Used by
+  /// the boot path to decide whether to show first-launch UI.
   Future<bool> hasSavedWallet() async {
-    return (await _secureStorage.read(key: _walletPathKey)) != null;
+    return (await _secureStorage.read(key: _walletMnemonicKey)) != null;
   }
 
-  /// Auto-load the persisted wallet using the password we cached in
-  /// secure storage at create/import/load time. Returns null when there
-  /// is no saved wallet (first run) or when the keyring entry is
-  /// missing — caller falls back to the password prompt in that case.
+  /// Reconstruct the wallet handle from the stored BIP39 mnemonic.
+  /// Returns null on first launch (no saved mnemonic). Idempotent.
   Future<WalletInfo?> tryAutoLoad() async {
-    final path = await _secureStorage.read(key: _walletPathKey);
-    final pw   = await _secureStorage.read(key: _walletPasswordKey);
-    if (path == null || pw == null) return null;
-    return loadWallet(pw);
-  }
-
-  // Load wallet from secure storage
-  Future<WalletInfo?> loadWallet(String password) async {
-    final pathStr = await _secureStorage.read(key: _walletPathKey);
-    if (pathStr == null) return null;
-
-    final pathPtr     = pathStr.toNativeUtf8();
-    final passwordPtr = password.toNativeUtf8();
-    try {
-      final handle = NativeLibrary.bindings
-          .mc_wallet_load(pathPtr.cast(), passwordPtr.cast());
-      if (handle == nullptr) return null;
-      _walletHandle = handle;
-      _updateCache();
-      // Store the password so the next app launch auto-loads via
-      // tryAutoLoad() — the keyring is the only persistent place we
-      // keep it, never plain prefs.
-      await _secureStorage.write(key: _walletPasswordKey, value: password);
-      return _cachedInfo;
-    } finally {
-      calloc.free(pathPtr);
-      calloc.free(passwordPtr);
-    }
+    final mnemonic = await _secureStorage.read(key: _walletMnemonicKey);
+    if (mnemonic == null || mnemonic.isEmpty) return null;
+    final handle = WalletMnemonicBindings.walletFromMnemonic(mnemonic);
+    if (handle == null) return null;
+    _walletHandle = handle;
+    _updateCache();
+    return _cachedInfo;
   }
 
   // ---- BIP39 mnemonic creation / restore ------------------------
@@ -95,15 +66,13 @@ class WalletService {
   }
 
   /// Build (or restore) a wallet from a 12-word mnemonic. Both create
-  /// and restore land here because the path is the same: derive
-  /// keypair → persist to disk under `password` → cache mnemonic in
-  /// the platform keyring for auto-load. `username` is stored locally
-  /// for UI pre-fill; the actual on-chain username registration is a
-  /// separate call (see `submitUsernameRegister`) so the user can opt
-  /// out of being publicly searchable.
+  /// and restore land here. The mnemonic alone is the recovery secret;
+  /// it's persisted in platform secure storage and the libwally
+  /// derivation runs fresh on every launch. `username` is stored
+  /// locally for UI pre-fill; the on-chain registration is a separate
+  /// call (see submitUsernameRegister).
   Future<WalletInfo> createWalletFromMnemonic({
     required String mnemonic,
-    required String password,
     String username = '',
   }) async {
     final cleaned = mnemonic.trim().toLowerCase();
@@ -115,7 +84,7 @@ class WalletService {
       throw Exception('Failed to derive wallet from mnemonic');
     }
     _walletHandle = handle;
-    await _saveAndCache(password);
+    _updateCache();
     await _secureStorage.write(key: _walletMnemonicKey, value: cleaned);
     if (username.isNotEmpty) {
       await _secureStorage.write(key: _walletUsernameKey, value: username);
@@ -137,19 +106,12 @@ class WalletService {
     return (await _secureStorage.read(key: _walletUsernameKey)) ?? '';
   }
 
-  /// Wipe everything we cached for this wallet — keyring entries +
-  /// on-disk wallet file. Used by the "Sign out / log into a different
-  /// wallet" flow. The chain entries for the wallet (username, level,
-  /// etc.) are untouched because they're on-chain.
+  /// Wipe everything we cached for this wallet — the mnemonic plus
+  /// the username display cache. Used by the "Sign out / log into a
+  /// different wallet" flow. The chain entries for the wallet
+  /// (username, level, etc.) are untouched because they're on-chain.
   Future<void> clearLocalWallet() async {
     freeWallet();
-    final pathStr = await _secureStorage.read(key: _walletPathKey);
-    if (pathStr != null) {
-      final f = File(pathStr);
-      if (await f.exists()) await f.delete();
-    }
-    await _secureStorage.delete(key: _walletPathKey);
-    await _secureStorage.delete(key: _walletPasswordKey);
     await _secureStorage.delete(key: _walletMnemonicKey);
     await _secureStorage.delete(key: _walletUsernameKey);
   }
@@ -185,20 +147,6 @@ class WalletService {
   }
 
   // ---- Internal -------------------------------------------------------
-
-  Future<void> _saveAndCache(String password) async {
-    final dir = await getApplicationSupportDirectory();
-    final path = '${dir.path}/wallet/player.key';
-    await Directory('${dir.path}/wallet').create(recursive: true);
-
-    final pathPtr = path.toNativeUtf8();
-    NativeLibrary.bindings.mc_wallet_save(_walletHandle!, pathPtr.cast());
-    calloc.free(pathPtr);
-
-    await _secureStorage.write(key: _walletPathKey,     value: path);
-    await _secureStorage.write(key: _walletPasswordKey, value: password);
-    _updateCache();
-  }
 
   void _updateCache() {
     if (_walletHandle == null) return;

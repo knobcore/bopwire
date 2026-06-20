@@ -1849,31 +1849,15 @@ void action_login(mc::Database& db, const std::string& data_dir,
         }
     }
 
-    // Path 1b: legacy passphrase via PBKDF2.
-    {
-        auto seed = mc::crypto::derive_seed_pbkdf2_sha512(
-            entered, kFounderSalt, kFounderIters);
-        auto kp = mc::crypto::keypair_from_seed(seed.data(), seed.size());
-        if (try_kp_for_login(kp)) {
-            mv.last_action = "login: authenticated (level "
-                           + std::to_string(mod.level) + ")";
-            mv.last_action_color = CP_OK;
-            return;
-        }
-    }
-
-    // Path 2: treat input as raw hex private key.
-    if (entered.size() == 64) {
-        mc::crypto::KeyPair kp;
-        if (mc::crypto::keypair_from_hex(entered, kp)) {
-            if (try_kp_for_login(kp)) {
-                mv.last_action = "login: authenticated (level "
-                               + std::to_string(mod.level) + ")";
-                mv.last_action_color = CP_OK;
-                return;
-            }
-        }
-    }
+    // Path 1b ("PBKDF2 passphrase → keypair_from_seed") and Path 2
+    // ("raw 64-hex priv → keypair_from_hex") were removed alongside
+    // the SHA-256-rehashed keypair_from_* helpers themselves. Their
+    // rehash step silently produced a DIFFERENT key than every
+    // standard secp256k1 / EVM tool computed from the same bytes, so
+    // the moderator level the operator typed against the chain didn't
+    // correspond to any address an external recovery tool could
+    // produce. The only login routes now are Path 1a (mnemonic) and
+    // the username → mnemonic prompt above.
 
     // Deliberately vague — don't tell the operator whether the input
     // was malformed, parsed but unknown, or known-but-revoked. Same

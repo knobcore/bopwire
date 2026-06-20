@@ -49,20 +49,6 @@ struct WalletHandle {
     mc::crypto::KeyPair kp;
 };
 
-mc_wallet_t mc_wallet_load(const char* path, const char* password) {
-    try {
-        mc::crypto::EncryptedKey ek;
-        if (!mc::crypto::load_encrypted_key(path, ek)) { set_error("load failed"); return nullptr; }
-        std::vector<uint8_t> priv;
-        if (!mc::crypto::decrypt_key(ek, password, priv)) { set_error("bad password"); return nullptr; }
-        auto kp = mc::crypto::keypair_from_seed(priv.data(), priv.size());
-        return new WalletHandle{kp};
-    } catch (const std::exception& e) {
-        set_error(e.what());
-        return nullptr;
-    }
-}
-
 // ---- BIP39 mnemonic wallet flow -------------------------------------
 //
 // NB: the function definitions here drop the `extern "C" MUSICCHAIN_API`
@@ -101,35 +87,18 @@ mc_wallet_t mc_wallet_from_mnemonic(
     }
 }
 
-char* mc_wallet_get_eth_address(mc_wallet_t wallet) {
-    auto* w = static_cast<WalletHandle*>(wallet);
-    if (!w) { set_error("null wallet"); return nullptr; }
-    auto a = mc::crypto::eth_address_from_pubkey(w->kp.public_key);
-    // Format as 0x-prefixed lowercase 40-hex per Ethereum convention.
-    static const char hex_lut[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(42);
-    out.append("0x");
-    for (uint8_t b : a) {
-        out.push_back(hex_lut[b >> 4]);
-        out.push_back(hex_lut[b & 0x0f]);
-    }
-    return make_cstring(out);
-}
-
-int mc_wallet_save(mc_wallet_t wallet, const char* path) {
-    auto* w = static_cast<WalletHandle*>(wallet);
-    // Save unencrypted for simplicity (production should use encrypt_key)
-    return mc::crypto::save_keypair(path, std::string(path) + ".pub", w->kp) ? 0 : -1;
-}
-
 void mc_wallet_free(mc_wallet_t wallet) {
     delete static_cast<WalletHandle*>(wallet);
 }
 
 char* mc_wallet_get_address(mc_wallet_t wallet) {
     auto* w = static_cast<WalletHandle*>(wallet);
-    return make_cstring(mc::crypto::to_hex(w->kp.address.data(), 20));
+    if (!w) { set_error("null wallet"); return nullptr; }
+    return make_cstring(mc::crypto::to_checksum_hex(w->kp.address));
+}
+
+char* mc_wallet_get_eth_address(mc_wallet_t wallet) {
+    return mc_wallet_get_address(wallet);
 }
 
 char* mc_wallet_get_public_key(mc_wallet_t wallet) {

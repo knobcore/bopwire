@@ -13,18 +13,26 @@
 // a friend's handle to an address.
 
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 
+import '../providers/wallet_provider.dart';
 import '../services/wallet_service.dart';
-import 'wallet_first_launch_screen.dart';
 
 class WalletLoginScreen extends StatefulWidget {
   final WalletService walletService;
   final VoidCallback onLoggedIn;
+  /// Called when the user taps "Sign out and start fresh" after the
+  /// stored wallet has been cleared from disk. The gate uses this to
+  /// transition `_state` to `firstLaunch` WITHOUT swapping the route
+  /// (which would unmount the gate's State and silently drop the
+  /// subsequent onLoggedIn callback).
+  final VoidCallback onResetWallet;
 
   const WalletLoginScreen({
     super.key,
     required this.walletService,
     required this.onLoggedIn,
+    required this.onResetWallet,
   });
 
   @override
@@ -65,14 +73,19 @@ class _WalletLoginScreenState extends State<WalletLoginScreen> {
       _error = null;
     });
     try {
-      // The mnemonic IS the password — same as first-launch. Derives
-      // the keypair, encrypts the on-disk key file under the mnemonic,
-      // and stashes the mnemonic in the platform keyring so the next
-      // app launch auto-unlocks without prompting.
-      await widget.walletService.createWalletFromMnemonic(
+      // The mnemonic is the only credential. createWalletFromMnemonic
+      // derives the keypair via libwally BIP39+BIP32, caches it in
+      // memory, and stores the mnemonic in platform secure storage
+      // (Keychain / KeyStore / DPAPI) for the next launch to rederive.
+      final info = await widget.walletService.createWalletFromMnemonic(
         mnemonic: mnemonic,
-        password: mnemonic,
       );
+      // Push WalletInfo directly into WalletProvider so the wallet
+      // tab renders immediately — tryAutoLoad on next cold start
+      // rebuilds the same WalletInfo from the saved mnemonic.
+      try {
+        if (mounted) context.read<WalletProvider>().setWallet(info);
+      } catch (_) {}
       widget.onLoggedIn();
     } catch (e) {
       if (mounted) {
@@ -87,12 +100,14 @@ class _WalletLoginScreenState extends State<WalletLoginScreen> {
   Future<void> _signOut() async {
     await widget.walletService.clearLocalWallet();
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(MaterialPageRoute(
-      builder: (_) => WalletFirstLaunchScreen(
-        walletService: widget.walletService,
-        onComplete: widget.onLoggedIn,
-      ),
-    ));
+    // Defer to the gate to swap to the first-launch screen. Using
+    // Navigator.pushReplacement here would TEAR DOWN the WalletGate
+    // (since the gate IS the home route), so by the time
+    // WalletFirstLaunchScreen calls its onComplete the gate's State
+    // is already disposed and the setState that should transition us
+    // to home gets dropped on the floor. Symptom: the spinner just
+    // keeps spinning after Create account.
+    widget.onResetWallet();
   }
 
   @override

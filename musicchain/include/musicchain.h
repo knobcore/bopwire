@@ -50,12 +50,15 @@ MUSICCHAIN_API void mc_free(void* ptr);
 MUSICCHAIN_API const char* mc_last_error(void);
 
 // ---- Wallet ---------------------------------------------------------
+//
+// Address format: every wallet- or RPC-returned address is "0x" + 40
+// hex chars in EIP-55 mixed-case checksum form. The same form is what
+// every endpoint expects on input — parse helpers accept either lower-
+// case-with-0x or full EIP-55, but reject mixed-case with a bad
+// checksum so typos surface immediately. There is no legacy
+// no-prefix / no-checksum representation anymore.
 
 typedef void* mc_wallet_t;
-
-/** Load an existing wallet from path.
- *  Returns a wallet handle, or NULL on failure. */
-MUSICCHAIN_API mc_wallet_t mc_wallet_load(const char* path, const char* password);
 
 /** Generate a fresh 12-word BIP39 English mnemonic. Caller owns the
  *  returned string and must free it with mc_free. Returns NULL on
@@ -67,27 +70,30 @@ MUSICCHAIN_API char*        mc_bip39_generate_12(void);
 MUSICCHAIN_API int          mc_bip39_validate(const char* mnemonic);
 
 /** Derive a wallet from a BIP39 mnemonic + optional passphrase
- *  (passphrase may be NULL for empty). Returns NULL on failure (see
- *  mc_last_error). */
+ *  (passphrase may be NULL for empty). This is the ONLY wallet-creation
+ *  entry point — the unencrypted disk-save path was removed because it
+ *  duplicated the mnemonic's role as the recovery secret while making
+ *  the bytes accessible to anyone with read access to the user data
+ *  dir. Persist the mnemonic in platform secure storage instead, and
+ *  rederive on next launch. Returns NULL on failure (see mc_last_error). */
 MUSICCHAIN_API mc_wallet_t  mc_wallet_from_mnemonic(const char* mnemonic,
                                                     const char* passphrase);
-
-/** Compute the Ethereum-style Base address (0x-prefixed 40-hex,
- *  lowercase) for the wallet's secp256k1 key. Same key, different
- *  derivation — used by the Base bridge so musicchain and Base
- *  addresses are unified under one mnemonic. Caller frees with
- *  mc_free. */
-MUSICCHAIN_API char*        mc_wallet_get_eth_address(mc_wallet_t wallet);
-
-/** Save wallet to path. Returns 0 on success. */
-MUSICCHAIN_API int mc_wallet_save(mc_wallet_t wallet, const char* path);
 
 /** Release wallet handle. */
 MUSICCHAIN_API void mc_wallet_free(mc_wallet_t wallet);
 
-/** Get wallet address as a 40-character hex string (20 bytes).
- *  Caller must free with mc_free(). */
+/** EIP-55 mixed-case checksum address as "0x" + 40 hex chars (42 chars
+ *  total + NUL). This is the canonical user-facing wallet address —
+ *  every RPC, balance lookup, mint output, and transfer endpoint
+ *  consumes/produces this exact form. Caller frees with mc_free(). */
 MUSICCHAIN_API char* mc_wallet_get_address(mc_wallet_t wallet);
+
+/** DEPRECATED alias for mc_wallet_get_address — the chain's wallet
+ *  derivation is already Ethereum-style (keccak256 of the uncompressed
+ *  pubkey, last 20 bytes) so this returns the same string as
+ *  mc_wallet_get_address. Kept only so an older Dart build that still
+ *  imports the symbol links. New code calls mc_wallet_get_address. */
+MUSICCHAIN_API char*        mc_wallet_get_eth_address(mc_wallet_t wallet);
 
 /** Get compressed public key as a 66-character hex string (33 bytes).
  *  Caller must free with mc_free(). */

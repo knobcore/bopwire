@@ -11,11 +11,10 @@ import '../services/library_scanner.dart';
 
 class WalletProvider extends ChangeNotifier {
   WalletProvider() {
-    // Fire-and-forget: pulls the password we cached in secure storage
-    // (Keychain / KeyStore / DPAPI) at create/load/import time and
-    // re-opens the on-disk wallet so the user doesn't have to re-enter
-    // a password every cold start. tryAutoLoad returns null when no
-    // saved wallet exists, which keeps the no-wallet UI as-is.
+    // Fire-and-forget: pulls the BIP39 mnemonic from platform secure
+    // storage (Keychain / KeyStore / DPAPI) and rederives the keypair
+    // via libwally. Returns null on first run, which keeps the no-
+    // wallet UI as-is until first-launch completes.
     _tryAutoLoad();
   }
 
@@ -52,25 +51,19 @@ class WalletProvider extends ChangeNotifier {
     } catch (_) { /* no saved wallet or stale keyring entry — ignore */ }
   }
 
-  /// Re-run the auto-load path. Used after the wallet first-launch flow
-  /// finishes — WalletService just wrote a fresh keypair to disk, but
-  /// this provider was constructed at app startup BEFORE that write
-  /// happened, so `_info` is still null. Without this nudge the wallet
-  /// screen renders its `!hasWallet` spinner forever. Idempotent: safe
-  /// to call at any time.
+  /// Re-run the auto-load path. Used after the wallet first-launch
+  /// flow finishes — this provider was constructed at app startup
+  /// before the mnemonic was written to secure storage, so `_info`
+  /// is still null. Idempotent: safe to call at any time.
   Future<void> reload() async {
     await _tryAutoLoad();
   }
 
-  /// Adopt a freshly-derived WalletInfo without round-tripping through
-  /// disk. The encrypted-save / encrypted-load path on the C++ side
-  /// (mc_wallet_save writes unencrypted, mc_wallet_load expects
-  /// encrypted — see musicchain/src/capi/capi.cpp comment "Save
-  /// unencrypted for simplicity") makes auto-load fail every time
-  /// after a sign-in. This path lets the create/login flows publish
-  /// the WalletInfo straight into the provider so the Wallet tab
-  /// renders immediately, while the persisted encrypted-load bug gets
-  /// fixed separately.
+  /// Adopt a freshly-derived WalletInfo directly. The create/login
+  /// screens already hold the keypair in memory after calling
+  /// createWalletFromMnemonic; pushing it here lets the wallet tab
+  /// render immediately while the next launch will autoload from the
+  /// stored mnemonic.
   void setWallet(WalletInfo info) {
     _info  = info;
     _error = null;
@@ -79,23 +72,6 @@ class WalletProvider extends ChangeNotifier {
     unawaited(refreshBalance());
   }
 
-  // Try to load existing wallet on startup
-  Future<void> tryLoadWallet(String password) async {
-    _loading = true;
-    notifyListeners();
-    try {
-      _info  = await _service.loadWallet(password);
-      _error = null;
-      if (_info != null) {
-        LibraryScanner.artistAddress = _info!.address;
-        await refreshBalance();
-      }
-    } catch (e) {
-      _error = e.toString();
-    }
-    _loading = false;
-    notifyListeners();
-  }
 
   Future<void> refreshBalance() async {
     if (_info == null) return;

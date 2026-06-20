@@ -16,36 +16,29 @@ struct KeyPair {
 // Generate a new random keypair
 KeyPair generate_keypair();
 
-// Derive keypair from 32-byte seed.
-//
-// NOTE: this hashes the input through SHA-256 first ("seed → priv via
-// sha256") which is fine when you literally have an opaque seed but is
-// WRONG for an already-derived 32-byte secp256k1 private key (the
-// extra hash gives you a different key than every other EVM tool).
-// For BIP32-derived child keys use `keypair_from_priv_bytes` below.
-KeyPair keypair_from_seed(const uint8_t* seed, size_t len);
-
 // Build a keypair from an already-finalized 32-byte secp256k1 private
-// key — i.e. the output of BIP32 derivation, hardware-wallet export,
-// or any caller that's responsible for its own key material. Does NOT
-// hash the input. This is the function the libwally + BIP32 wallet
-// flow uses so the address it computes matches the one MetaMask, the
-// Android NDK (`mc_wallet_from_mnemonic`), and ethers.js compute from
-// the same mnemonic at the same path.
+// key. Does NOT hash the input. This is the ONLY supported way to
+// turn 32 priv-key bytes into a KeyPair — the libwally / BIP32 wallet
+// flow, node-key load, and every operator login route go through here
+// so the derived address matches every standard EVM tool (MetaMask,
+// ethers.js, the Android NDK `mc_wallet_from_mnemonic`) computing
+// from those same 32 bytes.
+//
+// The previous helpers `keypair_from_seed` (SHA-256-rehashed input)
+// and `keypair_from_hex` (which chained into it) were removed because
+// the rehash silently shifted the derived address off whatever every
+// other EVM tool produced from the same priv key. Callers wanting a
+// passphrase-based identity derive a mnemonic first (see
+// derive_seed_pbkdf2_sha512 + bip39 flow) and run it through the
+// libwally BIP32 path.
 KeyPair keypair_from_priv_bytes(const uint8_t priv32[32]);
 
 // Derive a deterministic 32-byte seed from a passphrase using
 // PBKDF2-HMAC-SHA512. Domain-separated by the salt string so a
-// passphrase reused elsewhere (encrypted key file etc.) doesn't
-// produce the same key. Used by the founder bootstrap so the founder's
-// private key is "the passphrase in your head" with no on-disk
-// material.
+// passphrase reused elsewhere doesn't produce the same key.
 std::vector<uint8_t> derive_seed_pbkdf2_sha512(const std::string& passphrase,
                                                const std::string& salt,
                                                uint32_t iterations);
-
-// Derive keypair from hex private key string
-bool keypair_from_hex(const std::string& priv_hex, KeyPair& out);
 
 // Derive Address from compressed public key.
 //

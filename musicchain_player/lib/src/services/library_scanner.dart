@@ -76,23 +76,17 @@ class LibraryScanner {
   LibraryScanner._();
   static final LibraryScanner instance = LibraryScanner._();
 
-  // Plain 40-hex (no 0x prefix) wallet address the user currently has
+  // EIP-55 0x-prefixed 42-char wallet address the user currently has
   // loaded. WalletProvider sets this whenever a wallet is created /
   // imported / auto-loaded so the next fingerprint.submit attaches it
-  // as the artist_address — the chain then credits future play royalties
-  // to this wallet instead of the zero address (which is what happened
-  // when the field was omitted).
+  // as the artist_address — the chain then credits future play
+  // royalties to this wallet instead of the zero address (which is
+  // what happened when the field was omitted). The chain's
+  // parse_address_checksummed accepts the full 0x form directly.
   static String _artistAddress = '';
   // ignore: avoid_setters_without_getters
   static set artistAddress(String addr) {
-    // Strip 0x prefix if the caller passed an EIP-55 form. The chain's
-    // rats_api fingerprint.submit handler requires exactly 40 hex chars
-    // (rats_api.cpp line "if (aa_hex.size() == 40)").
-    var v = addr;
-    if (v.length == 42 && (v.startsWith('0x') || v.startsWith('0X'))) {
-      v = v.substring(2);
-    }
-    _artistAddress = v;
+    _artistAddress = addr;
   }
 
   /// Prompt for the storage permissions LibraryScanner needs. Safe to call

@@ -429,14 +429,14 @@ std::pair<int, std::string> HttpServer::get_song(const std::string& content_hash
     json j = {
         {"content_hash", content_hash_hex},
         {"play_count", state.play_count},
-        {"discoverer", crypto::to_hex(state.discoverer_address.data(), 20)},
+        {"discoverer", crypto::to_checksum_hex(state.discoverer_address)},
     };
     return {200, j.dump()};
 }
 
 std::pair<int, std::string> HttpServer::get_balance(const std::string& address_hex) {
     Address addr;
-    if (!crypto::parse_address(address_hex, addr))
+    if (!crypto::parse_address_checksummed(address_hex, addr))
         return {400, R"({"error":"invalid address"})"};
     uint64_t bal = db_.get_balance(addr);
     json j = {{"address", address_hex}, {"balance", Ledger::format_balance(bal)}};
@@ -446,7 +446,7 @@ std::pair<int, std::string> HttpServer::get_balance(const std::string& address_h
 std::pair<int, std::string> HttpServer::get_escrow_balance(
     const std::string& address_hex) {
     Address addr;
-    if (!crypto::parse_address(address_hex, addr))
+    if (!crypto::parse_address_checksummed(address_hex, addr))
         return {400, R"({"error":"invalid address"})"};
     // Escrow lives in the regular ledger under a derived address that
     // has no private key — only the moderator can release via
@@ -455,8 +455,8 @@ std::pair<int, std::string> HttpServer::get_escrow_balance(
     Address escrow = crypto::escrow_address_for(addr);
     uint64_t bal = db_.get_balance(escrow);
     json j = {
-        {"address",        address_hex},
-        {"escrow_address", crypto::to_hex(escrow.data(), 20)},
+        {"address",        crypto::to_checksum_hex(addr)},
+        {"escrow_address", crypto::to_checksum_hex(escrow)},
         {"escrow_balance", Ledger::format_balance(bal)},
     };
     return {200, j.dump()};
@@ -471,7 +471,7 @@ std::pair<int, std::string> HttpServer::post_session_start(const std::string& bo
         Hash256 ch;
         Address pl;
         if (!crypto::parse_hash256(ch_hex, ch)) return {400, R"({"error":"bad content_hash"})"};
-        if (!crypto::parse_address(pl_hex, pl)) return {400, R"({"error":"bad player_address"})"};
+        if (!crypto::parse_address_checksummed(pl_hex, pl)) return {400, R"({"error":"bad player_address"})"};
 
         // Past the 10k-plays cliff, the listener has to burn tokens
         // per play. The required amount is dynamic — zero until the
@@ -744,23 +744,23 @@ std::pair<int, std::string> HttpServer::post_session_complete(
 // ---- Wallet routes --------------------------------------------------
 
 std::pair<int, std::string> HttpServer::get_wallet_address() {
-    json j = {{"address", crypto::to_hex(node_keypair_.address.data(), 20)}};
+    json j = {{"address", crypto::to_checksum_hex(node_keypair_.address)}};
     return {200, j.dump()};
 }
 
 std::pair<int, std::string> HttpServer::get_wallet_nonce(const std::string& address_hex) {
     Address addr;
-    if (!crypto::parse_address(address_hex, addr))
+    if (!crypto::parse_address_checksummed(address_hex, addr))
         return {400, R"({"error":"invalid address"})"};
     uint64_t nonce = db_.get_nonce(addr);
-    json j = {{"address", address_hex}, {"nonce", nonce}};
+    json j = {{"address", crypto::to_checksum_hex(addr)}, {"nonce", nonce}};
     return {200, j.dump()};
 }
 
 std::pair<int, std::string> HttpServer::post_wallet_create() {
     auto kp = crypto::generate_keypair();
     json j = {
-        {"address",     crypto::to_hex(kp.address.data(), 20)},
+        {"address",     crypto::to_checksum_hex(kp.address)},
         {"public_key",  crypto::to_hex(kp.public_key.data(), 33)},
         {"private_key", crypto::to_hex(kp.private_key.data(), kp.private_key.size())},
     };
@@ -774,7 +774,7 @@ static bool verify_moderator_sig(const std::string& mod_addr_hex,
                                   const std::string& sign_msg,
                                   Database& db) {
     Address mod_addr;
-    if (!crypto::parse_address(mod_addr_hex, mod_addr)) return false;
+    if (!crypto::parse_address_checksummed(mod_addr_hex, mod_addr)) return false;
     if (!db.is_moderator(mod_addr)) return false;
     auto sig_bytes = crypto::from_hex(sig_hex);
     if (sig_bytes.size() != 64) return false;
@@ -799,9 +799,9 @@ std::pair<int, std::string> HttpServer::post_moderator_release(const std::string
             return {403, R"({"error":"unauthorized"})"};
 
         Address from_addr, to_addr;
-        if (!crypto::parse_address(from_hex_str, from_addr))
+        if (!crypto::parse_address_checksummed(from_hex_str, from_addr))
             return {400, R"({"error":"bad from_address"})"};
-        if (!crypto::parse_address(to_hex_str, to_addr))
+        if (!crypto::parse_address_checksummed(to_hex_str, to_addr))
             return {400, R"({"error":"bad to_address"})"};
 
         uint64_t amount = 0;
@@ -857,9 +857,9 @@ std::pair<int, std::string> HttpServer::post_transfer(const std::string& body) {
         std::string sig_hex      = j["signature"];
 
         Address from_addr, to_addr;
-        if (!crypto::parse_address(from_hex_str, from_addr))
+        if (!crypto::parse_address_checksummed(from_hex_str, from_addr))
             return {400, R"({"error":"bad from_address"})"};
-        if (!crypto::parse_address(to_hex_str, to_addr))
+        if (!crypto::parse_address_checksummed(to_hex_str, to_addr))
             return {400, R"({"error":"bad to_address"})"};
 
         uint64_t amount = 0;

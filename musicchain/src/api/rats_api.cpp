@@ -369,7 +369,7 @@ void RatsApi::handle_request(const std::string& peer_id,
                     tx.name  = name;
                     tx.nonce = nonce;
                     bool malformed = false;
-                    if (!crypto::parse_address(addr_hex, tx.owner)) malformed = true;
+                    if (!crypto::parse_address_checksummed(addr_hex, tx.owner)) malformed = true;
                     auto pk_bytes  = crypto::from_hex(pk_hex);
                     auto sig_bytes = crypto::from_hex(sig_hex);
                     if (pk_bytes.size() != 33 || sig_bytes.size() != 64)
@@ -441,7 +441,7 @@ void RatsApi::handle_request(const std::string& peer_id,
                 // malformed mini-node identity at worst means we lose
                 // the credit for that peer's relays until they reconnect
                 // with a clean address.
-                if (crypto::parse_address(wallet_hex, addr)) {
+                if (crypto::parse_address_checksummed(wallet_hex, addr)) {
                     std::lock_guard<std::mutex> lk(peer_to_wallet_mu_);
                     peer_to_wallet_[peer_id] = addr;
                     std::cout << "[rats-api] mini.hello: peer "
@@ -716,7 +716,7 @@ void RatsApi::handle_request(const std::string& peer_id,
                                                             std::string());
                         if (!aa_hex.empty()) {
                             Address parsed{};
-                            if (crypto::parse_address(aa_hex, parsed)) {
+                            if (crypto::parse_address_checksummed(aa_hex, parsed)) {
                                 reg.artist_address = parsed;
                             }
                         }
@@ -1160,7 +1160,7 @@ void RatsApi::handle_request(const std::string& peer_id,
             Sig64    sig{};
             bool gate_ok = true;
             std::string gate_err;
-            if (!crypto::parse_address(player_addr_hex, player_addr)) {
+            if (!crypto::parse_address_checksummed(player_addr_hex, player_addr)) {
                 gate_ok = false; gate_err = "bad player_address";
             }
             if (gate_ok) {

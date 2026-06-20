@@ -42,8 +42,11 @@ std::string bytes_hex(const uint8_t* data, size_t len) {
 }
 
 bool parse_address_param(const std::string& s, Address& out) {
-    // Accept both 0x-prefixed and bare hex.
-    return mc::crypto::parse_address(s, out);
+    // Accept lowercase-with-0x and full EIP-55 mixed-case. Mixed-case
+    // with a bad checksum is rejected so an exchange's eth_getBalance
+    // typo surfaces at the JSON-RPC boundary instead of returning the
+    // balance of an unrelated address.
+    return mc::crypto::parse_address_checksummed(s, out);
 }
 
 bool parse_hash_param(const std::string& s, Hash256& out) {

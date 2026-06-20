@@ -24,6 +24,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../models/wallet.dart';
+import '../providers/wallet_provider.dart';
 import '../services/librats_discovery.dart';
 import '../services/rats_client.dart';
 import '../services/wallet_service.dart';
@@ -153,15 +154,11 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
     // ignore: avoid_print
     print('[wallet-setup] _finish: deriving keypair + persisting');
     try {
-      // The mnemonic IS the only credential. We pass it to WalletService
-      // as the password too because the on-disk encrypted key file still
-      // wants one — the encryption is just stopping a casual reader of
-      // the device's app data from spending; the actual recovery secret
-      // is the 12 words, which the user already wrote down. No more
-      // separate password to remember.
+      // The mnemonic is the only credential — derived in memory and
+      // persisted as-is in platform secure storage. No unencrypted
+      // file on disk; rederivation happens fresh on every launch.
       final info = await widget.walletService.createWalletFromMnemonic(
         mnemonic: mnemonic,
-        password: mnemonic,
         username: username,
       );
       // ignore: avoid_print
@@ -175,6 +172,19 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
       // on it.
       if (username.isNotEmpty) {
         await _tryRegisterUsername(info, username);
+      }
+
+      // Push the new keypair straight into the long-lived
+      // WalletProvider so the wallet tab renders immediately. Next
+      // launch's tryAutoLoad will rebuild the same WalletInfo by
+      // rederiving from the mnemonic in secure storage.
+      // ignore: avoid_print
+      print('[wallet-setup] _finish: setWallet → ${info.address}');
+      try {
+        context.read<WalletProvider>().setWallet(info);
+      } catch (e) {
+        // ignore: avoid_print
+        print('[wallet-setup] setWallet failed: $e');
       }
 
       // ignore: avoid_print

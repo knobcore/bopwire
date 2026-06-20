@@ -125,43 +125,40 @@ static void eip55_checksum(char addr_hex[41]) {
  * hex private key was a debug-time path we no longer expose; users who
  * need to bring a key in supply the mnemonic that derives it. */
 
-mc_wallet_t mc_wallet_load(const char* path, const char* password) {
-    WalletHandle* w;
-    FILE* f;
-    size_t n;
-    (void)password;
-    if (!path) return NULL;
-    f = fopen(path, "rb");
-    if (!f) return NULL;
-    w = (WalletHandle*)malloc(sizeof(WalletHandle));
-    if (!w) { fclose(f); return NULL; }
-    n = fread(w->priv, 1, 32, f);
-    fclose(f);
-    if (n != 32 || !secp256k1_ec_seckey_verify(g_ctx, w->priv)) {
-        free(w); return NULL;
-    }
-    return w;
-}
-
-int mc_wallet_save(mc_wallet_t wallet, const char* path) {
-    WalletHandle* w = (WalletHandle*)wallet;
-    FILE* f;
-    if (!w || !path) return -1;
-    f = fopen(path, "wb");
-    if (!f) return -1;
-    fwrite(w->priv, 1, 32, f);
-    fclose(f);
-    return 0;
-}
+/* mc_wallet_load / mc_wallet_save — DELETED.
+ *
+ * The wallet's recovery secret is the BIP39 mnemonic, which the Dart
+ * side persists in platform secure storage (Keychain / KeyStore /
+ * DPAPI). Writing the 32-byte private key to a plain file alongside
+ * that mnemonic doubled the on-device attack surface for no benefit —
+ * a malicious app with file-read access on the data dir got the key
+ * directly, bypassing the mnemonic protection entirely. At launch the
+ * Dart side reads the saved mnemonic and rederives via
+ * mc_wallet_from_mnemonic. */
 
 void mc_wallet_free(mc_wallet_t wallet) { free(wallet); }
 
 char* mc_wallet_get_address(mc_wallet_t wallet) {
     WalletHandle* w = (WalletHandle*)wallet;
     uint8_t addr[20];
+    char buf[43]; /* "0x" + 40 hex + NUL */
+    char* out;
+    size_t i;
     if (!w) return NULL;
     derive_address_keccak(w->priv, addr);
-    return bytes_to_hex_alloc(addr, 20);
+    buf[0] = '0'; buf[1] = 'x';
+    for (i = 0; i < 20; ++i) {
+        buf[2 + i*2]     = hex_chars[addr[i] >> 4];
+        buf[2 + i*2 + 1] = hex_chars[addr[i] & 0xF];
+    }
+    buf[42] = '\0';
+    /* EIP-55 mixed-case checksum so the address survives a copy/paste
+     * round-trip and typos surface immediately at parse time. */
+    eip55_checksum(buf + 2);
+    out = (char*)malloc(43);
+    if (!out) return NULL;
+    memcpy(out, buf, 43);
+    return out;
 }
 
 char* mc_wallet_get_public_key(mc_wallet_t wallet) {
@@ -270,25 +267,10 @@ mc_wallet_t mc_wallet_from_mnemonic(const char* mnemonic,
 }
 
 char* mc_wallet_get_eth_address(mc_wallet_t wallet) {
-    WalletHandle* w = (WalletHandle*)wallet;
-    uint8_t addr[20];
-    char buf[43]; /* "0x" + 40 hex + NUL */
-    char* out;
-    size_t i;
-    if (!w) return NULL;
-    derive_address_keccak(w->priv, addr);
-    buf[0] = '0'; buf[1] = 'x';
-    for (i = 0; i < 20; ++i) {
-        buf[2 + i*2]     = hex_chars[addr[i] >> 4];
-        buf[2 + i*2 + 1] = hex_chars[addr[i] & 0xF];
-    }
-    buf[42] = '\0';
-    /* EIP-55 operates on the hex chars only, not the 0x prefix. */
-    eip55_checksum(buf + 2);
-    out = (char*)malloc(43);
-    if (!out) return NULL;
-    memcpy(out, buf, 43);
-    return out;
+    /* Alias retained so an older Dart build that still imports the
+     * symbol links. mc_wallet_get_address already returns the same
+     * EIP-55 0x-prefixed string. */
+    return mc_wallet_get_address(wallet);
 }
 
 /* ---- SHA256 (still needed for mc_compute_checksum + mc_sha256) ------ */
