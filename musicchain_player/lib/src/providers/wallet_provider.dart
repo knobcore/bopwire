@@ -10,12 +10,42 @@ import '../services/node_service.dart';
 import '../services/library_scanner.dart';
 
 class WalletProvider extends ChangeNotifier {
+  /// Process-wide reference to the active WalletProvider so leaf code
+  /// (PlayerProvider.\_completeSessionSilently, offline-play submit, etc.)
+  /// can request a balance refresh without dragging BuildContext into
+  /// services. Set in the constructor, cleared in dispose.
+  static WalletProvider? _active;
+  static void refreshNow() {
+    final w = _active;
+    if (w != null && w._info != null) unawaited(w.refreshBalance());
+  }
+
   WalletProvider() {
+    _active = this;
     // Fire-and-forget: pulls the BIP39 mnemonic from platform secure
     // storage (Keychain / KeyStore / DPAPI) and rederives the keypair
     // via libwally. Returns null on first run, which keeps the no-
     // wallet UI as-is until first-launch completes.
     _tryAutoLoad();
+
+    // Defensive periodic refresh: the player path that fires
+    // session.complete is silent (errors swallowed, no UI feedback),
+    // so a successful mint lands on chain without anyone telling
+    // the wallet to re-fetch. A 20 s tick catches it within one
+    // listening session's worth of plays — invisible to the user
+    // beyond the balance digit ticking up.
+    _refreshTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (_info != null) unawaited(refreshBalance());
+    });
+  }
+
+  Timer? _refreshTimer;
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    if (identical(_active, this)) _active = null;
+    super.dispose();
   }
 
   final WalletService _service = WalletService();

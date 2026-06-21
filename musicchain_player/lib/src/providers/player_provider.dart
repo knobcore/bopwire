@@ -8,6 +8,7 @@ import '../models/session.dart';
 import '../services/node_client.dart';
 import '../services/node_service.dart';
 import '../services/heartbeat_service.dart';
+import 'wallet_provider.dart';
 
 enum PlayerState { idle, loading, playing, paused, stopped }
 
@@ -145,6 +146,7 @@ class PlayerProvider extends ChangeNotifier {
       currentSession = null;
       state          = PlayerState.idle;
       notifyListeners();
+      WalletProvider.refreshNow();
       return result;
     } catch (_) {
       return null;
@@ -160,6 +162,12 @@ class PlayerProvider extends ChangeNotifier {
   Future<void> _completeSessionSilently(String sessionId) async {
     try {
       await (await _getClient()).completeSession(sessionId);
+      // Nudge the wallet to re-fetch — completeSession is the moment
+      // the chain mints the discoverer + node + artist-escrow credits,
+      // so the cached balance the wallet tab shows is stale RIGHT
+      // NOW. Static refresh avoids hauling BuildContext through the
+      // player stack.
+      WalletProvider.refreshNow();
     } catch (_) {/* best effort */}
   }
 
