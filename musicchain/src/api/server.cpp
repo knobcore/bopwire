@@ -648,19 +648,50 @@ std::pair<int, std::string> HttpServer::post_session_complete(
     }
     if (have_cur) effective_ms += cur_end - cur_start;
 
-    // A play counts when timestamped heartbeats prove the listener
-    // consumed at least 50% of the song's unique timestamp range
-    // (seeking around still has to land on at least half of distinct
-    // song content — replaying the same chorus N times can't farm
-    // play credit). Falling back to a fixed 30 s threshold for ancient
-    // blocks whose SongSection failed to load (duration_ms = 0)
-    // preserves the old behavior for legacy data.
-    constexpr uint64_t kLegacyMinListenMs    = 30000;
-    constexpr uint64_t kPlayPercentRequired  = 50;
-    const uint64_t required_ms = song_section.duration_ms > 0
-        ? (uint64_t{song_section.duration_ms}
-            * kPlayPercentRequired / 100)
-        : kLegacyMinListenMs;
+    // Three independent gates a play has to clear before the chain
+    // mints anything. All must hold; any failure returns 400 and
+    // logs a [session.complete] REJECT line with the failing reason
+    // so partial-credit / lenient-threshold drift never sneaks in.
+    //
+    //   (1) Song must be registered with a known duration. The old
+    //       legacy 30 s fallback that fired when duration_ms = 0
+    //       was a free pass for unregistered songs — a 30 s clip
+    //       of a 5 min track minted full reward. Fail closed: if
+    //       the chain doesn't know how long the song is, the play
+    //       can't establish a 50 % consumption claim.
+    //   (2) Effective listened time must hit >= 50 % of song
+    //       duration. Aggregation collapses re-listened ranges, so
+    //       seeking back to replay the same 5 s clip until the
+    //       wall clock hits 50 % of the song doesn't count.
+    //   (3) Heartbeat density must be plausible: at least one beat
+    //       per 35 s of wall time. The session.heartbeat handler
+    //       wall-times every beat server-side; sparse beats imply
+    //       a script forging position_ms with no actual playback
+    //       loop. Same gate validate_mint enforces when a MintTx
+    //       lands in a block (see tokens/mint.cpp:92-102) — pulled
+    //       up to session.complete so we never apply a mint that
+    //       wouldn't validate post-hoc.
+    constexpr uint64_t kPlayPercentRequired = 50;
+    constexpr uint64_t kMaxMsPerHeartbeat   = 35000;
+    auto reject = [&](const std::string& err_json,
+                      const std::string& reason) {
+        std::cout << "[session.complete] REJECT sid="
+                  << crypto::to_hex(sess.session_id).substr(0, 12)
+                  << " reason=" << reason
+                  << " eff_ms=" << effective_ms
+                  << " song_dur_ms=" << song_section.duration_ms
+                  << " heartbeats=" << samples.size()
+                  << " wall_ms=" << duration_ms << "\n";
+        return std::pair<int, std::string>{400, err_json};
+    };
+
+    if (song_section.duration_ms == 0) {
+        return reject(
+            R"({"error":"song duration unknown — not registered on chain"})",
+            "song_not_registered");
+    }
+    const uint64_t required_ms =
+        uint64_t{song_section.duration_ms} * kPlayPercentRequired / 100;
     if (effective_ms < required_ms) {
         std::ostringstream err;
         err << R"({"error":"insufficient listen time","effective_listened_ms":)"
@@ -670,13 +701,16 @@ std::pair<int, std::string> HttpServer::post_session_complete(
             << R"(,"required_percent":)" << kPlayPercentRequired
             << R"(,"wall_duration_ms":)" << duration_ms
             << R"(,"heartbeats":)" << samples.size() << "}";
-        std::cout << "[session.complete] REJECT sid="
-                  << crypto::to_hex(sess.session_id).substr(0, 12)
-                  << " eff_ms=" << effective_ms
-                  << " req_ms=" << required_ms
-                  << " song_dur_ms=" << song_section.duration_ms
-                  << " heartbeats=" << samples.size() << "\n";
-        return {400, err.str()};
+        return reject(err.str(), "below_50pct");
+    }
+    const uint64_t min_heartbeats = duration_ms / kMaxMsPerHeartbeat;
+    if (samples.size() < min_heartbeats) {
+        std::ostringstream err;
+        err << R"({"error":"sparse heartbeats","heartbeats":)"
+            << samples.size()
+            << R"(,"required_heartbeats":)" << min_heartbeats
+            << R"(,"wall_duration_ms":)" << duration_ms << "}";
+        return reject(err.str(), "sparse_heartbeats");
     }
 
     // Build PlayProof

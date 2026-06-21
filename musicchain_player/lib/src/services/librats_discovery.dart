@@ -92,17 +92,17 @@ class LibratsDiscovery extends ChangeNotifier {
             .where((m) => (m['node_id'] as String? ?? '').isNotEmpty)
             .map((m) => MapEntry(m['node_id'] as String, m)));
 
-      // Wire reachability into RatsClient's relay map. Nodes the mini-node
-      // tagged "relay" are unreachable from outside their NAT — their
-      // RPCs must be tunneled through the mini-node. Nodes tagged "direct"
-      // are reachable so we send to them straight.
+      // Wire reachability into RatsClient's relay map. Nodes the mini-
+      // node tagged "relay" are unreachable from outside their NAT —
+      // their RPCs must be tunneled through the mini-node. Nodes
+      // tagged "direct" are reachable so we send to them straight.
       // The relay anchor MUST be the mini-node, never a random
       // validated peer (post-pivot full nodes don't handle
-      // relay.forward — they'd silently drop the tunneled body).
-      final vpsPeer = rats.firstMiniNodePeerId
-                   ?? (rats.validatedPeerIds.isNotEmpty
-                       ? rats.validatedPeerIds.first
-                       : '');
+      // relay.forward — they'd silently drop the tunneled body). If
+      // mini.hello hasn't landed yet we leave relays unset rather
+      // than guess; the next refresh tick re-runs this once the
+      // mini-node identity is known.
+      final vpsPeer = rats.firstMiniNodePeerId ?? '';
       for (final r in routes.values) {
         final pid   = r['rats_peer_id']   as String? ?? '';
         final reach = r['reachability']   as String? ?? 'unknown';

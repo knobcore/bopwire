@@ -1158,18 +1158,35 @@ class RatsClient {
     if (eof) _streams.remove(streamId);
   }
 
-  /// Pull the current routing table from the VPS mini-node by sending a
-  /// `routes.get` RPC. Targets a peer that self-identified as a
-  /// mini-node via mini.hello; falls back to validatedPeerIds.first
-  /// only when no mini-node is known (cold start before the hello
-  /// lands). Sending to a full-node returns unknown_type post-pivot,
-  /// which silently empties the UI — hence the explicit preference.
+  /// Pull the current routing table from the VPS mini-node by sending
+  /// a `routes.get` RPC. Targets a peer that self-identified as a
+  /// mini-node via mini.hello — and ONLY that peer. The previous
+  /// fallback to validatedPeerIds.first lit up "no handler for
+  /// type=routes.get" errors any time librats had already peer-
+  /// exchanged a non-mini-node peer (another player, a full node)
+  /// into the validated set before mini.hello landed, because that
+  /// peer would reject the request as unknown.
+  ///
+  /// On cold start the mini-node's hello arrives ~500 ms after the
+  /// TCP handshake, so we wait up to 4 s for it to register before
+  /// returning empty. The next periodic refresh will retry without
+  /// the wait.
   Future<List<Map<String, dynamic>>> requestRoutes(
       {Duration timeout = const Duration(seconds: 6)}) async {
-    final ids = validatedPeerIds;
-    if (ids.isEmpty) return const [];
-    final target = firstMiniNodePeerId ?? ids.first;
-    final body = await request(target, 'routes.get', const {},
+    String? mini = firstMiniNodePeerId;
+    if (mini == null) {
+      for (int i = 0; i < 8 && mini == null; ++i) {
+        await Future.delayed(const Duration(milliseconds: 500));
+        mini = firstMiniNodePeerId;
+      }
+    }
+    if (mini == null) {
+      // ignore: avoid_print
+      print('[rats] requestRoutes: no mini-node identified — '
+            'validatedPeers=${validatedPeerIds.length}');
+      return const [];
+    }
+    final body = await request(mini, 'routes.get', const {},
                                 timeout: timeout);
     final m = (body as Map<String, dynamic>?) ?? const {};
     final peers = (m['peers'] as List?) ?? const [];
