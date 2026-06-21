@@ -670,6 +670,12 @@ std::pair<int, std::string> HttpServer::post_session_complete(
             << R"(,"required_percent":)" << kPlayPercentRequired
             << R"(,"wall_duration_ms":)" << duration_ms
             << R"(,"heartbeats":)" << samples.size() << "}";
+        std::cout << "[session.complete] REJECT sid="
+                  << crypto::to_hex(sess.session_id).substr(0, 12)
+                  << " eff_ms=" << effective_ms
+                  << " req_ms=" << required_ms
+                  << " song_dur_ms=" << song_section.duration_ms
+                  << " heartbeats=" << samples.size() << "\n";
         return {400, err.str()};
     }
 
@@ -712,10 +718,24 @@ std::pair<int, std::string> HttpServer::post_session_complete(
 
     // Apply mint directly to chain state
     leveldb::WriteBatch batch;
-    if (!chain_.apply_mint(mint, play_count, batch))
+    if (!chain_.apply_mint(mint, play_count, batch)) {
+        std::cout << "[session.complete] APPLY-MINT-FAIL sid="
+                  << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
         return {500, R"({"error":"failed to apply mint"})"};
-    if (!db_.write(batch))
+    }
+    if (!db_.write(batch)) {
+        std::cout << "[session.complete] DB-WRITE-FAIL sid="
+                  << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
         return {500, R"({"error":"db write failed"})"};
+    }
+    std::cout << "[session.complete] OK sid="
+              << crypto::to_hex(sess.session_id).substr(0, 12)
+              << " player=" << crypto::to_checksum_hex(sess.player_address)
+              << " artist=" << crypto::to_checksum_hex(song_section.artist_address)
+              << " play_count=" << (play_count + 1)
+              << " outputs=" << outputs.size()
+              << " (eff_ms=" << effective_ms
+              << "/req_ms=" << required_ms << ")\n";
 
     // Tally response amounts
     uint64_t artist_amount = 0, node_amount = 0, discoverer_amount = 0;
