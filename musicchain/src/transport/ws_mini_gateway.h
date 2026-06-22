@@ -149,4 +149,33 @@ private:
 bool ws_mini_gateway_dispatch_reply(const std::string& req_id,
                                     const std::string& envelope_json);
 
+// Lookups the mini-node main defines for the gateway + handlers to call
+// into. Defined in tools/mini_node.cpp; declared here so any
+// translation unit that includes this header (the gateway, the audio
+// fetch handler, etc.) can resolve them. Don't add stateful helpers
+// here — pure read-only views over the mini-node's own state only.
+namespace mini_state {
+
+/// Snapshot of the routes table as JSON. Same shape `routes_json()`
+/// returns over the librats RPC path.
+std::string routes_json();
+
+/// JSON array of every known mini-node peer (rats_peer_id +
+/// public_address) plus self. Same shape `mininodes.list` returns.
+std::string mininodes_list_json();
+
+/// Count of routes currently in the table — read for `mini.hello`.
+uint64_t routes_count();
+
+/// Pick a full-node peer to send a relay.forward at. Returns the
+/// peer's rats_peer_id, or "" if no full node currently reachable.
+/// Selection policy: any direct route's rats_peer_id is preferred
+/// over an Unknown / Relay route.
+std::string pick_full_node_peer_id();
+
+/// This mini-node's own librats peer id, or "" if not running.
+std::string our_peer_id();
+
+} // namespace mini_state
+
 } // namespace mc::transport
