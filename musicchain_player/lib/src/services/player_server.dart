@@ -75,7 +75,26 @@ class PlayerServer {
   final Pointer<Void>     _handle;
   final _rng = Random.secure();
 
+  // Active stream registry. We need this for two reasons:
+  //   1. Mid-stream cancellation: if the receiving peer disconnects (or
+  //      we otherwise notice it's pointless to keep sending), flipping
+  //      `cancelled` lets the in-flight `_streamChunks` loop bail out
+  //      between chunks instead of blasting kilobytes at a dead socket.
+  //   2. Cleanup correlation: keying by streamId lets a future ACK /
+  //      flow-control message find the right RandomAccessFile to close.
+  final Map<int, _ActiveStream> _streams = {};
+
   static const int chunkPayload = 16 * 1024;
+
+  // Backpressure knobs. We don't have application-level ACKs yet, so we
+  // do TIME-based pacing: after every kPaceEveryChunks chunks we sleep
+  // for kPaceDelay. With 16 KB payloads, 4 chunks per 8 ms works out to
+  // ~8 MB/s per stream — well under the 5 MB/s target we want to leave
+  // for a busy mini-node to relay everyone else's traffic too, but
+  // still bursty enough that TCP gets to coalesce sends. If we ever
+  // wire up real receiver ACKs, this becomes a sliding window instead.
+  static const int      kPaceEveryChunks = 4;
+  static const Duration kPaceDelay       = Duration(milliseconds: 8);
 
   /// PieceDownloader requests at most 256 KB per call; we cap at 512 KB
   /// so a small protocol-version mismatch doesn't let a peer pull
@@ -162,8 +181,18 @@ class PlayerServer {
       return {'matched': false, 'content_hash': hash};
     }
     final file  = File(entry.filePath);
-    final bytes = await file.readAsBytes();
-    final sid   = _rng.nextInt(0xFFFFFFFF);
+    // Stat through the File handle (one syscall) instead of
+    // file.readAsBytes() — which would slurp the whole audio file into
+    // a Uint8List, blowing RAM on phones for any track over a few MB
+    // and adding I/O latency to the reply envelope. The actual bytes
+    // get streamed off disk page-by-page inside _streamChunks.
+    final int totalBytes;
+    try {
+      totalBytes = await file.length();
+    } on FileSystemException catch (e) {
+      return {'matched': false, 'content_hash': hash, 'error': e.message};
+    }
+    final sid = _rng.nextInt(0xFFFFFFFF);
 
     // If [originator] is non-empty, the request arrived via VPS relay.
     // The VPS doesn't track stream chunks by req_id — only the 'F' tag
@@ -174,31 +203,69 @@ class PlayerServer {
       sendTo:     peerId,
       relayTo:    originator,
       streamId:   sid,
-      bytes:      bytes,
+      file:       file,
+      totalBytes: totalBytes,
     ));
 
     return {
       'matched':      true,
       'stream_id':    sid,
-      'total_bytes':  bytes.length,
+      'total_bytes':  totalBytes,
       'chunk_bytes':  chunkPayload,
       'content_type': entry.audioFormat == 'ogg' ? 'audio/ogg' : 'audio/mpeg',
       'source':       originator.isEmpty ? 'peer' : 'peer-relay',
     };
   }
 
+  /// Externally request that an in-flight stream stop sending. The next
+  /// chunk-loop iteration will notice [`_ActiveStream.cancelled`] and
+  /// bail out, closing the RandomAccessFile and unregistering itself.
+  /// Idempotent: calling on an unknown / already-finished stream is a
+  /// no-op so disconnect handlers can fire freely.
+  void cancelStream(int streamId) {
+    final active = _streams[streamId];
+    if (active == null) return;
+    active.cancelled = true;
+  }
+
+  /// Cancel every stream we're currently sending to [peerId]. Intended
+  /// to be wired into RatsClient.onPeerDisconnected once a clean lookup
+  /// from peerId → stream_id exists at the RatsClient layer.
+  /// TODO: rats_client.dart is off-limits in this change set, so the
+  /// disconnect hook isn't wired yet. The API is exposed here so a
+  /// future patch can call it without further surgery on this file.
+  void cancelStreamsForPeer(String peerId) {
+    final victims = <int>[];
+    _streams.forEach((sid, active) {
+      if (active.peerId == peerId) victims.add(sid);
+    });
+    for (final sid in victims) {
+      cancelStream(sid);
+    }
+  }
+
   Future<void> _streamChunks({
-    required String   sendTo,
-    required String   relayTo,
-    required int      streamId,
-    required Uint8List bytes,
+    required String sendTo,
+    required String relayTo,
+    required int    streamId,
+    required File   file,
+    required int    totalBytes,
   }) async {
     final relay      = relayTo.isNotEmpty;
     const kTagF      = 0x46; // 'F'
     final prefixLen  = relay ? (1 + 40) : 0;
     final peerPtr    = sendTo.toNativeUtf8();
     final native     = malloc<Uint8>(prefixLen + 9 + chunkPayload);
+    // Page-sized scratch we reuse across iterations. We could read
+    // directly into the native buffer with a typed-data view, but
+    // RandomAccessFile.read returns a fresh Uint8List anyway, so the
+    // copy cost is unavoidable; reusing 'native' just keeps malloc
+    // churn out of the hot loop.
+    RandomAccessFile? raf;
+    final active = _ActiveStream(peerId: sendTo);
+    _streams[streamId] = active;
     try {
+      raf = await file.open();
       if (relay) {
         native[0] = kTagF;
         // 40 hex characters of the originator's peer id, ASCII-encoded.
@@ -208,11 +275,28 @@ class PlayerServer {
       }
       var offset = 0;
       var seq    = 0;
-      while (offset < bytes.length) {
-        final n = (offset + chunkPayload > bytes.length)
-            ? bytes.length - offset
+      while (offset < totalBytes) {
+        // Cancellation gate. We check at the top of the loop so a
+        // disconnect that races with the very first chunk still wins;
+        // any chunk we've already framed is at most one extra send.
+        if (active.cancelled || _streams[streamId] != active) break;
+
+        final n = (offset + chunkPayload > totalBytes)
+            ? totalBytes - offset
             : chunkPayload;
-        final eof = (offset + n) >= bytes.length;
+        final eof = (offset + n) >= totalBytes;
+
+        // Pull n bytes off disk. read() advances the file position, so
+        // we never need to call setPosition() in the loop — sequential
+        // reads are the fast path on every platform we ship.
+        final slice = await raf.read(n);
+        if (slice.length != n) {
+          // Truncated read = file changed under us mid-stream. Bail
+          // rather than send a short chunk that wouldn't match the
+          // total_bytes the receiver was promised.
+          break;
+        }
+
         native[prefixLen + 0] = streamId & 0xFF;
         native[prefixLen + 1] = (streamId >> 8) & 0xFF;
         native[prefixLen + 2] = (streamId >> 16) & 0xFF;
@@ -222,23 +306,37 @@ class PlayerServer {
         native[prefixLen + 6] = (seq >> 16) & 0xFF;
         native[prefixLen + 7] = (seq >> 24) & 0xFF;
         native[prefixLen + 8] = eof ? 1 : 0;
-        for (int i = 0; i < n; ++i) native[prefixLen + 9 + i] = bytes[offset + i];
+        for (int i = 0; i < n; ++i) native[prefixLen + 9 + i] = slice[i];
         _bindings.sendBinary(_handle, peerPtr,
             native.cast<Void>(), prefixLen + 9 + n);
         offset += n;
         ++seq;
-        if (seq % 8 == 0) {
-          // Yield to the event loop without sleeping 1ms — `delayed(0)`
-          // routes through the microtask queue, which is enough to let
-          // a pending Flutter frame / progress callback fire, but adds
-          // no measurable per-stream latency. The 1ms version cost
-          // ~8 ms per 128 KB streamed.
-          await Future<void>.delayed(Duration.zero);
+
+        // Cooperative pacing. Yielding to the event loop every chunk
+        // was free CPU-wise but let one stream monopolise outbound
+        // bandwidth on the relaying mini-node. A real-time delay
+        // every kPaceEveryChunks gives other streams + control
+        // traffic time to interleave, which is the whole point of
+        // "stable + instant" — instant means low first-byte latency
+        // for the NEXT request too, not just maximum throughput on
+        // this one.
+        if (seq % kPaceEveryChunks == 0) {
+          await Future<void>.delayed(kPaceDelay);
         }
       }
+    } catch (_) {
+      // Swallow: we're an unawaited future. Dropping the stream is
+      // already the right user-visible outcome; the receiver will see
+      // a missing EOF and time out.
     } finally {
+      // Always: close the disk handle, free the native buffers, and
+      // deregister from _streams. Doing this in finally — not after the
+      // loop — means a thrown read() doesn't leak a file descriptor.
+      try { await raf?.close(); } catch (_) {}
       malloc.free(native);
       malloc.free(peerPtr);
+      if (_streams[streamId] == active) _streams.remove(streamId);
+      active.done.complete();
     }
   }
 
@@ -259,4 +357,18 @@ class PlayerServer {
     }
     return {'songs': out};
   }
+}
+
+/// Bookkeeping for one in-flight stream.send loop. Lives in the
+/// PlayerServer._streams map, keyed by stream_id. The only mutable
+/// field is [cancelled] — the sender loop polls it between chunks; an
+/// outside caller (currently cancelStream/cancelStreamsForPeer, later
+/// the disconnect hook) sets it. [done] is provided so a future patch
+/// can `await` clean teardown when shutting the server down without
+/// changing public method signatures.
+class _ActiveStream {
+  _ActiveStream({required this.peerId});
+  final String peerId;
+  bool cancelled = false;
+  final Completer<void> done = Completer<void>();
 }

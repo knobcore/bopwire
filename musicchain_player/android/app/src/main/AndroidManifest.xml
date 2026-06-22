@@ -20,6 +20,11 @@
     <!-- workmanager periodic LibraryScanner task + MusicChainService
          partial wake lock so the librats handshake survives screen-off. -->
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <!-- Doze exemption: the foreground service + wake lock are not enough
+         on cellular — Android throttles the Dart isolate ~30 s after the
+         screen goes off and librats RX stalls. MainActivity prompts the
+         user once to whitelist us from battery optimization. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <!-- Foreground service permissions: the swarm-link service uses
          dataSync (we maintain a persistent UDP/TCP link). Android 14+

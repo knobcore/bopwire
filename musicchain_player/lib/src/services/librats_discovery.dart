@@ -58,7 +58,41 @@ class LibratsDiscovery extends ChangeNotifier {
     // completes before the first routes.get; on slow networks the 2-second
     // sleep used to fall short and we'd time out + sit empty for 30 s.
     _runWhenVpsReady();
-    _timer = Timer.periodic(const Duration(seconds: 30), (_) => refresh());
+    // Cellular carrier NAT closes idle UDP/TCP mappings in 30-60 s. The
+    // 15s socket-keepalive defends one direction; this 20s discovery
+    // refresh keeps the application-layer NAT entry warm bidirectionally.
+    _timer = Timer.periodic(const Duration(seconds: 20), (_) {
+      refresh();
+      _bidirectionalProbe();
+    });
+  }
+
+  /// Paired bidirectional probe to exercise the return path on the same
+  /// 20s cadence as refresh(). routes.get is a one-way poll
+  /// (player -> mini-node); without a complementary call the carrier NAT
+  /// entry can age out in the reverse direction even while we keep
+  /// hitting the forward direction. mini.ping is a tiny no-op verb on
+  /// the mini-node that replies instantly; if it isn't implemented yet,
+  /// fall back to mininodes.list which definitely exists and also
+  /// returns small data.
+  Future<void> _bidirectionalProbe() async {
+    final rats = RatsClient.instance;
+    final mini = rats.firstMiniNodePeerId;
+    if (mini == null) return;
+    try {
+      await rats.request(mini, 'mini.ping', const {},
+          timeout: const Duration(seconds: 4));
+    } catch (_) {
+      // mini.ping not implemented yet on the mini-node — fall back to
+      // mininodes.list which is guaranteed to exist and is similarly
+      // small. The exact verb doesn't matter; what matters is that the
+      // reply traverses the NAT in the player->mini-node return
+      // direction.
+      try {
+        await rats.request(mini, 'mininodes.list', const {},
+            timeout: const Duration(seconds: 4));
+      } catch (_) { /* both probes failed; next tick will retry */ }
+    }
   }
 
   Future<void> _runWhenVpsReady() async {
@@ -202,7 +236,7 @@ class LibratsDiscovery extends ChangeNotifier {
         // times out silently). public_address is the host:port the
         // mini-node's STUN probe observed for the home node — that's
         // our reachability hint. librats.connect is async and
-        // dedupes, so re-dialing on every 30 s refresh is cheap and
+        // dedupes, so re-dialing on every 20 s refresh is cheap and
         // recovers from a home-node restart that rebinds an
         // ephemeral port.
         if (pickPub.isNotEmpty) {
@@ -220,6 +254,51 @@ class LibratsDiscovery extends ChangeNotifier {
                              'peers=${rats.peerCount} '
                              'validated=${rats.validatedPeerIds.length}');
                 });
+              }
+            }
+          }
+        }
+
+        // Direct-when-reachable carve-out. If routes.get told the mini-
+        // node WE are 'direct' (port-forwarded desktop, open egress), we
+        // can talk peer-to-peer regardless of what the mini-node
+        // labelled the picked full node. Cellular players hit symmetric
+        // NAT and this connect either fails fast or is deduped silently
+        // by librats — there's no harm in trying. On desktop with an
+        // open port this unlocks direct P2P even when the mini-node
+        // (conservatively) tagged the picked node 'relay' because its
+        // own probe couldn't traverse our NAT.
+        final ourPid = rats.ownPeerId;
+        Map<String, dynamic>? ourRoute;
+        if (ourPid.isNotEmpty) {
+          ourRoute = routes.values.firstWhere(
+              (m) => (m['rats_peer_id'] as String? ?? '') == ourPid,
+              orElse: () => const <String, dynamic>{});
+        }
+        final ourReach = (ourRoute?['reachability'] as String? ?? '');
+        if (ourReach == 'direct' &&
+            autoSelectedReachability == 'relay' &&
+            pickPub.isNotEmpty) {
+          final colon = pickPub.indexOf(':');
+          if (colon > 0) {
+            final host = pickPub.substring(0, colon);
+            final port = int.tryParse(pickPub.substring(colon + 1));
+            if (port != null && port > 0) {
+              rats.connect(host, port);
+              // Wait up to 3 s for the dial to land in validatedPeerIds.
+              // If it does, suppress the relay so subsequent RPCs go
+              // direct; otherwise leave the relay mapping the
+              // setRelayVia loop above installed.
+              final pickedPid = autoSelectedRatsPeerId;
+              for (int i = 0; i < 12; ++i) {
+                await Future.delayed(const Duration(milliseconds: 250));
+                if (rats.validatedPeerIds.contains(pickedPid)) {
+                  rats.setRelayVia(pickedPid, null);
+                  autoSelectedReachability = 'direct';
+                  debugPrint('[discovery] direct-when-reachable carve-out '
+                             'succeeded for $pickedPid via $host:$port');
+                  break;
+                }
               }
             }
           }

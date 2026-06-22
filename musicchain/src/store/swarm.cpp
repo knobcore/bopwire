@@ -275,6 +275,35 @@ void SwarmIndex::mark_peer_offline(const std::string& peer_id) {
     online_peers_.erase(peer_id);
 }
 
+void SwarmIndex::evict_peer(const std::string& peer_id) {
+    if (peer_id.empty()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    online_peers_.erase(peer_id);
+    auto pit = peer_to_hashes_.find(peer_id);
+    if (pit == peer_to_hashes_.end()) return;
+    std::vector<std::string> hashes(pit->second.begin(), pit->second.end());
+    size_t removed = 0;
+    for (const auto& hash_hex : hashes) {
+        auto it = map_.find(hash_hex);
+        if (it == map_.end()) continue;
+        auto& vec = it->second;
+        const size_t before = vec.size();
+        vec.erase(std::remove_if(vec.begin(), vec.end(),
+                                 [&](const SwarmMember& m){
+                                     return m.peer_id == peer_id;
+                                 }),
+                  vec.end());
+        removed += (before - vec.size());
+        if (db_) db_->del(make_key(hash_hex, peer_id));
+        if (vec.empty()) map_.erase(it);
+    }
+    peer_to_hashes_.erase(peer_id);
+    if (removed > 0) {
+        std::cout << "[swarm] evicted peer " << peer_id.substr(0, 12)
+                  << " (" << removed << " entries dropped)\n";
+    }
+}
+
 size_t SwarmIndex::drop_peer(const std::string& peer_id) {
     if (peer_id.empty()) return 0;
     std::lock_guard<std::mutex> lk(mu_);

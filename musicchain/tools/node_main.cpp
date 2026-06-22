@@ -684,9 +684,9 @@ fuzzy_ok: ;
                     return;
                 }
                 candidates.wake();
-                std::cout << "[relay] queued RelayRewardTx: "
-                          << count << " MC → mini "
-                          << db.hex(mini_addr).substr(0, 12) << "…\n";
+                std::cerr << "[relay] minted RelayRewardTx target="
+                          << db.hex(mini_addr) << " count=" << count
+                          << " tx_hash=" << mc::crypto::to_hex(h) << "\n";
             });
     }
 

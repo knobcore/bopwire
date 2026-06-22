@@ -55,6 +55,13 @@ class MusicChainService : Service() {
         // 24-hour cap is a safety net — Android logs a warning if a
         // wake lock is held indefinitely, and a process death frees it
         // anyway.
+        //
+        // Wake lock alone is NOT sufficient on cellular: Doze will still
+        // throttle the Dart isolate ~30 s after screen-off, killing
+        // librats RX. MainActivity now prompts the user once for the
+        // REQUEST_IGNORE_BATTERY_OPTIMIZATIONS exemption — without that
+        // whitelist this wake lock keeps the CPU ticking but the network
+        // stack is still suspended by Doze.
         wakeLock?.acquire(24L * 60L * 60L * 1000L)
     }
 

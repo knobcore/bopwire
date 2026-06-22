@@ -98,6 +98,15 @@ public:
     /// can swarm.hello_digest and skip the resync.
     void mark_peer_offline(const std::string& peer_id);
 
+    /// Hard-evict a peer: remove from online_peers_, drop every
+    /// (canonical_hash → SwarmMember) entry where member.peer_id ==
+    /// peer_id, and persist the removals to leveldb. Use when the
+    /// transport says the peer is gone for good (e.g. librats
+    /// disconnect-callback) — unlike mark_peer_offline, this purges
+    /// the on-disk record so stream.open won't keep returning a dead
+    /// peer up to the 20-minute prune cutoff. Idempotent.
+    void evict_peer(const std::string& peer_id);
+
     /// Drop every entry this peer owns — used by swarm.hello when the
     /// player declares a brand-new (digest-miss) hash list, replacing
     /// what we had. Returns the number of entries removed.

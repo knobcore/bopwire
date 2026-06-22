@@ -86,8 +86,26 @@ void RelayCreditTracker::loop() {
         }
         if (snapshot.empty()) continue;
 
+        // Chain-side cap (see apply_relay_reward / transaction.cpp:491+):
+        // RelayRewardTx with count > 1,000,000 is rejected at validation.
+        // Pre-clamp here so a runaway/malicious accumulator doesn't trip
+        // us into emitting an unmineable tx and silently dropping the
+        // credit. If we exceed the cap we mint the maximum allowed and
+        // carry the remainder forward to the next sweep.
+        constexpr uint64_t kMaxCountPerTx = 1'000'000ull;
         for (auto& [addr_hex, count] : snapshot) {
             if (count == 0) continue;
+            uint64_t to_mint   = count;
+            uint64_t carryover = 0;
+            if (to_mint > kMaxCountPerTx) {
+                carryover = to_mint - kMaxCountPerTx;
+                to_mint   = kMaxCountPerTx;
+                std::cerr << "[relay] count " << count
+                          << " > cap " << kMaxCountPerTx
+                          << " for mini " << addr_hex.substr(0, 12)
+                          << "… — minting cap, carrying over "
+                          << carryover << "\n";
+            }
             Address a{};
             // Parse hex back to 20 bytes.
             for (size_t i = 0; i < 20 && i * 2 + 1 < addr_hex.size(); ++i) {
@@ -101,9 +119,18 @@ void RelayCreditTracker::loop() {
                     (nibble(addr_hex[i*2]) << 4) | nibble(addr_hex[i*2+1]));
             }
             try {
-                if (mint_) mint_(a, count);
+                if (mint_) mint_(a, to_mint);
             } catch (...) { /* don't let a bad mint cb take down the tracker */ }
-            db_.del("rc:" + addr_hex);
+            if (carryover > 0) {
+                // Re-credit the overflow into the live map + leveldb so
+                // it shows up in the next sweep instead of vanishing.
+                std::lock_guard<std::mutex> lk(mu_);
+                auto& c = credits_[addr_hex];
+                c += carryover;
+                db_.put("rc:" + addr_hex, u64_to_bytes(c));
+            } else {
+                db_.del("rc:" + addr_hex);
+            }
         }
     }
 }

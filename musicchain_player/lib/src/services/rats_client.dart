@@ -17,11 +17,13 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:ffi/ffi.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../ffi/rats_bindings.dart';
+import 'player_server.dart';
 
 /// Bootstrap mini-node used as the initial peer. The mesh-discovery layer
 /// (mini.hello + mininodes.list) grows this into a full list of VPSes
@@ -139,6 +141,62 @@ class RatsClient {
       if (_miniNodePeerIds.contains(id)) return id;
     }
     return null;
+  }
+
+  /// Most-recent load_score per mini-node peer id, populated from
+  /// `mininodes.list` replies. Used by [bestMiniNodePeerId] to pick the
+  /// lightest mini-node for relay traffic instead of always landing on
+  /// `firstMiniNodePeerId`, which under load could concentrate every
+  /// player on a single VPS. Empty until the first mininodes.list reply
+  /// has been merged in — callers fall back to [firstMiniNodePeerId] in
+  /// that window.
+  final Map<String, double> _miniNodeLoad = {};
+  final Map<String, int>    _miniNodeLastSeenMs = {};
+
+  /// External hook for any caller that has fresh mininodes.list data and
+  /// wants to keep the load-aware picker current (librats_discovery's
+  /// 20s bidirectional probe is one such caller). Pass `peer_id ->
+  /// load_score` pairs; entries not present in the map are left
+  /// untouched so partial updates don't blow away known scores.
+  void updateMiniNodeLoad(Map<String, double> loadByPeerId,
+                          {Map<String, int>? lastSeenMs}) {
+    if (loadByPeerId.isEmpty && (lastSeenMs == null || lastSeenMs.isEmpty)) {
+      return;
+    }
+    _miniNodeLoad.addAll(loadByPeerId);
+    if (lastSeenMs != null) _miniNodeLastSeenMs.addAll(lastSeenMs);
+  }
+
+  /// Read-only view onto the per-mini-node load_score cache so callers
+  /// like LibratsDiscovery can introspect for diagnostics.
+  Map<String, double> get miniNodeLoadScores =>
+      Map.unmodifiable(_miniNodeLoad);
+
+  /// Load-aware mini-node selector. Walks `_miniNodePeerIds` intersected
+  /// with `validatedPeerIds`, then picks the entry with the lowest
+  /// cached `load_score`. Tiebreaks on freshest `last_seen_ms`. Returns
+  /// null when no validated mini-node is connected; falls back to
+  /// [firstMiniNodePeerId] when the load cache hasn't populated yet
+  /// (cold start, first ~20 s after launch).
+  String? get bestMiniNodePeerId {
+    if (!_started) return null;
+    final validated = validatedPeerIds.toSet();
+    final eligible = _miniNodePeerIds
+        .where((id) => validated.contains(id))
+        .toList(growable: false);
+    if (eligible.isEmpty) return null;
+    if (_miniNodeLoad.isEmpty) return firstMiniNodePeerId;
+    eligible.sort((a, b) {
+      final la = _miniNodeLoad[a] ?? double.infinity;
+      final lb = _miniNodeLoad[b] ?? double.infinity;
+      final cmp = la.compareTo(lb);
+      if (cmp != 0) return cmp;
+      // Tiebreak: prefer the freshest mini-node (highest last_seen_ms).
+      final sa = _miniNodeLastSeenMs[a] ?? 0;
+      final sb = _miniNodeLastSeenMs[b] ?? 0;
+      return sb.compareTo(sa);
+    });
+    return eligible.first;
   }
 
   /// Per-target relay routing. Populated by `LibratsDiscovery` from the
@@ -262,6 +320,13 @@ class RatsClient {
     // Register the binary callback so audio chunks delivered by full nodes
     // are routed to the in-flight _streams demuxer.
     _registerBinaryHandler();
+
+    // Register the disconnect callback so we can tear down per-peer state
+    // (mini-node membership, relay mappings, and any in-flight outbound
+    // streams PlayerServer is serving to that peer) the moment librats
+    // notices the peer is gone, rather than waiting for the next watchdog
+    // tick to catch validatedPeerIds shrinking.
+    _registerDisconnectHandler();
 
     // Load the known mini-node list. The first time the player ever runs
     // there's nothing in prefs and we fall back to the hardcoded seed; on
@@ -423,6 +488,8 @@ class RatsClient {
     final ids = validatedPeerIds;
     if (ids.isEmpty) return;
     final discovered = <MiniNodeAddr>{};
+    final freshLoad = <String, double>{};
+    final freshSeen = <String, int>{};
     for (final pid in ids) {
       try {
         final reply = await request(pid, 'mininodes.list', const {},
@@ -438,8 +505,23 @@ class RatsClient {
           final port = int.tryParse(addr.substring(colon + 1));
           if (port == null || port <= 0 || port > 65535) continue;
           discovered.add(MiniNodeAddr(host, port));
+          // Cache load_score keyed by the mini-node's rats peer id so
+          // bestMiniNodePeerId can pick the lightest relay. mininodes
+          // that omit either field are skipped — bestMiniNode... treats
+          // missing scores as infinity so they sort last.
+          final entryPid =
+              (e['rats_peer_id'] as String? ?? '').trim();
+          if (entryPid.isNotEmpty) {
+            final ls = (e['load_score'] as num?)?.toDouble();
+            if (ls != null) freshLoad[entryPid] = ls;
+            final seen = (e['last_seen_ms'] as int?);
+            if (seen != null) freshSeen[entryPid] = seen;
+          }
         }
       } catch (_) { /* peer didn't implement mininodes.list — skip */ }
+    }
+    if (freshLoad.isNotEmpty || freshSeen.isNotEmpty) {
+      updateMiniNodeLoad(freshLoad, lastSeenMs: freshSeen);
     }
     bool changed = false;
     for (final v in discovered) {
@@ -471,6 +553,15 @@ class RatsClient {
       for (final v in _knownMiniNodes) {
         _dialOne(v);
       }
+      // Drop ghost mini-node peer ids and stale relay mappings so the
+      // next refresh repopulates from scratch instead of routing through
+      // peer ids librats no longer knows. After a mini-node restart
+      // there's a ~30 s window where the old peer_id is still cached
+      // here but the underlying socket is dead — without this every
+      // outbound request gets routed to the ghost peer and times out at
+      // 15 s instead of failing fast.
+      _miniNodePeerIds.clear();
+      _relayVia.clear();
       _vpsWasUp = false;
       return;
     }
@@ -677,6 +768,32 @@ class RatsClient {
     return results == null ? const <String>[] : results.toList(growable: false);
   }
 
+  /// Locate peers seeding [contentHashHex] via the BitTorrent-compatible
+  /// DHT. Full nodes announce `content_hash` against the DHT key
+  /// `sha1(content_hash_bytes)` (BEP-5 style) as part of
+  /// `fingerprint.submit`; players call this to discover seeders
+  /// independently of the swarm.hello / stream.open path so a song
+  /// remains reachable even when no mini-node has cached the swarm map.
+  Future<List<String>> findContentSeeders(
+      String contentHashHex,
+      {Duration timeout = const Duration(seconds: 4)}) async {
+    // Must be a 32-byte content hash rendered as 64 hex chars.
+    if (contentHashHex.length != 64) return const <String>[];
+    final hashBytes = <int>[];
+    for (int i = 0; i < contentHashHex.length; i += 2) {
+      final hi = int.tryParse(contentHashHex.substring(i, i + 2), radix: 16);
+      if (hi == null) return const <String>[];
+      hashBytes.add(hi);
+    }
+    final dhtKey = sha1.convert(hashBytes).bytes;
+    final buf = StringBuffer();
+    for (final b in dhtKey) {
+      buf.write(b.toRadixString(16).padLeft(2, '0'));
+    }
+    final dhtKeyHex = buf.toString();
+    return findHashHolders(dhtKeyHex, listenWindow: timeout);
+  }
+
   /// Tear down. Currently only used by tests. Closes every
   /// NativeCallable trampoline, cancels every pending timer, and lets
   /// the FFI handle go.
@@ -713,6 +830,7 @@ class RatsClient {
     _replyCallable.close();
     _requestCallable.close();
     _binaryCallable.close();
+    _disconnectCallable.close();
     if (identical(_activeForCallback, this)) {
       _activeForCallback = null;
     }
@@ -777,7 +895,15 @@ class RatsClient {
         // don't handle relay.forward, so the relayed request bounced
         // back as "no handler for type=relay.forward". Mirrors the
         // pattern already used for stun.observe at line 531.
-        routeVia = firstMiniNodePeerId
+        //
+        // bestMiniNodePeerId is load-aware (lightest mini-node first,
+        // tiebreak on freshness) so during a peak we don't concentrate
+        // every player's relay traffic on a single VPS. Falls through
+        // to firstMiniNodePeerId on cold start (before mininodes.list
+        // populated the load cache) and finally to validatedPeerIds.first
+        // as the universal last resort.
+        routeVia = bestMiniNodePeerId
+            ?? firstMiniNodePeerId
             ?? (validatedPeerIds.isNotEmpty ? validatedPeerIds.first : null);
       }
     }
@@ -1096,6 +1222,53 @@ class RatsClient {
     _binaryCallable =
         NativeCallable<NativeBinaryCb>.listener(_onBinaryListener);
     _b.setBinaryCb(_handle, _binaryCallable.nativeFunction, nullptr);
+  }
+
+  late final NativeCallable<NativeConnCb> _disconnectCallable;
+
+  /// Static trampoline for peer-disconnect events. librats hands us a
+  /// strdup'd peer_id we must NOT free (per project_librats_callback
+  /// ownership: connection_cb strdups, disconnect_cb does NOT — freeing
+  /// it yields STATUS_HEAP_CORRUPTION). We copy the id into Dart and
+  /// hand off to the per-peer cleanup.
+  static void _onDisconnectListener(
+      Pointer<Void> _, Pointer<Utf8> peerIdPtr) {
+    final self = _activeForCallback;
+    if (self == null) return;
+    if (peerIdPtr.address == 0) return;
+    String peerId;
+    try {
+      peerId = peerIdPtr.toDartString();
+    } catch (_) {
+      return;
+    }
+    self._handlePeerDisconnected(peerId);
+  }
+
+  void _registerDisconnectHandler() {
+    _disconnectCallable =
+        NativeCallable<NativeConnCb>.listener(_onDisconnectListener);
+    _b.setDisconnectCb(_handle, _disconnectCallable.nativeFunction, nullptr);
+  }
+
+  void _handlePeerDisconnected(String peerId) {
+    if (peerId.isEmpty) return;
+    // Drop per-peer routing state so subsequent requests don't get
+    // relayed through a dead mini-node id.
+    _miniNodePeerIds.remove(peerId);
+    _miniNodeLoad.remove(peerId);
+    _miniNodeLastSeenMs.remove(peerId);
+    _relayVia.removeWhere((_, via) => via == peerId);
+
+    // Tell PlayerServer to cancel any in-flight outbound streams targeted
+    // at this peer so the chunk loop bails between sends instead of
+    // blasting kilobytes into a closed socket. Guarded: PlayerServer.instance
+    // throws StateError before PlayerServer.initialize() has run (test
+    // harness, early dispose race), and any throw inside the cancel path
+    // must not break the disconnect event delivery.
+    try {
+      PlayerServer.instance.cancelStreamsForPeer(peerId);
+    } catch (_) {/* PlayerServer not initialized yet, or cancel threw */}
   }
 
   /// Buffer for chunks that arrive BEFORE the requester has registered its

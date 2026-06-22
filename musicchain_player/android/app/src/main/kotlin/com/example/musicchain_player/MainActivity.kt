@@ -1,6 +1,7 @@
 package com.example.musicchain_player
 
 import android.content.Context
+import android.content.Intent
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -8,8 +9,11 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -45,6 +49,13 @@ class MainActivity : FlutterActivity() {
         // doesn't terminate the librats client. Idempotent — the
         // service short-circuits if already started.
         MusicChainService.start(this)
+
+        // Foreground service + wake lock aren't enough on cellular: Doze
+        // throttles the Dart isolate ~30 s after screen-off and librats
+        // RX stalls. Prompt the user once to whitelist us from battery
+        // optimization. Some OEMs (Xiaomi, Huawei) refuse the intent
+        // entirely — swallow the throw so the app still launches.
+        requestBatteryOptimizationExemptionOnce()
 
         // Notify Dart side whenever the default network changes (wifi ↔
         // cellular flip, hotspot tether, etc.) so it can force-redial the
@@ -118,6 +129,33 @@ class MainActivity : FlutterActivity() {
         decodeExecutor.shutdownNow()
         unregisterNetworkCallback()
         super.onDestroy()
+    }
+
+    // One-shot Doze exemption prompt. Skips silently if the user already
+    // granted (or saw and dismissed) the dialog, since re-prompting on
+    // every launch is hostile UX and some OEM ROMs flag it as spammy.
+    private fun requestBatteryOptimizationExemptionOnce() {
+        val prefs = getSharedPreferences("musicchain_prefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean(PREF_BATTERY_OPT_REQUESTED, false)) return
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            prefs.edit().putBoolean(PREF_BATTERY_OPT_REQUESTED, true).apply()
+            return
+        }
+        try {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:$packageName")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+        } catch (_: Throwable) {
+            // Some OEMs (Xiaomi MIUI, Huawei EMUI) disallow this intent.
+            // Nothing we can do from here; the user has to dig through
+            // Settings manually.
+        }
+        // Mark requested either way — we don't want to spam on every
+        // launch when the OEM blocks the dialog.
+        prefs.edit().putBoolean(PREF_BATTERY_OPT_REQUESTED, true).apply()
     }
 
     private fun registerNetworkCallback() {
@@ -409,5 +447,9 @@ class MainActivity : FlutterActivity() {
         dstShorts.flip()
         ByteBuffer.wrap(le).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(dstShorts)
         return Pcm(le, sampleRate, channelCount)
+    }
+
+    companion object {
+        private const val PREF_BATTERY_OPT_REQUESTED = "mc_battery_opt_requested"
     }
 }

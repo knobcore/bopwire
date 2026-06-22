@@ -329,6 +329,13 @@ void RatsLink::load_bootstrap_list() {
         }
     }
     if (bootstrap_vps_.empty()) {
+        // Always try 127.0.0.1 first to cover the colocated mini-node case
+        // (a full node + a mini-node both running on the same VPS host —
+        // see the loopback-fallback comment in redial_vps for why public-IP
+        // dial gets refused there). Loopback dial is cheap when not
+        // colocated: librats refuses immediately and we move on to the
+        // configured MC_VPS_HOST without measurable delay.
+        bootstrap_vps_.push_back({"127.0.0.1", MC_VPS_RATS_PORT});
         bootstrap_vps_.push_back({MC_VPS_HOST, MC_VPS_RATS_PORT});
     }
 }
@@ -345,13 +352,21 @@ void RatsLink::route_loop() {
     //      the warmup left the node dead-on-arrival for 30+ s after
     //      any blip.
     //   2. After a handshake first appears, send our route_publish so
-    //      the mini-node's routing table sees us immediately.
+    //      the mini-node's routing table sees us immediately. We also
+    //      republish whenever the validated-peer count GROWS (a new
+    //      mini-node or full node came online) so that peer learns
+    //      about us right away instead of waiting for the 5-minute
+    //      steady-state republish.
     //   3. Every 5 minutes of steady-state, republish routes so the
     //      mini-node doesn't time us out.
-    constexpr int kTickSeconds          = 3;
+    //
+    // 1-second tick instead of 3 seconds so a missed handshake recovers
+    // in under a second.
+    constexpr int kTickSeconds          = 1;
     constexpr int kSteadyRepublishTicks = (5 * 60) / kTickSeconds;
-    bool was_up        = false;
-    int  steady_ticks  = 0;
+    bool was_up              = false;
+    int  steady_ticks        = 0;
+    int  last_published_peers = 0;
 
     while (route_thread_running_) {
         const int peers = validated_peer_count();
@@ -362,18 +377,32 @@ void RatsLink::route_loop() {
             }
             redial_vps();
             steady_ticks = 0;
+            last_published_peers = 0;
         } else {
             if (!was_up) {
                 std::cout << "[rats] VPS link up (" << peers
                           << " peer" << (peers == 1 ? "" : "s")
                           << ") — publishing route\n";
                 publish_route_now();
+                last_published_peers = peers;
                 // Re-run STUN now that we have a live link — gives the
                 // route record an accurate public_address sooner.
                 observe_public_address_via_vps();
                 steady_ticks = 0;
+            } else if (peers > last_published_peers) {
+                // A new validated peer just appeared (mini-node restart
+                // recovered, or another full node joined). Publish our
+                // route right away so that peer's routing table learns
+                // about us immediately rather than waiting up to 5
+                // minutes for the steady-state republish.
+                std::cout << "[rats] validated-peer count rose to " << peers
+                          << " — republishing route\n";
+                publish_route_now();
+                last_published_peers = peers;
+                steady_ticks = 0;
             } else if (++steady_ticks >= kSteadyRepublishTicks) {
                 publish_route_now();
+                last_published_peers = peers;
                 steady_ticks = 0;
             }
         }

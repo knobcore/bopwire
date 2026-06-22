@@ -127,6 +127,38 @@ std::mutex         g_routes_mu;
 std::unordered_map<std::string, RouteEntry> g_routes;
 bool               g_quiet = false;
 
+// ---- Route TTL + reaper ---------------------------------------------
+//
+// Audit found g_routes had no cleanup, so a full node that vanished
+// (crashed, lost its VPS link, migrated) would linger here forever and
+// keep getting served to players in routes.get. The reaper thread wakes
+// every kReaperIntervalMs and erases any RouteEntry whose received_at_ms
+// is older than kRouteTtlMs. Mirror-cleans g_mininode_load /
+// g_mininode_addr so the per-peer load reply doesn't reference a
+// dead route.
+constexpr uint64_t kRouteTtlMs       = 10 * 60 * 1000; // 10 min
+constexpr int      kReaperIntervalMs = 30 * 1000;      // 30 s
+std::atomic<bool>  g_reaper_running{false};
+std::thread        g_reaper_thread;
+
+// ---- Per-peer binary-relay rate limit -------------------------------
+//
+// Each connected peer gets a token bucket sized to kRelayBucketBytes
+// (50 MB), refilled at kRelayRefillBps (10 MB/s). Tokens are charged
+// per inbound 'F'-tagged relay frame; if a peer's bucket goes negative
+// we drop the frame instead of forwarding so one chatty cellular peer
+// can't saturate the VPS uplink for everyone. Buckets for peers that
+// no longer appear in rats_get_validated_peer_ids are pruned by the
+// reaper above.
+struct RelayBucket {
+    uint64_t tokens         = 0;  // current credit (bytes)
+    uint64_t last_refill_ms = 0;
+};
+constexpr uint64_t kRelayBucketBytes = 50ULL * 1024 * 1024; // 50 MB burst
+constexpr uint64_t kRelayRefillBps   = 10ULL * 1024 * 1024; // 10 MB/s sustained
+std::mutex                                       g_relay_bucket_mu;
+std::unordered_map<std::string, RelayBucket>     g_relay_buckets;
+
 // Peers that responded to mini.hello are tracked here so we can replicate
 // every fresh route to them. The "from_mininode" loop guard in ingest_route
 // prevents an A→B→A→B forwarding ping-pong.
@@ -1338,7 +1370,43 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
             push_event("relay-fwd", target,
                        inner_type + " from " + originator_pid.substr(0, 12));
         }
-        rats_send_message(g_client, target.c_str(), kRequestType, fwd.dump().c_str());
+        // Capture rc so we can detect a dead target full node and
+        // evict its route immediately — otherwise the player would
+        // keep hitting the same offline node for the next TTL window
+        // (audit: dead-route eviction on send-failure).
+        const auto fwd_rc = rats_send_message(g_client, target.c_str(),
+                                              kRequestType, fwd.dump().c_str());
+        if (fwd_rc != RATS_SUCCESS) {
+            // Evict every route entry whose rats_peer_id matches the
+            // unreachable target. Note: the pending relay we just
+            // recorded above will never be matched, but it'll be
+            // overwritten the next time the same fresh id is minted
+            // (counter increments) so leaving it is harmless and
+            // erasing it would race the (impossible) reply path.
+            {
+                std::lock_guard<std::mutex> lk(g_routes_mu);
+                for (auto it = g_routes.begin(); it != g_routes.end(); ) {
+                    if (it->second.rats_peer_id == target) {
+                        const std::string node_id = it->second.node_id;
+                        it = g_routes.erase(it);
+                        if (!g_quiet) {
+                            push_event("route-evict", node_id,
+                                       "send_failed");
+                        }
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            // Tell the originator the route is dead so the player can
+            // immediately retry against a different full node instead
+            // of waiting for a reply that will never come.
+            std::ostringstream dr;
+            dr << "{\"req_id\":\"" << req_id
+               << "\",\"status\":\"dead_route\","
+               << "\"error\":\"target unreachable, route evicted\"}";
+            send_reply(peer_id, dr.str());
+        }
         rats_string_free(peer_id);
         rats_string_free(message_data);
         return; // mini-node sends no immediate reply — wait for the relayed answer
@@ -1465,6 +1533,41 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
         if (!is_hex) { cleanup(); return; }
     }
     const size_t payload_size = size - 1 - 40;
+    // ---- Per-peer token-bucket rate limit --------------------------
+    //
+    // Audit issue: a misbehaving cellular peer could spam relay
+    // forwards and saturate the VPS uplink, hurting every other
+    // tenant. Charge `size` bytes against the sender's bucket; refill
+    // at kRelayRefillBps since last_refill_ms. Drop the frame (do NOT
+    // forward) when the bucket would go negative.
+    const std::string sender_pid(peer_id);
+    {
+        const uint64_t now = now_ms();
+        std::lock_guard<std::mutex> lk(g_relay_bucket_mu);
+        auto [it, inserted] = g_relay_buckets.try_emplace(sender_pid);
+        RelayBucket& bk = it->second;
+        if (inserted) {
+            bk.tokens         = kRelayBucketBytes;
+            bk.last_refill_ms = now;
+        } else {
+            const uint64_t dt_ms = (now > bk.last_refill_ms)
+                                       ? (now - bk.last_refill_ms) : 0;
+            // refill = bps * dt / 1000, computed without overflow
+            const uint64_t refill = (kRelayRefillBps / 1000) * dt_ms;
+            bk.tokens = (bk.tokens + refill > kRelayBucketBytes)
+                            ? kRelayBucketBytes
+                            : (bk.tokens + refill);
+            bk.last_refill_ms = now;
+        }
+        if (bk.tokens < size) {
+            if (!g_quiet) {
+                push_event("relay-drop", sender_pid, "rate_limited");
+            }
+            cleanup();
+            return;
+        }
+        bk.tokens -= size;
+    }
     if (!g_quiet) {
         push_event("relay-bin", std::string(target_hex),
                    std::to_string(payload_size) + " B from "
@@ -1473,6 +1576,86 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
     rats_send_binary(g_client, target_hex,
                       b + 1 + 40, payload_size);
     cleanup();
+}
+
+// ---- Background reaper ---------------------------------------------
+//
+// Wakes every kReaperIntervalMs while g_reaper_running. Three jobs:
+//   1. Expire RouteEntry records older than kRouteTtlMs so a vanished
+//      full node stops appearing in routes.get.
+//   2. Prune mini-node auxiliary tables (g_mininode_load /
+//      g_mininode_addr) for peers whose route just got dropped.
+//   3. Prune g_relay_buckets entries for peers no longer present in
+//      rats_get_validated_peer_ids — otherwise a churn of cellular
+//      peers would let the bucket map grow unboundedly.
+void reaper_loop() {
+    while (g_reaper_running.load()) {
+        // Sleep in small slices so shutdown is responsive.
+        for (int slept = 0;
+             slept < kReaperIntervalMs && g_reaper_running.load();
+             slept += 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!g_reaper_running.load()) break;
+
+        const uint64_t now = now_ms();
+
+        // 1 + 2: expire stale routes, take a list of evicted node_ids
+        // / rats_peer_ids so we can purge mirror tables outside the
+        // routes lock.
+        std::vector<std::string> evicted_peers;
+        {
+            std::lock_guard<std::mutex> lk(g_routes_mu);
+            for (auto it = g_routes.begin(); it != g_routes.end(); ) {
+                if (it->second.received_at_ms + kRouteTtlMs < now) {
+                    if (!it->second.rats_peer_id.empty()) {
+                        evicted_peers.push_back(it->second.rats_peer_id);
+                    }
+                    const std::string node_id = it->second.node_id;
+                    it = g_routes.erase(it);
+                    if (!g_quiet) {
+                        push_event("route-expire", node_id, "ttl");
+                    }
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (!evicted_peers.empty()) {
+            std::lock_guard<std::mutex> lk(g_mininodes_mu);
+            for (const auto& pid : evicted_peers) {
+                g_mininode_load.erase(pid);
+                g_mininode_addr.erase(pid);
+            }
+        }
+
+        // 3: prune buckets for peers that are no longer validated.
+        std::unordered_set<std::string> alive;
+        if (g_client) {
+            int count = 0;
+            char** ids = rats_get_validated_peer_ids(g_client, &count);
+            if (ids) {
+                for (int i = 0; i < count; ++i) {
+                    if (ids[i]) {
+                        alive.emplace(ids[i]);
+                        rats_string_free(ids[i]);
+                    }
+                }
+                std::free(ids);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_relay_bucket_mu);
+            for (auto it = g_relay_buckets.begin();
+                 it != g_relay_buckets.end(); ) {
+                if (alive.count(it->first) == 0) {
+                    it = g_relay_buckets.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
 }
 
 } // namespace
@@ -1699,6 +1882,13 @@ int main(int argc, char** argv) {
     // hole-punch attempts fail. See on_relay_binary above.
     rats_set_binary_callback(client, on_relay_binary, nullptr);
 
+    // Start the background reaper. It expires stale routes
+    // (kRouteTtlMs), trims mini-node mirror tables, and prunes
+    // disconnected peers from the relay rate-limit map. Joined on
+    // shutdown below.
+    g_reaper_running.store(true);
+    g_reaper_thread = std::thread(reaper_loop);
+
     rats_start_automatic_peer_discovery(client);
 
     // Browser-facing surfaces (WsTcpRelay, WsAudioBridge, WsMiniGateway)
@@ -1775,6 +1965,10 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[mini-node] shutting down...\n";
+    // Stop + join the reaper before tearing down librats so it can't
+    // call rats_get_validated_peer_ids on a destroyed client.
+    g_reaper_running.store(false);
+    if (g_reaper_thread.joinable()) g_reaper_thread.join();
     rats_stop_automatic_peer_discovery(client);
     rats_stop(client);
     rats_destroy(client);

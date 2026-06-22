@@ -20,6 +20,7 @@
 // HTTP/3 back.
 
 #include <nlohmann/json.hpp>
+#include <openssl/sha.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -28,7 +29,9 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -145,7 +148,12 @@ void RatsApi::on_peer_connected_cb(void* user_data, const char* peer_id) {
 void RatsApi::on_peer_disconnected_cb(void* user_data, const char* peer_id) {
     auto* self = static_cast<RatsApi*>(user_data);
     if (self && peer_id && *peer_id) {
-        self->swarm_.mark_peer_offline(peer_id);
+        // Hard evict instead of mark_peer_offline so dead-peer entries
+        // don't linger up to 20 minutes (kStaleAfterMs) in stream.open
+        // results when the transport says the peer is gone. The peer
+        // can re-announce on reconnect via swarm.hello — cheap, since
+        // the player ships a digest-based delta path.
+        self->swarm_.evict_peer(peer_id);
         if (self->propagator_) self->propagator_->on_peer_disconnected(peer_id);
         // Drop the mini-node wallet cache entry so a re-connect under a
         // fresh peer_id can re-identify and we don't keep a stale entry
@@ -165,6 +173,22 @@ void RatsApi::on_peer_disconnected_cb(void* user_data, const char* peer_id) {
 }
 
 namespace {
+
+// 20-byte SHA-1 over arbitrary bytes, hex-encoded — used to derive a
+// BEP-5 DHT key from a 32-byte canonical content_hash so the full node
+// can `rats_announce_for_hash` itself as a seeder/tracker for the song.
+// Players locate seeders with `rats_find_peers` over the same 20-byte
+// key on their side.
+std::string dht_key_for_content_hash(const Hash256& content_hash) {
+    unsigned char out[SHA_DIGEST_LENGTH];
+    SHA1(content_hash.data(), content_hash.size(), out);
+    std::ostringstream os;
+    os << std::hex << std::setfill('0');
+    for (int i = 0; i < SHA_DIGEST_LENGTH; ++i) {
+        os << std::setw(2) << static_cast<int>(out[i]);
+    }
+    return os.str();
+}
 
 // Parse a verb-handler `std::pair<int, std::string>` (HTTP status + JSON body
 // text) into the rats reply envelope. Status 200-299 is "ok"; everything else
@@ -655,6 +679,21 @@ void RatsApi::handle_request(const std::string& peer_id,
                     member.audio_format = audio_format_from_string(
                         in.value("audio_format", std::string("ogg")));
                     swarm_.announce(*match, member);
+                    // DHT seeder announce: make this full node
+                    // discoverable as a tracker for the canonical
+                    // content_hash so the player's rats_find_peers
+                    // probe (BEP-5, 20-byte SHA-1 key) returns us as
+                    // a peer for the song. librats dedupes repeated
+                    // announces internally — safe to call on every
+                    // submit.
+                    if (client_) {
+                        const std::string dht_key =
+                            dht_key_for_content_hash(*match);
+                        rats_announce_for_hash(
+                            client_, dht_key.c_str(),
+                            static_cast<int>(config_.rats_port),
+                            nullptr, nullptr);
+                    }
                     reply = {{"req_id", req_id},
                              {"status", "ok"},
                              {"body", {
@@ -740,6 +779,18 @@ void RatsApi::handle_request(const std::string& peer_id,
                         self_member.bitrate      = reg_bitrate;
                         self_member.audio_format = reg_format;
                         swarm_.announce(ch, self_member);
+                        // DHT seeder announce for the new-song path —
+                        // same key derivation as the matched branch so
+                        // future find_peers probes for this canonical
+                        // content_hash land on us.
+                        if (client_) {
+                            const std::string dht_key =
+                                dht_key_for_content_hash(ch);
+                            rats_announce_for_hash(
+                                client_, dht_key.c_str(),
+                                static_cast<int>(config_.rats_port),
+                                nullptr, nullptr);
+                        }
                         reply = {{"req_id", req_id},
                                  {"status", "ok"},
                                  {"body", {
