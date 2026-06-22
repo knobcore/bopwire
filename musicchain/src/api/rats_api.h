@@ -70,13 +70,12 @@ public:
     store::SwarmIndex& swarm_index() { return swarm_; }
 
     /// Synchronous verb dispatch for transports that don't go through
-    /// the rats client (e.g. the WebSocket bridge for the web player).
-    /// `body` is the same `{req_id, type, body}` envelope librats peers
-    /// send. The reply is routed through the thread-local
-    /// `g_ws_reply_sink` set by the caller — see ws_bridge.cpp for the
-    /// hand-off contract. `peer_id` is a synthetic identifier the
-    /// transport assigns (e.g. "ws-1.2.3.4:5678") so log lines and
-    /// swarm bookkeeping have something to print.
+    /// the rats client. `body` is the same `{req_id, type, body}`
+    /// envelope librats peers send. The reply is routed through the
+    /// thread-local `g_ws_reply_sink` set by the caller. Originally
+    /// added for the now-removed WebSocket bridge to the web player;
+    /// retained as a generic hook in case future non-librats sources
+    /// of RPC envelopes show up.
     void dispatch_for_bridge(const std::string& peer_id,
                               const std::string& body) {
         handle_request(peer_id, body);

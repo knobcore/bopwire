@@ -17,10 +17,6 @@
 #include "../src/net/load_monitor.h"
 #include "../src/crypto/keys.h"
 #include "../src/crypto/bip39.h"   // bip39_generate_12 / bip39_mnemonic_to_keypair
-#include "../src/transport/ws_tcp_relay.h"  // browser-librats WS→TCP relay
-#include "../src/transport/ws_audio_bridge.h" // browser audio.fetch bridge (legacy)
-#include "../src/transport/ws_mini_gateway.h" // unified browser JSON+binary gateway
-#include "../src/transport/audio_fetch_handler.h" // audio.fetch verb handler
 #include <fstream>
 #include <memory>
 #include <sys/stat.h>
@@ -55,17 +51,6 @@
 namespace {
 
 constexpr uint16_t kDefaultRatsPort = 8080; // librats project default (plain TCP)
-constexpr uint16_t kDefaultWsRelayPort = 8081; // WebSocket→TCP relay for browser librats
-// New unified JSON-envelope + binary-frame WebSocket gateway. The browser
-// hits this single surface to talk to the mini-node — no librats-WASM
-// required client-side. Local verbs (routes.get / mininodes.list /
-// mini.hello / stun.observe) answer directly; everything else is wrapped
-// as relay.forward to a full node. Binary frames out carry audio chunks
-// for audio.fetch (handler installed separately).
-constexpr uint16_t kDefaultWsGatewayPort = 8082;
-// Legacy audio-fetch-only WebSocket bridge — still wired up so existing
-// browser clients continue to work while they migrate to ws_mini_gateway.
-constexpr uint16_t kDefaultAudioBridgePort = 8083;
 constexpr const char* kRoutesTopic   = "musicchain.routes";
 constexpr const char* kRequestType   = "musicchain.request";
 constexpr const char* kReplyType     = "musicchain.reply";
@@ -1403,27 +1388,8 @@ void on_relay_reply(void* /*ud*/, const char* peer_id, const char* message_data)
         }
     }
     if (!matched) {
-        // Not one of OUR forwarded relay replies. First give the
-        // ws_mini_gateway a chance to claim it — its relay.forward
-        // path tracks browser-originated req_ids in a separate
-        // pending map.
-        if (mc::transport::ws_mini_gateway_dispatch_reply(req_id,
-                                                          message_data)) {
-            rats_string_free(peer_id);
-            rats_string_free(message_data);
-            return;
-        }
-        // Then the new gateway-level audio.fetch verb handler — it
-        // mints its own req_ids for stream.open and swarm.members and
-        // expects replies on this same channel.
-        if (mc::transport::dispatch_audio_fetch_reply(req_id,
-                                                      message_data)) {
-            rats_string_free(peer_id);
-            rats_string_free(message_data);
-            return;
-        }
-        // Finally the legacy audio-fetch bridge takes a turn.
-        mc::transport::WsAudioBridge::dispatch_reply(req_id, message_data);
+        // Not one of our forwarded relay replies — nothing else claims
+        // this channel now that the browser gateway is gone. Drop.
         rats_string_free(peer_id);
         rats_string_free(message_data);
         return;
@@ -1481,14 +1447,9 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
     // registry; let it try to claim the chunk before we treat the
     // buffer as a relay-bridge forward.
     if (size < 1 || b[0] != kRelayBinaryTag) {
-        if (size >= 9) {
-            // Gateway-level audio.fetch handler first; falls back to
-            // the legacy WsAudioBridge if the stream_id isn't one of
-            // ours.
-            if (!mc::transport::dispatch_audio_fetch_chunk(b, size)) {
-                mc::transport::WsAudioBridge::dispatch_chunk(b, size);
-            }
-        }
+        // Non-'F'-tagged binary chunks used to be claimed by the
+        // browser audio.fetch handler / WsAudioBridge. With the
+        // browser gateway gone, no consumer exists for them — drop.
         cleanup();
         return;
     }
@@ -1516,97 +1477,8 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
 
 } // namespace
 
-// ---- mini_state hooks consumed by ws_mini_gateway -------------------
-//
-// The gateway needs read-only views of the same data the librats RPC
-// handler answers from (routes table, mini-node mesh, etc.). Rather
-// than expose a sprawling state struct, we publish the four trivial
-// accessors below in the mc::transport::mini_state namespace. The
-// gateway forward-declares them in its header and links against
-// these definitions at link time.
-
-namespace mc::transport::mini_state {
-
-std::string routes_json() {
-    // Reuse the file-static helper without exposing it externally.
-    return ::routes_json();
-}
-
-std::string mininodes_list_json() {
-    nlohmann::json arr = nlohmann::json::array();
-    {
-        char* own = rats_get_our_peer_id(g_client);
-        if (own) {
-            arr.push_back({{"rats_peer_id", own},
-                           {"public_address", std::string()},
-                           {"self", true}});
-            rats_string_free(own);
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_mininodes_mu);
-        for (const auto& p : g_mininode_peers) {
-            auto it = g_mininode_addr.find(p);
-            arr.push_back({
-                {"rats_peer_id",   p},
-                {"public_address", it == g_mininode_addr.end()
-                                       ? std::string()
-                                       : it->second},
-                {"self", false},
-            });
-        }
-    }
-    return arr.dump();
-}
-
-uint64_t routes_count() {
-    std::lock_guard<std::mutex> lk(g_routes_mu);
-    return static_cast<uint64_t>(g_routes.size());
-}
-
-std::string pick_full_node_peer_id() {
-    // Selection policy: prefer direct-reachable routes, fall back to
-    // unknown, never pick a relay-only route (its reply would have to
-    // come back through the very link we're trying to use). The
-    // chosen full node's rats_peer_id is what we feed to relay.forward.
-    std::lock_guard<std::mutex> lk(g_routes_mu);
-    std::string best;
-    Reachability best_r = Reachability::Relay;
-    for (const auto& kv : g_routes) {
-        const auto& r = kv.second;
-        if (r.rats_peer_id.empty()) continue;
-        if (r.reachability == Reachability::Relay) continue;
-        if (r.reachability == Reachability::Direct) {
-            return r.rats_peer_id; // best possible — first hit wins
-        }
-        // Unknown is a fallback if we never find a Direct route.
-        if (best.empty() || best_r == Reachability::Relay) {
-            best = r.rats_peer_id;
-            best_r = r.reachability;
-        }
-    }
-    return best;
-}
-
-std::string our_peer_id() {
-    if (!g_client) return {};
-    char* p = rats_get_our_peer_id(g_client);
-    if (!p) return {};
-    std::string s = p;
-    rats_string_free(p);
-    return s;
-}
-
-} // namespace mc::transport::mini_state
-
-// ws_mini_gateway_dispatch_reply is declared in
-// src/transport/ws_mini_gateway.h (already #included above).
-
 int main(int argc, char** argv) {
     uint16_t rats_port = kDefaultRatsPort;
-    uint16_t ws_relay_port = kDefaultWsRelayPort;
-    uint16_t audio_bridge_port = kDefaultAudioBridgePort;
-    uint16_t ws_gateway_port = kDefaultWsGatewayPort;
     std::string config_path;
     mc::net::LoadConfig load_cfg;
 
@@ -1614,10 +1486,6 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--rats-port" && i + 1 < argc) {
             rats_port = static_cast<uint16_t>(std::atoi(argv[++i]));
-        } else if (a == "--ws-relay-port" && i + 1 < argc) {
-            ws_relay_port = static_cast<uint16_t>(std::atoi(argv[++i]));
-        } else if (a == "--audio-bridge-port" && i + 1 < argc) {
-            audio_bridge_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (a == "--config" && i + 1 < argc) {
             config_path = argv[++i];
         } else if (a == "--max-bps" && i + 1 < argc) {
@@ -1646,10 +1514,6 @@ int main(int argc, char** argv) {
         } else if (a == "-h" || a == "--help") {
             std::cout << "Usage: mini-node [--rats-port N] [--quiet]\n"
                       << "  --rats-port          librats TCP port (default " << kDefaultRatsPort << ")\n"
-                      << "  --ws-relay-port      WebSocket->TCP relay port for browser librats\n"
-                      << "                       (default " << kDefaultWsRelayPort << "; bytes flow through to --rats-port)\n"
-                      << "  --audio-bridge-port  audio.fetch WebSocket bridge port for browser clients\n"
-                      << "                       (default " << kDefaultAudioBridgePort << "; pulls song bytes from swarm peers)\n"
                       << "  --quiet              suppress per-peer log lines\n"
                       << "  --peer-vps           host:port[,host:port...] of fellow mini-nodes\n"
                       << "                       to dial at startup so we mesh with them\n";
@@ -1680,12 +1544,6 @@ int main(int argc, char** argv) {
                     if (j.contains("rats_port") &&
                         rats_port == kDefaultRatsPort)
                         rats_port = j["rats_port"].get<uint16_t>();
-                    if (j.contains("ws_relay_port") &&
-                        ws_relay_port == kDefaultWsRelayPort)
-                        ws_relay_port = j["ws_relay_port"].get<uint16_t>();
-                    if (j.contains("audio_bridge_port") &&
-                        audio_bridge_port == kDefaultAudioBridgePort)
-                        audio_bridge_port = j["audio_bridge_port"].get<uint16_t>();
                     if (j.contains("load_monitor")) {
                         const auto& lm = j["load_monitor"];
                         if (lm.contains("max_bandwidth_bps"))
@@ -1712,8 +1570,6 @@ int main(int argc, char** argv) {
         try {
             nlohmann::json j;
             j["rats_port"] = rats_port;
-            j["ws_relay_port"] = ws_relay_port;
-            j["audio_bridge_port"] = audio_bridge_port;
             nlohmann::json lm;
             lm["max_bandwidth_bps"]    = load_cfg.max_bandwidth_bps;
             lm["cpu_weight"]           = load_cfg.cpu_weight;
@@ -1845,101 +1701,10 @@ int main(int argc, char** argv) {
 
     rats_start_automatic_peer_discovery(client);
 
-    // ---- Browser-librats WS→TCP relay --------------------------------
-    //
-    // Browser-side librats compiled with emscripten's `-lwebsocket.js`
-    // can't open raw TCP sockets — every BSD `connect(host, port)` call
-    // gets shimmed into `new WebSocket("ws://host:port/")`. WsTcpRelay
-    // accepts that upgrade on ws_relay_port (default 8081) and pumps
-    // each binary WS frame straight into a fresh TCP socket on
-    // 127.0.0.1:rats_port (the librats listener we just brought up).
-    // Bytes flowing back from librats are wrapped in binary WS frames
-    // and sent to the browser. No JSON, no envelope, no parsing — just
-    // a transparent byte pump so browser librats sees the same
-    // protocol every native peer does.
-    mc::transport::WsTcpRelay ws_relay;
-    if (!ws_relay.start(ws_relay_port, rats_port)) {
-        std::cerr << "[mini-node] WsTcpRelay failed to start on port "
-                  << ws_relay_port
-                  << " — browser librats peers will not be reachable\n";
-    }
-
-    // ---- Browser audio-fetch bridge ----------------------------------
-    //
-    // A separate WebSocket surface for web players that want to PULL
-    // audio bytes from a swarm peer through this mini-node. The bridge
-    // owns its own per-WS worker thread, sends stream.open to the
-    // target peer over our existing rats client, and forwards the
-    // peer's binary chunks back as binary WS frames. See
-    // src/transport/ws_audio_bridge.cpp for the full protocol spec.
-    mc::transport::WsAudioBridge audio_bridge;
-    if (!audio_bridge.start(audio_bridge_port, client)) {
-        std::cerr << "[mini-node] WsAudioBridge failed to start on port "
-                  << audio_bridge_port
-                  << " — browser audio.fetch requests will not be served\n";
-    }
-
-    // ---- Unified browser gateway (default 8082) ----------------------
-    //
-    // The keystone of the "mini-nodes are routers" architecture: a
-    // single WebSocket endpoint that carries every verb the web player
-    // needs (songs.list, session.*, wallet.*, audio.fetch, etc.) over
-    // JSON envelopes, with binary frames in-band for audio chunks.
-    // Browsers connect here and never have to know whether the chain
-    // RPC was answered locally vs. relayed to a full node. See
-    // src/transport/ws_mini_gateway.cpp for the full protocol.
-    mc::transport::WsMiniGateway ws_gateway;
-    if (!ws_gateway.start(ws_gateway_port, client)) {
-        std::cerr << "[mini-node] WsMiniGateway failed to start on port "
-                  << ws_gateway_port
-                  << " — browser players will not be able to connect\n";
-    } else {
-        std::cout << "[mini-node] browser gateway up on ws://0.0.0.0:"
-                  << ws_gateway_port << "/\n";
-
-        // Wire audio.fetch through the standalone handler in
-        // src/transport/audio_fetch_handler.{h,cpp}. The gateway is
-        // shell + envelope routing; the handler owns the actual
-        // librats stream.open → binary-chunk relay. We keep each
-        // active handle in a shared map so cancel() fires on
-        // shutdown and stale handles get GC'd.
-        struct AudioFetchRegistry {
-            std::mutex mu;
-            std::unordered_map<mc::transport::WsMiniConnId,
-                std::unique_ptr<mc::transport::AudioFetchHandle>> active;
-        };
-        static AudioFetchRegistry afr;
-
-        mc::transport::WsMiniGateway::set_audio_fetch_handler(
-            [client](mc::transport::WsMiniConnId conn_id,
-                     const std::string& req_id,
-                     const std::string& peer_id_hex,
-                     const std::string& content_hash) {
-                auto handle = mc::transport::start_audio_fetch(
-                    client, req_id, content_hash, peer_id_hex,
-                    [conn_id](const std::string& json) {
-                        mc::transport::WsMiniGateway::sendText(conn_id, json);
-                    },
-                    [conn_id](const uint8_t* data, size_t size) {
-                        mc::transport::WsMiniGateway::sendBinary(conn_id,
-                                                                 data, size);
-                    });
-                // Stash so its worker keeps running until shutdown.
-                std::lock_guard<std::mutex> lk(afr.mu);
-                afr.active[conn_id] = std::move(handle);
-                // Best-effort GC: prune any finished entries while we
-                // hold the lock so the map doesn't grow without bound
-                // across a long-lived gateway. The handle's worker
-                // sets finished() once the audio stream completes.
-                for (auto it = afr.active.begin(); it != afr.active.end(); ) {
-                    if (it->second && it->second->finished()) {
-                        it = afr.active.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-            });
-    }
+    // Browser-facing surfaces (WsTcpRelay, WsAudioBridge, WsMiniGateway)
+    // were removed when the web player was dropped — players are now
+    // Android + Windows only on librats directly. See memory entries
+    // [feedback-no-web-version] and [project-musicchain-mini-node-router].
 
     // Dial every seed mini-node. on_peer_connected → send_mini_hello
     // promotes them to g_mininode_peers as soon as the handshake settles,
@@ -2010,9 +1775,6 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[mini-node] shutting down...\n";
-    ws_gateway.stop();
-    audio_bridge.stop();
-    ws_relay.stop();
     rats_stop_automatic_peer_discovery(client);
     rats_stop(client);
     rats_destroy(client);

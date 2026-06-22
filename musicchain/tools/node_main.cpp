@@ -18,7 +18,6 @@
 #include "../src/api/server.h"
 #include "../src/api/rats_api.h"
 #include "../src/api/jsonrpc_server.h"
-#include "../src/transport/ws_bridge.h"
 // h3_server include removed: the standalone HTTP/3 listener was retired
 // when verbs moved to librats RPC. Restore behind MC_WITH_H3 when bringing
 // it back.
@@ -79,7 +78,6 @@ static mc::net::NodeConfig load_config(const std::string& path) {
     if (j.contains("p2p_port"))           cfg.p2p_port = j["p2p_port"];
     if (j.contains("api_port"))           cfg.api_port = j["api_port"];
     if (j.contains("rats_port"))          cfg.rats_port = j["rats_port"];
-    if (j.contains("ws_port"))            cfg.ws_port = j["ws_port"];
     if (j.contains("max_peers"))          cfg.max_peers = j["max_peers"];
     if (j.contains("max_sessions"))       cfg.max_sessions = j["max_sessions"];
     if (j.contains("validator_enabled"))  cfg.validator_enabled = j["validator_enabled"];
@@ -130,7 +128,6 @@ static void save_config(const std::string& path,
     j["p2p_port"]          = cfg.p2p_port;
     j["api_port"]          = cfg.api_port;
     j["rats_port"]         = cfg.rats_port;
-    j["ws_port"]           = cfg.ws_port;
     j["max_peers"]         = cfg.max_peers;
     j["max_sessions"]      = cfg.max_sessions;
     j["validator_enabled"] = cfg.validator_enabled;
@@ -707,23 +704,6 @@ fuzzy_ok: ;
 
     // WebSocket bridge for the web player. Browsers can't speak librats
     // (no UDP / no raw sockets / no DHT), so we expose the same verb
-    // surface over a ws:// listener — each frame is a JSON envelope
-    // {req_id, type, body} fed straight into RatsApi::dispatch_for_bridge.
-    // Reply envelopes go back over the same socket via the thread-local
-    // sink RatsApi installs around handle_request. Disabled when
-    // cfg.ws_port == 0.
-    mc::transport::WsBridge ws_bridge(rats_api);
-    if (cfg.ws_port != 0) {
-        if (ws_bridge.start(cfg.ws_port)) {
-            std::cout << "[node] ws bridge listening on port "
-                      << cfg.ws_port << " (browsers: ws://<host>:"
-                      << cfg.ws_port << "/)\n";
-        } else {
-            std::cerr << "[node] ws bridge failed to start on port "
-                      << cfg.ws_port << " — continuing without browser surface\n";
-        }
-    }
-
     // Register signal handlers
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
@@ -749,7 +729,6 @@ fuzzy_ok: ;
     }
 
     std::cout << "[node] shutting down...\n";
-    ws_bridge.stop();
     rats_api.stop();
     rats.stop();
     api.stop();

@@ -23,12 +23,6 @@ struct NodeConfig {
     uint16_t    p2p_port     = 9333;
     uint16_t    api_port     = 9334;
     uint16_t    rats_port    = 8080;
-    // WebSocket bridge port. The web player can't speak librats (no
-    // browser-side UDP / no DHT / no raw sockets), so the home node
-    // accepts ws:// upgrades on this port and forwards every JSON
-    // envelope to RatsApi::dispatch_for_bridge. Default 9090; set to
-    // 0 to disable the bridge.
-    uint16_t    ws_port      = 9090;
     std::vector<std::string> seed_nodes;
     // Explicit "host:port" full-node sync seeds for BlockPropagator's
     // initial dial. Optional — when empty, BlockPropagator falls back to
