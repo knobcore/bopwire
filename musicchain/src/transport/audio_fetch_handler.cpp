@@ -23,6 +23,7 @@
 //
 
 #include "audio_fetch_handler.h"
+#include "ws_mini_gateway.h"  // for mc::transport::mini_state::pick_full_node_peer_id
 
 // Both headers come from deps/librats/src/, re-exported by the
 // `rats` (mc_rats_quic alias) target via its BUILD_INTERFACE — works
@@ -57,9 +58,10 @@ constexpr const char* kRequestType = "musicchain.request";
 // giving up. Matches WsAudioBridge.
 constexpr int kOpenTimeoutMs = 8000;
 
-// How long the handler waits for `swarm.members` from the home node
-// when the browser omitted peer_id. Home-node is local-ish to the
-// mini-node; 4 s is plenty.
+// How long the handler waits for the `stream.open` directory reply
+// from a full node when the browser omitted peer_id. Mini-node and
+// full nodes are usually one or zero NAT-hops apart on the mesh; 4 s
+// is plenty.
 constexpr int kSwarmLookupTimeoutMs = 4000;
 
 // Stall guard while streaming. If no chunk arrives for this long the
@@ -78,9 +80,10 @@ struct StreamState {
     bool                    have_reply = false;
     std::string             reply_json;
 
-    // The home-node's swarm.members reply lands here when peer_id was
-    // omitted by the browser. Same channel as reply_json but tracked
-    // separately so a slow peer doesn't masquerade as the home node.
+    // The full-node's stream.open directory reply lands here when
+    // peer_id was omitted by the browser. Same channel as reply_json
+    // but tracked separately so a slow swarm peer doesn't masquerade
+    // as the directory.
     bool                    have_swarm = false;
     std::string             swarm_json;
 
@@ -170,7 +173,7 @@ std::string new_req_id() {
 }
 
 // Pluck the first 40-hex peer id out of a `stream.open` reply body.
-// The home node emits `{peers: [{peer_id, bitrate, audio_format,
+// The full node emits `{peers: [{peer_id, bitrate, audio_format,
 // content_hash}, ...], source: "swarm"|"no_swarm"}` per rats_api.cpp's
 // stream.open handler. We tolerate the older `members` spelling and
 // raw-string entries too, just in case a different node implementation
@@ -224,7 +227,7 @@ struct AudioFetchHandle::Impl {
     rats_client_t  rats        = nullptr;
     std::string    browser_req_id;
     std::string    content_hash;
-    std::string    peer_id;          // empty == ask home node first
+    std::string    peer_id;          // empty == ask a full node first
     SendTextFn     send_text;
     SendBinaryFn   send_bin;
 
@@ -294,50 +297,44 @@ void AudioFetchHandle::Impl::run_worker() {
         return;
     }
 
-    // 2. If peer_id was omitted, ask the home node for swarm members
-    //    and pick the first one whose id is well-shaped. The home node
-    //    is on the librats mesh too; we ask it via a regular
-    //    `musicchain.request` of type swarm.members.
+    // 2. If peer_id was omitted, ask a FULL NODE for the swarm peer
+    //    list and pick the first one whose id is well-shaped. The
+    //    mini-node mesh holds many full nodes (one colocated on the
+    //    VPS, others on residential boxes behind NAT). pick_full_node_peer_id
+    //    returns one that has published a route over gossipsub
+    //    `musicchain.routes` — that filter excludes other mini-nodes
+    //    and excludes raw player peers (phones don't run the chain),
+    //    both of which would have ignored stream.open or replied
+    //    `unknown_type` and caused the 4 s lookup to time out.
+    //
+    //    Earlier this code just grabbed `rats_get_validated_peer_ids[0]`
+    //    and asked whatever happened to be first in the list — usually
+    //    a player, which then never answered. That's the symptom the
+    //    user saw as "home node did not answer stream.open within 4000ms"
+    //    against the multi-full-node mesh.
     if (peer_id.empty()) {
-        // Find the home node. The mini-node maintains a list of peers
-        // through the regular librats callbacks; for the audio.fetch
-        // use case we accept any connected peer as the swarm directory
-        // — the home node will answer, others will reply with not_found
-        // or be silent and time out. Practical for v1; the gateway can
-        // tighten this once it tracks the home-node peer_id explicitly.
-        int peer_count = 0;
-        char** peer_ids = rats_get_validated_peer_ids(rats, &peer_count);
-        if (!peer_ids || peer_count == 0) {
-            if (peer_ids) std::free(peer_ids);
-            send_error_envelope("no_peer",
-                "peer_id omitted and no connected peers to ask "
-                "for swarm members");
+        std::string directory =
+            mc::transport::mini_state::pick_full_node_peer_id();
+        if (directory.empty()) {
+            send_error_envelope("no_full_node",
+                "peer_id omitted and no full node currently reachable "
+                "via this mini-node to look up the swarm");
             return;
         }
-        // First peer is fine — the mini-node's connection list is
-        // typically dominated by the home node anyway. The librats
-        // convention (see broadcast_swarm_peer_* in mini_node.cpp) is
-        // to rats_string_free each entry then std::free the array.
-        std::string directory = peer_ids[0] ? std::string(peer_ids[0])
-                                            : std::string();
-        for (int i = 0; i < peer_count; ++i) {
-            if (peer_ids[i]) rats_string_free(peer_ids[i]);
-        }
-        std::free(peer_ids);
         if (!is_hex_string(directory, 40)) {
-            send_error_envelope("no_peer",
-                "directory peer id is malformed");
+            send_error_envelope("no_full_node",
+                "selected full node peer id is malformed");
             return;
         }
 
         swarm_req_id = new_req_id();
         register_pending_swarm(swarm_req_id, state.get());
 
-        // Use the canonical `stream.open` verb — the home node's
+        // Use the canonical `stream.open` verb — a full node's
         // rats_api answers that with a `{peers: [{peer_id, bitrate,
         // audio_format, ...}], source: "swarm"|"no_swarm"}` body. The
         // earlier code targeted a `swarm.members` verb that never
-        // existed on the home node, so this lookup always failed with
+        // existed on the full node, so this lookup always failed with
         // unknown_type and the audio.fetch returned "no usable
         // peer_id" to the browser.
         nlohmann::json swarm_req = {
@@ -375,7 +372,7 @@ void AudioFetchHandle::Impl::run_worker() {
         if (state->abort.load()) return;
         if (!got_swarm) {
             send_error_envelope("swarm_lookup_timeout",
-                "home node did not answer stream.open within "
+                "full node did not answer stream.open within "
                 + std::to_string(kSwarmLookupTimeoutMs) + "ms");
             return;
         }
