@@ -1896,6 +1896,49 @@ int main(int argc, char** argv) {
     } else {
         std::cout << "[mini-node] browser gateway up on ws://0.0.0.0:"
                   << ws_gateway_port << "/\n";
+
+        // Wire audio.fetch through the standalone handler in
+        // src/transport/audio_fetch_handler.{h,cpp}. The gateway is
+        // shell + envelope routing; the handler owns the actual
+        // librats stream.open → binary-chunk relay. We keep each
+        // active handle in a shared map so cancel() fires on
+        // shutdown and stale handles get GC'd.
+        struct AudioFetchRegistry {
+            std::mutex mu;
+            std::unordered_map<mc::transport::WsMiniConnId,
+                std::unique_ptr<mc::transport::AudioFetchHandle>> active;
+        };
+        static AudioFetchRegistry afr;
+
+        mc::transport::WsMiniGateway::set_audio_fetch_handler(
+            [client](mc::transport::WsMiniConnId conn_id,
+                     const std::string& req_id,
+                     const std::string& peer_id_hex,
+                     const std::string& content_hash) {
+                auto handle = mc::transport::start_audio_fetch(
+                    client, req_id, content_hash, peer_id_hex,
+                    [conn_id](const std::string& json) {
+                        mc::transport::WsMiniGateway::sendText(conn_id, json);
+                    },
+                    [conn_id](const uint8_t* data, size_t size) {
+                        mc::transport::WsMiniGateway::sendBinary(conn_id,
+                                                                 data, size);
+                    });
+                // Stash so its worker keeps running until shutdown.
+                std::lock_guard<std::mutex> lk(afr.mu);
+                afr.active[conn_id] = std::move(handle);
+                // Best-effort GC: prune any finished entries while we
+                // hold the lock so the map doesn't grow without bound
+                // across a long-lived gateway. The handle's worker
+                // sets finished() once the audio stream completes.
+                for (auto it = afr.active.begin(); it != afr.active.end(); ) {
+                    if (it->second && it->second->finished()) {
+                        it = afr.active.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            });
     }
 
     // Dial every seed mini-node. on_peer_connected → send_mini_hello
