@@ -381,6 +381,8 @@ set(MC_SOURCES
   src/api/jsonrpc_server.cpp
   src/api/routes.cpp
   src/api/rats_api.cpp
+  src/transport/ws_bridge.cpp
+  src/transport/ws_tcp_relay.cpp
   src/capi/capi.cpp
 )
 if(msh3_FOUND)
@@ -475,7 +477,8 @@ add_executable(musicchain-mini-node
   src/crypto/signature.cpp
   src/crypto/wally_bip39.cpp
   src/core/block.cpp
-  src/core/transaction.cpp)
+  src/core/transaction.cpp
+  src/transport/ws_tcp_relay.cpp)
 target_link_libraries(musicchain-mini-node PRIVATE
   mc_rats_quic
   wallycore

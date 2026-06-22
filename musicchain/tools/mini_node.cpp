@@ -17,6 +17,7 @@
 #include "../src/net/load_monitor.h"
 #include "../src/crypto/keys.h"
 #include "../src/crypto/bip39.h"   // bip39_generate_12 / bip39_mnemonic_to_keypair
+#include "../src/transport/ws_tcp_relay.h"  // browser-librats WS→TCP relay
 #include <fstream>
 #include <memory>
 #include <sys/stat.h>
@@ -51,6 +52,7 @@
 namespace {
 
 constexpr uint16_t kDefaultRatsPort = 8080; // librats project default (plain TCP)
+constexpr uint16_t kDefaultWsRelayPort = 8081; // WebSocket→TCP relay for browser librats
 constexpr const char* kRoutesTopic   = "musicchain.routes";
 constexpr const char* kRequestType   = "musicchain.request";
 constexpr const char* kReplyType     = "musicchain.reply";
@@ -1416,6 +1418,7 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
 
 int main(int argc, char** argv) {
     uint16_t rats_port = kDefaultRatsPort;
+    uint16_t ws_relay_port = kDefaultWsRelayPort;
     std::string config_path;
     mc::net::LoadConfig load_cfg;
 
@@ -1423,6 +1426,8 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--rats-port" && i + 1 < argc) {
             rats_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (a == "--ws-relay-port" && i + 1 < argc) {
+            ws_relay_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (a == "--config" && i + 1 < argc) {
             config_path = argv[++i];
         } else if (a == "--max-bps" && i + 1 < argc) {
@@ -1450,10 +1455,12 @@ int main(int argc, char** argv) {
             if (!cur.empty()) g_seed_mininodes.push_back(cur);
         } else if (a == "-h" || a == "--help") {
             std::cout << "Usage: mini-node [--rats-port N] [--quiet]\n"
-                      << "  --rats-port  librats TCP port (default " << kDefaultRatsPort << ")\n"
-                      << "  --quiet      suppress per-peer log lines\n"
-                      << "  --peer-vps   host:port[,host:port...] of fellow mini-nodes\n"
-                      << "               to dial at startup so we mesh with them\n";
+                      << "  --rats-port      librats TCP port (default " << kDefaultRatsPort << ")\n"
+                      << "  --ws-relay-port  WebSocket→TCP relay port for browser librats\n"
+                      << "                   (default " << kDefaultWsRelayPort << "; bytes flow through to --rats-port)\n"
+                      << "  --quiet          suppress per-peer log lines\n"
+                      << "  --peer-vps       host:port[,host:port...] of fellow mini-nodes\n"
+                      << "                   to dial at startup so we mesh with them\n";
             return 0;
         } else {
             // legacy --http-port flag is silently accepted+ignored so existing
@@ -1481,6 +1488,9 @@ int main(int argc, char** argv) {
                     if (j.contains("rats_port") &&
                         rats_port == kDefaultRatsPort)
                         rats_port = j["rats_port"].get<uint16_t>();
+                    if (j.contains("ws_relay_port") &&
+                        ws_relay_port == kDefaultWsRelayPort)
+                        ws_relay_port = j["ws_relay_port"].get<uint16_t>();
                     if (j.contains("load_monitor")) {
                         const auto& lm = j["load_monitor"];
                         if (lm.contains("max_bandwidth_bps"))
@@ -1507,6 +1517,7 @@ int main(int argc, char** argv) {
         try {
             nlohmann::json j;
             j["rats_port"] = rats_port;
+            j["ws_relay_port"] = ws_relay_port;
             nlohmann::json lm;
             lm["max_bandwidth_bps"]    = load_cfg.max_bandwidth_bps;
             lm["cpu_weight"]           = load_cfg.cpu_weight;
@@ -1638,6 +1649,25 @@ int main(int argc, char** argv) {
 
     rats_start_automatic_peer_discovery(client);
 
+    // ---- Browser-librats WS→TCP relay --------------------------------
+    //
+    // Browser-side librats compiled with emscripten's `-lwebsocket.js`
+    // can't open raw TCP sockets — every BSD `connect(host, port)` call
+    // gets shimmed into `new WebSocket("ws://host:port/")`. WsTcpRelay
+    // accepts that upgrade on ws_relay_port (default 8081) and pumps
+    // each binary WS frame straight into a fresh TCP socket on
+    // 127.0.0.1:rats_port (the librats listener we just brought up).
+    // Bytes flowing back from librats are wrapped in binary WS frames
+    // and sent to the browser. No JSON, no envelope, no parsing — just
+    // a transparent byte pump so browser librats sees the same
+    // protocol every native peer does.
+    mc::transport::WsTcpRelay ws_relay;
+    if (!ws_relay.start(ws_relay_port, rats_port)) {
+        std::cerr << "[mini-node] WsTcpRelay failed to start on port "
+                  << ws_relay_port
+                  << " — browser librats peers will not be reachable\n";
+    }
+
     // Dial every seed mini-node. on_peer_connected → send_mini_hello
     // promotes them to g_mininode_peers as soon as the handshake settles,
     // and from there route gossip flows both directions.
@@ -1707,6 +1737,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[mini-node] shutting down...\n";
+    ws_relay.stop();
     rats_stop_automatic_peer_discovery(client);
     rats_stop(client);
     rats_destroy(client);

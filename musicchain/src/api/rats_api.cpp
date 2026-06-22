@@ -1473,8 +1473,21 @@ void RatsApi::handle_request(const std::string& peer_id,
     send_reply(peer_id, reply.dump());
 }
 
+// Thread-local reply sink for alternative transports — currently used
+// by src/transport/ws_bridge.cpp to detour replies into a browser's
+// WebSocket connection instead of librats. When non-null, send_reply
+// hands the JSON to this closure and skips the rats path entirely.
+// The bridge runs handle_request synchronously on the same thread that
+// installed the sink, so a thread_local scope is correct: no two
+// dispatches can race for the slot.
+thread_local std::function<void(const std::string&)>* g_ws_reply_sink = nullptr;
+
 void RatsApi::send_reply(const std::string& peer_id,
                          const std::string& reply_json) {
+    if (g_ws_reply_sink && *g_ws_reply_sink) {
+        (*g_ws_reply_sink)(reply_json);
+        return;
+    }
     if (!client_) return;
     rats_send_message(client_, peer_id.c_str(),
                       MC_REPLY_TYPE, reply_json.c_str());

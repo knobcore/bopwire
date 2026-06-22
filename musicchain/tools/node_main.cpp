@@ -18,6 +18,7 @@
 #include "../src/api/server.h"
 #include "../src/api/rats_api.h"
 #include "../src/api/jsonrpc_server.h"
+#include "../src/transport/ws_bridge.h"
 // h3_server include removed: the standalone HTTP/3 listener was retired
 // when verbs moved to librats RPC. Restore behind MC_WITH_H3 when bringing
 // it back.
@@ -78,6 +79,7 @@ static mc::net::NodeConfig load_config(const std::string& path) {
     if (j.contains("p2p_port"))           cfg.p2p_port = j["p2p_port"];
     if (j.contains("api_port"))           cfg.api_port = j["api_port"];
     if (j.contains("rats_port"))          cfg.rats_port = j["rats_port"];
+    if (j.contains("ws_port"))            cfg.ws_port = j["ws_port"];
     if (j.contains("max_peers"))          cfg.max_peers = j["max_peers"];
     if (j.contains("max_sessions"))       cfg.max_sessions = j["max_sessions"];
     if (j.contains("validator_enabled"))  cfg.validator_enabled = j["validator_enabled"];
@@ -128,6 +130,7 @@ static void save_config(const std::string& path,
     j["p2p_port"]          = cfg.p2p_port;
     j["api_port"]          = cfg.api_port;
     j["rats_port"]         = cfg.rats_port;
+    j["ws_port"]           = cfg.ws_port;
     j["max_peers"]         = cfg.max_peers;
     j["max_sessions"]      = cfg.max_sessions;
     j["validator_enabled"] = cfg.validator_enabled;
@@ -170,7 +173,8 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // --daemon when launching from systemd / service manager / Windows
     // service so the binary stays a plain log-only daemon and doesn't
     // leave the controlling terminal in raw mode.
-    bool tui_mode = true;
+    bool tui_mode      = true;
+    bool tui_cli_set   = false;  // true iff --tui/--no-tui/--daemon/--quiet was passed
 
     // Parse arguments
     for (size_t i = 0; i < args.size(); ++i) {
@@ -179,8 +183,8 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         else if (args[i] == "--p2p-port" && i+1 < args.size())  { cfg.p2p_port = static_cast<uint16_t>(std::stoi(args[++i])); }
         else if (args[i] == "--api-port" && i+1 < args.size())  { cfg.api_port = static_cast<uint16_t>(std::stoi(args[++i])); }
         else if (args[i] == "--no-tui" || args[i] == "--daemon"
-                                       || args[i] == "--quiet") { tui_mode = false; }
-        else if (args[i] == "--tui")                            { tui_mode = true; }
+                                       || args[i] == "--quiet") { tui_mode = false; tui_cli_set = true; }
+        else if (args[i] == "--tui")                            { tui_mode = true;  tui_cli_set = true; }
     }
 
     // Divert all log output into the TUI's in-memory ring BEFORE chain
@@ -246,12 +250,12 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         if (cfg.dht_bootstrap_hash.empty())
             cfg.dht_bootstrap_hash = file_cfg.dht_bootstrap_hash;
         if (cfg.registry_url.empty())  cfg.registry_url  = file_cfg.registry_url;
-        // tui_mode: file value wins unless CLI explicitly passed --no-tui /
-        // --tui (handled before this block flipped tui_mode away from the
-        // default). We re-apply the persisted value here only when the CLI
-        // didn't touch it. Simplest signal: if CLI didn't set it, tui_mode
-        // is still the default true.
-        if (tui_mode == true) tui_mode = g_tui_mode_persisted;
+        // tui_mode: file value wins ONLY when the CLI didn't set it.
+        // The old "if (tui_mode == true) tui_mode = g_tui_mode_persisted"
+        // check couldn't tell "default true" from "operator passed
+        // --tui", so a shipped tui_mode:false always won — explicit
+        // --tui silently did nothing.
+        if (!tui_cli_set) tui_mode = g_tui_mode_persisted;
     }
 
     if (cfg.data_dir.empty()) cfg.data_dir = "./data";
@@ -701,6 +705,25 @@ fuzzy_ok: ;
     }
     std::cout << "[node] API listening on port " << cfg.api_port << "\n";
 
+    // WebSocket bridge for the web player. Browsers can't speak librats
+    // (no UDP / no raw sockets / no DHT), so we expose the same verb
+    // surface over a ws:// listener — each frame is a JSON envelope
+    // {req_id, type, body} fed straight into RatsApi::dispatch_for_bridge.
+    // Reply envelopes go back over the same socket via the thread-local
+    // sink RatsApi installs around handle_request. Disabled when
+    // cfg.ws_port == 0.
+    mc::transport::WsBridge ws_bridge(rats_api);
+    if (cfg.ws_port != 0) {
+        if (ws_bridge.start(cfg.ws_port)) {
+            std::cout << "[node] ws bridge listening on port "
+                      << cfg.ws_port << " (browsers: ws://<host>:"
+                      << cfg.ws_port << "/)\n";
+        } else {
+            std::cerr << "[node] ws bridge failed to start on port "
+                      << cfg.ws_port << " — continuing without browser surface\n";
+        }
+    }
+
     // Register signal handlers
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
@@ -726,6 +749,7 @@ fuzzy_ok: ;
     }
 
     std::cout << "[node] shutting down...\n";
+    ws_bridge.stop();
     rats_api.stop();
     rats.stop();
     api.stop();
