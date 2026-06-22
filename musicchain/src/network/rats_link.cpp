@@ -273,9 +273,29 @@ void RatsLink::redial_vps() {
             // each tick keeps the F2 stream readable.
             continue;
         }
+        // Public-IP dial was refused by librats. The most common cause
+        // on the VPS itself is the COLOCATED case: a full node + a
+        // mini-node both run on the same box, so the bootstrap target
+        // host IS one of our own interface addresses. librats's
+        // should_ignore_peer() unconditionally blocks dials to any of
+        // our local interface IPs regardless of port (see
+        // deps/librats/src/librats.cpp). Loopback is the only path
+        // around it — librats's localhost block is SAME-PORT only, so
+        // 127.0.0.1:<mini-node-port> (a different port from this full
+        // node's listen) goes through and the handshake lands on the
+        // colocated mini-node's accept loop.
+        //
+        // Non-colocated deployments (residential full node, etc.) hit
+        // this branch only when the watchdog tick races a transient
+        // resolve / TCP error — the loopback retry then fails too
+        // (nothing's listening on 127.0.0.1:<port>) and we fall
+        // through to the error log just like before.
+        if (rats_connect(client_, "127.0.0.1", vps.port) != 0) {
+            continue;
+        }
         std::cerr << "[rats] watchdog redial of VPS bootstrap "
                   << vps.host << ":" << vps.port
-                  << " failed (host unresolved / socket refused)\n";
+                  << " failed (public + 127.0.0.1 fallback both refused)\n";
     }
 }
 
