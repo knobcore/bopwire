@@ -383,6 +383,8 @@ set(MC_SOURCES
   src/api/rats_api.cpp
   src/transport/ws_bridge.cpp
   src/transport/ws_tcp_relay.cpp
+  src/transport/ws_audio_bridge.cpp
+  src/transport/ws_mini_gateway.cpp
   src/capi/capi.cpp
 )
 if(msh3_FOUND)
@@ -470,6 +472,7 @@ endif() # NOT MC_MINI_NODE_ONLY
 # RELAY_REWARD tx type.
 add_executable(musicchain-mini-node
   tools/mini_node.cpp
+  src/transport/audio_fetch_handler.cpp
   src/net/load_monitor.cpp
   src/crypto/hash.cpp
   src/crypto/keys.cpp
@@ -478,7 +481,9 @@ add_executable(musicchain-mini-node
   src/crypto/wally_bip39.cpp
   src/core/block.cpp
   src/core/transaction.cpp
-  src/transport/ws_tcp_relay.cpp)
+  src/transport/ws_tcp_relay.cpp
+  src/transport/ws_audio_bridge.cpp
+  src/transport/ws_mini_gateway.cpp)
 target_link_libraries(musicchain-mini-node PRIVATE
   mc_rats_quic
   wallycore

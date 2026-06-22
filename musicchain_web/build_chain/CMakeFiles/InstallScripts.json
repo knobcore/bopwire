@@ -1,0 +1,11 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/lain/blockchain/musicchain_web/build_chain/cmake_install.cmake",
+		"C:/Users/lain/blockchain/musicchain_web/build_chain/libwally_build/cmake_install.cmake",
+		"C:/Users/lain/blockchain/musicchain_web/build_chain/libwally_build/src/secp256k1/cmake_install.cmake",
+		"C:/Users/lain/blockchain/musicchain_web/build_chain/libwally_build/src/secp256k1/src/cmake_install.cmake",
+		"C:/Users/lain/blockchain/musicchain_web/build_chain/libwally_build/src/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -2,6 +2,33 @@
 //
 // ws_bridge.h — minimal WebSocket-over-TCP bridge for the web player.
 //
+// STATUS: LEGACY / OPTIONAL.
+//
+// As of 2026-06-21 the canonical path for browsers is:
+//
+//     browser → mini-node WS gateway (default ws://<vps>:8082)
+//               → relay.forward over rats → home node
+//
+// i.e. the web player no longer connects to this bridge in the
+// default deployment. The mini-node gateway lives in a separate
+// process and is what the Vite dev proxy and production frontend
+// both point at (see musicchain_web/vite.config.ts).
+//
+// This bridge is kept operational because:
+//   * Full-node operators may want to expose ws:// directly to
+//     browsers on their own LAN during local development (no need
+//     to spin up a mini-node).
+//   * The dispatch path it exercises (RatsApi::dispatch_for_bridge +
+//     g_ws_reply_sink) is shared with other internal callers and
+//     should keep getting integration test coverage.
+//
+// If you are looking for the production browser entry point: it is
+// NOT here. Go to the mini-node gateway implementation. Treat any
+// new feature work on this file as opt-in for full nodes that want
+// to self-serve the web player.
+//
+// ----------------------------------------------------------------
+//
 // Browsers can't talk librats (no UDP, no DHT, no native socket layer
 // at all that exposes raw frames). They CAN talk WebSocket. This
 // listener accepts ws:// upgrades from the browser, parses each

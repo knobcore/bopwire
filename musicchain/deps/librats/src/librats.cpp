@@ -136,7 +136,7 @@ bool RatsClient::start() {
                         (bind_address_.empty() ? "" : " bound to " + bind_address_));
         return false;
     }
-    
+
     // Update listen_port_ with actual bound port if ephemeral port was requested
     if (listen_port_ == 0) {
         listen_port_ = get_bound_port(server_socket_);
@@ -146,10 +146,10 @@ bool RatsClient::start() {
             LOG_CLIENT_INFO("Server bound to ephemeral port " << listen_port_);
         }
     }
-    
+
     // Set server socket to non-blocking for the IO poller
     set_socket_nonblocking(server_socket_);
-    
+
     // Create platform-optimal IO poller and register server socket
     poller_ = IOPoller::create();
     poller_->add(server_socket_, PollIn);

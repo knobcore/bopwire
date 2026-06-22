@@ -1,5 +1,11 @@
 // ws_bridge.cpp — minimal WebSocket gateway into RatsApi.
 //
+// LEGACY / OPTIONAL: as of 2026-06-21 browsers reach the chain via a
+// separate mini-node WS gateway (default port 8082) and relay.forward
+// over rats. This bridge is kept operational so full-node operators
+// can still expose ws:// directly to local browsers without running a
+// mini-node. See ws_bridge.h for the role split.
+//
 // See ws_bridge.h for the design rationale. Highlights:
 //
 //   * One thread, one select() loop, N TCP connections (no per-conn
