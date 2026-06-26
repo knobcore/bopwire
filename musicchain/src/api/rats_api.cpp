@@ -47,6 +47,7 @@ namespace mc::api {
 constexpr const char* MC_REQUEST_TYPE = "musicchain.request";
 constexpr const char* MC_REPLY_TYPE   = "musicchain.reply";
 constexpr const char* MC_MOD_TYPE     = "musicchain.mod";
+constexpr const char* MC_LIBRARY_TYPE = "musicchain.library";  // DB2 delta gossip
 
 RatsApi::RatsApi(HttpServer& http,
                  Chain& chain, CandidateManager& candidates,
@@ -71,6 +72,9 @@ void RatsApi::start(rats_client_t client) {
                     &RatsApi::on_request_cb, this);
     rats_on_message(client_, MC_MOD_TYPE,
                     &RatsApi::on_mod_action_cb, this);
+    // DB2 — wallet-signed library deltas flood over their own broadcast type.
+    rats_on_message(client_, MC_LIBRARY_TYPE,
+                    &RatsApi::on_library_cb, this);
     // Connection-state authoritative swarm: track who's online so
     // entries from offline peers vanish from members() without needing
     // the per-track TTL renewal that the old per-file fingerprint.submit
@@ -471,37 +475,26 @@ void RatsApi::handle_request(const std::string& peer_id,
         }
         // ---- DB2: wallet-keyed library store ----------------------------
         //
-        //   library.announce { wallet, hashes:[hex,...] } -> {version,count}
-        //       Replace a wallet's library ("say hi — here's my list").
-        //       UNSIGNED in this first cut; the signed-delta + gossip layer
-        //       that clones edits onto every node lands next and will gate on
-        //       a wallet signature here.
+        //   library.delta   { wallet, pubkey, version, ts, add:[hex],
+        //                     del:[hex], sig }   -> {applied, version}
+        //       A wallet-signed edit. The wallet is the sole writer of its own
+        //       record (verified here), so this needs no privilege. The whole
+        //       initial library is just a delta with add=everything. On a
+        //       genuinely-new version it is applied AND flooded to every peer
+        //       (musicchain.library broadcast), which is how an edit clones
+        //       onto all nodes as it happens.
         //   library.get     { wallet }          -> {version, hashes:[...]}
         //   library.holders { content_hash }    -> {holders:[wallet,...]}
-        else if (type == "library.announce") {
-            Address wallet{};
-            if (!crypto::parse_address_checksummed(
-                    in.value("wallet", std::string()), wallet)) {
-                reply = {{"req_id", req_id}, {"status", "invalid"},
-                         {"error", "wallet not a 20-byte address"}};
-            } else {
-                std::vector<Hash256> hashes;
-                if (in.contains("hashes") && in["hashes"].is_array()) {
-                    for (const auto& hh : in["hashes"]) {
-                        if (!hh.is_string()) continue;
-                        Hash256 ch{};
-                        if (crypto::parse_hash256(hh.get<std::string>(), ch))
-                            hashes.push_back(ch);
-                    }
-                }
-                const uint64_t version = library_.set_library(wallet, hashes);
-                reply = {{"req_id", req_id}, {"status", "ok"},
-                         {"body", {
-                             {"wallet",  crypto::to_hex(wallet.data(), wallet.size())},
-                             {"version", version},
-                             {"count",   hashes.size()},
-                         }}};
-            }
+        else if (type == "library.delta") {
+            const bool applied = ingest_library_delta(in.dump(),
+                                                      /*broadcast_if_new=*/true);
+            reply = {{"req_id", req_id},
+                     {"status", applied ? "ok" : "rejected"},
+                     {"body", {
+                         {"applied", applied},
+                         {"version", in.value("version", static_cast<uint64_t>(0))},
+                     }}};
+            if (!applied) reply["error"] = "bad signature or stale version";
         }
         else if (type == "library.get") {
             Address wallet{};
@@ -1913,6 +1906,117 @@ void RatsApi::handle_mod_envelope(const std::string& peer_id,
         // from looping.
         rats_broadcast_string(client_, payload_json.c_str());
     }
+}
+
+// ======================================================================
+// DB2 — wallet-signed library delta: canonical bytes, verify, ingest, flood
+// ======================================================================
+namespace {
+
+bool from_hex_fixed(const std::string& hex, uint8_t* out, size_t n) {
+    if (hex.size() != n * 2) return false;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        const int hi = nib(hex[2*i]), lo = nib(hex[2*i+1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+void put_le(std::vector<uint8_t>& v, uint64_t x, int bytes) {
+    for (int i = 0; i < bytes; ++i)
+        v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xFF));
+}
+
+// Canonical signed bytes for a library delta. The player's Dart signer MUST
+// produce these byte-for-byte or the signature won't verify:
+//   "mclib1"                     6-byte domain tag (versions the format)
+//   wallet                       20
+//   version                      8  LE
+//   ts_ms                        8  LE
+//   add_count                    4  LE
+//   add_hashes                   add_count * 32   (in wire order)
+//   del_count                    4  LE
+//   del_hashes                   del_count * 32   (in wire order)
+// The signer hashes this with SHA-256 and ECDSA-signs the digest; the wire
+// order of add/del IS the signed order, so no canonical sort is needed.
+std::vector<uint8_t> library_canonical(const Address& wallet,
+                                       uint64_t version, uint64_t ts_ms,
+                                       const std::vector<Hash256>& add,
+                                       const std::vector<Hash256>& del) {
+    std::vector<uint8_t> b;
+    static const char tag[6] = {'m', 'c', 'l', 'i', 'b', '1'};
+    b.insert(b.end(), tag, tag + 6);
+    b.insert(b.end(), wallet.begin(), wallet.end());
+    put_le(b, version, 8);
+    put_le(b, ts_ms,   8);
+    put_le(b, add.size(), 4);
+    for (const auto& h : add) b.insert(b.end(), h.begin(), h.end());
+    put_le(b, del.size(), 4);
+    for (const auto& h : del) b.insert(b.end(), h.begin(), h.end());
+    return b;
+}
+
+} // namespace
+
+bool RatsApi::ingest_library_delta(const std::string& payload_json,
+                                   bool broadcast_if_new) {
+    json env;
+    try { env = json::parse(payload_json); } catch (...) { return false; }
+    if (!env.is_object()) return false;
+
+    Address  wallet{};
+    PubKey33 pubkey{};
+    Sig64    sig{};
+    if (!crypto::parse_address_checksummed(env.value("wallet", std::string()), wallet))
+        return false;
+    if (!from_hex_fixed(env.value("pubkey", std::string()), pubkey.data(), pubkey.size()))
+        return false;
+    if (!from_hex_fixed(env.value("sig", std::string()), sig.data(), sig.size()))
+        return false;
+    // Bind the signature to the wallet: the pubkey must derive to it.
+    if (crypto::address_from_pubkey(pubkey) != wallet) return false;
+
+    const uint64_t version = env.value("version", static_cast<uint64_t>(0));
+    const uint64_t ts_ms   = env.value("ts",      static_cast<uint64_t>(0));
+    std::vector<Hash256> add, del;
+    if (env.contains("add") && env["add"].is_array())
+        for (const auto& h : env["add"]) {
+            Hash256 ch{};
+            if (h.is_string() && crypto::parse_hash256(h.get<std::string>(), ch))
+                add.push_back(ch);
+        }
+    if (env.contains("del") && env["del"].is_array())
+        for (const auto& h : env["del"]) {
+            Hash256 ch{};
+            if (h.is_string() && crypto::parse_hash256(h.get<std::string>(), ch))
+                del.push_back(ch);
+        }
+
+    // Verify the wallet's signature over the canonical bytes.
+    const auto    canon  = library_canonical(wallet, version, ts_ms, add, del);
+    const Hash256 digest = crypto::sha256(canon.data(), canon.size());
+    if (!crypto::verify_ecdsa(digest, sig, pubkey)) return false;
+
+    // Apply (version-gated + idempotent). Only a genuinely-new version floods.
+    if (!library_.apply_delta(wallet, add, del, version)) return false;
+
+    if (broadcast_if_new && client_)
+        rats_broadcast_message(client_, MC_LIBRARY_TYPE, payload_json.c_str());
+    return true;
+}
+
+void RatsApi::on_library_cb(void* user_data, const char* /*peer_id*/,
+                            const char* message_data) {
+    auto* self = static_cast<RatsApi*>(user_data);
+    if (!self || !message_data) return;
+    self->ingest_library_delta(message_data, /*broadcast_if_new=*/true);
 }
 
 bool RatsApi::publish_mod_action(const std::string&         action,

@@ -139,6 +139,20 @@ private:
     void handle_request(const std::string& peer_id, const std::string& body);
     void send_reply(const std::string& peer_id, const std::string& reply_json);
 
+    /// DB2 gossip — receive a wallet-signed `library.delta` over the
+    /// MC_LIBRARY_TYPE broadcast channel: verify the signature against the
+    /// claimed wallet, apply_delta() (version-gated/idempotent), and on a
+    /// genuinely-new application re-broadcast so it floods the mesh. The
+    /// version gate is what stops re-broadcast loops + converges every node.
+    static void on_library_cb(void* user_data, const char* peer_id,
+                              const char* message_data);
+    /// Verify + apply a signed library-delta payload. Returns true iff it was
+    /// newly applied (newer version). When `broadcast_if_new`, a newly-applied
+    /// delta is re-broadcast to every peer (the flood). Shared by the
+    /// library.delta request verb and the broadcast handler.
+    bool ingest_library_delta(const std::string& payload_json,
+                              bool broadcast_if_new);
+
     /// Receive a moderation envelope from a peer (broadcast or sync push)
     /// — verify the signature against the moderator set, dedupe by sig,
     /// apply the hide / unhide to db, and persist to the mod log so
