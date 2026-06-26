@@ -333,6 +333,16 @@ if(WIN32)
   list(APPEND MC_LINK_LIBS ws2_32 iphlpapi bcrypt advapi32)
 endif()
 
+# ---- CRoaring (Roaring bitmaps) for the wallet LibraryStore (DB2) -----
+# Compiled as an isolated C static lib so the amalgamation keeps its own
+# SIMD-autodetect flags and doesn't inherit the project's C++ strictness.
+# PIC so it links into the musicchain SHARED lib.
+add_library(roaring STATIC deps/croaring/roaring.c)
+target_include_directories(roaring PUBLIC ${CMAKE_SOURCE_DIR}/deps/croaring)
+set_target_properties(roaring PROPERTIES POSITION_INDEPENDENT_CODE ON)
+list(APPEND MC_LINK_LIBS roaring)
+list(APPEND MC_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/deps/croaring")
+
 # ---- Library sources ----
 
 set(MC_SOURCES
@@ -367,6 +377,7 @@ set(MC_SOURCES
   src/network/rats_link.cpp
   src/storage/database.cpp
   src/store/swarm.cpp
+  src/store/library_store.cpp
   src/api/server.cpp
   src/api/jsonrpc_server.cpp
   src/api/routes.cpp

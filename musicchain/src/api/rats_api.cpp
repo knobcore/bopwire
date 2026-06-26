@@ -59,6 +59,9 @@ RatsApi::RatsApi(HttpServer& http,
     // restarts. Without this, every restart wiped the swarm and players
     // couldn't find each other again until they re-fingerprint.submit.
     swarm_.attach(db_);
+    // DB2 — wallet-keyed library store. Slurps persisted libraries + rebuilds
+    // the reverse (song → wallets) index from the same leveldb.
+    library_.attach(db_);
 }
 
 void RatsApi::start(rats_client_t client) {
@@ -465,6 +468,76 @@ void RatsApi::handle_request(const std::string& peer_id,
             reply = wrap_handler_result(req_id,
                 http_.verb_session_complete(in.value("session_id", ""),
                                             in.dump()));
+        }
+        // ---- DB2: wallet-keyed library store ----------------------------
+        //
+        //   library.announce { wallet, hashes:[hex,...] } -> {version,count}
+        //       Replace a wallet's library ("say hi — here's my list").
+        //       UNSIGNED in this first cut; the signed-delta + gossip layer
+        //       that clones edits onto every node lands next and will gate on
+        //       a wallet signature here.
+        //   library.get     { wallet }          -> {version, hashes:[...]}
+        //   library.holders { content_hash }    -> {holders:[wallet,...]}
+        else if (type == "library.announce") {
+            Address wallet{};
+            if (!crypto::parse_address_checksummed(
+                    in.value("wallet", std::string()), wallet)) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "wallet not a 20-byte address"}};
+            } else {
+                std::vector<Hash256> hashes;
+                if (in.contains("hashes") && in["hashes"].is_array()) {
+                    for (const auto& hh : in["hashes"]) {
+                        if (!hh.is_string()) continue;
+                        Hash256 ch{};
+                        if (crypto::parse_hash256(hh.get<std::string>(), ch))
+                            hashes.push_back(ch);
+                    }
+                }
+                const uint64_t version = library_.set_library(wallet, hashes);
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {
+                             {"wallet",  crypto::to_hex(wallet.data(), wallet.size())},
+                             {"version", version},
+                             {"count",   hashes.size()},
+                         }}};
+            }
+        }
+        else if (type == "library.get") {
+            Address wallet{};
+            if (!crypto::parse_address_checksummed(
+                    in.value("wallet", std::string()), wallet)) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "wallet not a 20-byte address"}};
+            } else {
+                auto hashes = library_.library(wallet);
+                json arr = json::array();
+                for (const auto& h : hashes) arr.push_back(crypto::to_hex(h));
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {
+                             {"wallet",  crypto::to_hex(wallet.data(), wallet.size())},
+                             {"version", library_.library_version(wallet)},
+                             {"hashes",  arr},
+                         }}};
+            }
+        }
+        else if (type == "library.holders") {
+            Hash256 ch{};
+            if (!crypto::parse_hash256(in.value("content_hash", std::string()), ch)) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "content_hash not 32-byte hex"}};
+            } else {
+                auto ws = library_.holders(ch);
+                json arr = json::array();
+                for (const auto& w : ws)
+                    arr.push_back(crypto::to_hex(w.data(), w.size()));
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {
+                             {"content_hash", crypto::to_hex(ch)},
+                             {"holders",      arr},
+                             {"count",        ws.size()},
+                         }}};
+            }
         }
         // ---- mini-node identity (relay credit attribution) --------------
         //

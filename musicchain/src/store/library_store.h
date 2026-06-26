@@ -1,0 +1,92 @@
+#pragma once
+//
+// LibraryStore — the wallet-keyed music library + (future) playlist store.
+// This is "DB2": a SECOND database, separate from the chain and OUTSIDE
+// consensus. Each wallet owns a set of song content-hashes; the wallet is
+// the sole writer of its own record, so replication is plain eventually-
+// consistent gossip (signed deltas + anti-entropy) — no block ordering, no
+// double-spend, no quorum.
+//
+// Storage model (per node):
+//   * a wallet's library is a set of song ids, held as a Roaring bitmap
+//     (compact for sparse sets, mutable in place, O(1) membership, fast
+//     set-algebra for "songs in common");
+//   * "song id" is a purely LOCAL, first-seen intern handle for a 32-byte
+//     content_hash — it never leaves the node. The wire + every public method
+//     speak content HASHES, so two nodes need no agreement on id numbering.
+//   * the reverse index (which wallets hold song X) is the transpose: another
+//     Roaring per song over wallet-ordinals — discovery's "holders(hash)".
+//
+// Persistence is leveldb under the L-prefixes (separate keyspace from the
+// chain's). The forward libraries are authoritative on disk; the reverse
+// index is derived and rebuilt from them on attach().
+//
+// Phase 1 (this file) is the store + local mutate/query. The signed-delta
+// gossip + anti-entropy that clones edits onto every other node layers on top
+// via apply_delta() (which is already idempotent + version-gated for exactly
+// that purpose) — it does not care whether a delta arrived locally or over
+// the wire.
+
+#include "../core/block.h"      // Hash256, Address
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <vector>
+
+namespace mc { class Database; }
+
+namespace mc::store {
+
+class LibraryStore {
+public:
+    LibraryStore();
+    ~LibraryStore();
+    LibraryStore(const LibraryStore&) = delete;
+    LibraryStore& operator=(const LibraryStore&) = delete;
+
+    /// Wire up persistence and slurp the persisted libraries + intern tables,
+    /// then rebuild the reverse index in memory. Safe to call once at startup.
+    void attach(Database& db);
+
+    // ---- mutate ------------------------------------------------------------
+
+    /// Replace a wallet's whole library with `hashes` (the "say hi — here's my
+    /// list" path). Bumps the wallet's version and returns the new value.
+    uint64_t set_library(const Address& wallet,
+                         const std::vector<Hash256>& hashes);
+
+    /// Apply an edit: add `add` and remove `remove` from the wallet's library.
+    /// `version` is the new monotonic version carried by a (signed) delta;
+    /// the call is a NO-OP and returns false if `version` is not strictly
+    /// greater than the wallet's current version (idempotent under gossip
+    /// re-delivery / out-of-order arrival). Returns true if applied.
+    bool apply_delta(const Address& wallet,
+                     const std::vector<Hash256>& add,
+                     const std::vector<Hash256>& remove,
+                     uint64_t version);
+
+    // ---- query (forward: wallet -> songs) ---------------------------------
+
+    std::vector<Hash256> library(const Address& wallet) const;
+    size_t               library_size(const Address& wallet) const;
+    uint64_t             library_version(const Address& wallet) const;
+
+    // ---- query (reverse: song -> wallets) ---------------------------------
+
+    /// Every wallet whose library currently contains `ch`. The discovery
+    /// query — "who has this song?".
+    std::vector<Address> holders(const Hash256& ch) const;
+    size_t               holder_count(const Hash256& ch) const;
+
+    // ---- stats -------------------------------------------------------------
+
+    size_t wallet_count() const;   // wallets with a non-empty library
+    size_t catalog_size() const;   // distinct songs interned
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> p_;
+};
+
+} // namespace mc::store

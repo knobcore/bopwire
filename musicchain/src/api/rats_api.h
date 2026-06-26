@@ -6,6 +6,7 @@
 #include "../network/manager.h"
 #include "../crypto/keys.h"
 #include "../store/swarm.h"
+#include "../store/library_store.h"   // DB2: wallet-keyed Roaring library store
 #include <nlohmann/json_fwd.hpp>   // nlohmann::json fwd-decl for #10 handlers
 
 #include <atomic>
@@ -70,6 +71,10 @@ public:
     /// TUI can render live song-count / member stats without going
     /// through an RPC round trip.
     store::SwarmIndex& swarm_index() { return swarm_; }
+
+    /// Read-only handle to the wallet-keyed library store (DB2) so the TUI /
+    /// future gossip layer can query libraries + holders without an RPC hop.
+    store::LibraryStore& library_store() { return library_; }
 
     /// Synchronous verb dispatch for transports that don't go through
     /// the rats client. `body` is the same `{req_id, type, body}`
@@ -189,6 +194,12 @@ private:
     /// content_hash. stream.open returns this list so requesters can
     /// reach out to a swarm member directly.
     store::SwarmIndex swarm_;
+
+    /// DB2 — wallet → Roaring(song ids) library store + song → wallets reverse
+    /// index. Separate keyspace from the chain, outside consensus; attached to
+    /// the same leveldb in start(). Edits replicate via signed deltas
+    /// (apply_delta) over a gossip layer that lands in a follow-up.
+    store::LibraryStore library_;
 
     /// Periodically prunes ghost peers from [swarm_]. Started in
     /// [start], stopped in [stop].
