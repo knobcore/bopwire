@@ -20,6 +20,11 @@ class WalletProvider extends ChangeNotifier {
     if (w != null && w._info != null) unawaited(w.refreshBalance());
   }
 
+  /// The active wallet provider (if a wallet is loaded). Lets non-widget
+  /// services (e.g. LibraryPublisher) sign with the user's key without a
+  /// BuildContext.
+  static WalletProvider? get active => _active;
+
   WalletProvider() {
     _active = this;
     // Fire-and-forget: pulls the BIP39 mnemonic from platform secure
@@ -68,6 +73,11 @@ class WalletProvider extends ChangeNotifier {
   bool        get loading => _loading;
   String?     get error   => _error;
   bool        get hasWallet => _info != null;
+
+  /// ECDSA-sign arbitrary bytes with the wallet key (secp256k1; the native
+  /// signer SHA-256s the data internally). Returns the 64-byte signature as
+  /// 128-char hex. Used by LibraryPublisher to sign DB2 library deltas.
+  String sign(Uint8List data) => _service.sign(data);
 
   Future<void> _tryAutoLoad() async {
     try {

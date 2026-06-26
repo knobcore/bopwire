@@ -17,6 +17,7 @@ import 'package:crypto/crypto.dart' as crypto;
 import 'package:permission_handler/permission_handler.dart';
 
 import 'fingerprinter.dart';
+import 'library_publisher.dart';
 import 'library_service.dart';
 import 'node_service.dart';
 import 'rats_client.dart';
@@ -120,7 +121,13 @@ class LibraryScanner {
   /// Used by both the boot-time announce and the VPS-reconnect handler.
   /// Replaces the old per-track `fingerprint.submit` loop that flooded
   /// the network at every reconnect with one RPC per song.
-  Future<void> reAnnounce() => syncSwarm();
+  Future<void> reAnnounce() async {
+    await syncSwarm();
+    // DB2 — also publish the wallet-signed library to the gossip-replicated
+    // LibraryStore so the full node (and, via flood, every other node) has our
+    // current list. Fire-and-forget; the node's version gate makes it idempotent.
+    unawaited(LibraryPublisher.publishFull());
+  }
 
   /// Compute the local canonical-hash set, send `swarm.hello_digest`,
   /// and if the full node has us under a different set fall through to

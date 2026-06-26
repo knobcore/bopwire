@@ -1913,7 +1913,11 @@ void RatsApi::handle_mod_envelope(const std::string& peer_id,
 // ======================================================================
 namespace {
 
-bool from_hex_fixed(const std::string& hex, uint8_t* out, size_t n) {
+bool from_hex_fixed(const std::string& hex_in, uint8_t* out, size_t n) {
+    // Tolerate an optional 0x / 0X prefix so either hex form parses.
+    const std::string hex =
+        (hex_in.size() >= 2 && hex_in[0] == '0' &&
+         (hex_in[1] == 'x' || hex_in[1] == 'X')) ? hex_in.substr(2) : hex_in;
     if (hex.size() != n * 2) return false;
     auto nib = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
