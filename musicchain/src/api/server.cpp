@@ -786,7 +786,17 @@ std::pair<int, std::string> HttpServer::post_session_complete(
 
     // ---- gate 2: timestamps cover the song --------------------------
     {
-        const uint64_t required_ms = song_section.duration_ms > 0
+        // Guard against a garbage on-chain duration. A buggy container once
+        // registered 662646176 ms (= 184 h), and 50% of that can never be
+        // listened, so the song became permanently un-rewardable. A real music
+        // track is < 6 h; if the stored duration is implausible, fall back to
+        // the fixed legacy listen threshold instead of a percentage of a bogus
+        // value — so songs already registered with a bad duration still reward
+        // on a genuine play.
+        constexpr uint64_t kMaxSaneDurationMs = 6ull * 60 * 60 * 1000;
+        const bool dur_sane = song_section.duration_ms > 0 &&
+            uint64_t{song_section.duration_ms} < kMaxSaneDurationMs;
+        const uint64_t required_ms = dur_sane
             ? (uint64_t{song_section.duration_ms}
                 * kPlayPercentRequired / 100)
             : kLegacyMinListenMs;

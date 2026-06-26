@@ -497,7 +497,17 @@ class LibraryScanner {
       final pcmDurMs = (fp.pcmSamples /
                        (fp.channelCount > 0 ? fp.channelCount : 1) /
                        fp.sampleRate * 1000).round();
-      final durationMs = tagDurMs > 0 ? tagDurMs : pcmDurMs;
+      // Sanity-gate the duration. A container/tag can report a wildly wrong
+      // value (seen registered on-chain: 662646176 ms = 184 h). Because the
+      // play-reward gate requires listening to 50% of the REGISTERED duration,
+      // a garbage duration makes the song PERMANENTLY un-rewardable (every real
+      // play scores "below_threshold"). Accept a value only if it's plausible
+      // for a track (< 6 h): prefer the tag, fall back to the PCM-derived
+      // duration, else 0 so the node applies its fixed legacy listen threshold.
+      const kMaxSaneDurationMs = 6 * 60 * 60 * 1000; // 6 hours
+      final durationMs = (tagDurMs > 0 && tagDurMs < kMaxSaneDurationMs)
+          ? tagDurMs
+          : (pcmDurMs > 0 && pcmDurMs < kMaxSaneDurationMs ? pcmDurMs : 0);
 
       final fmt = _formatFromPath(file.path);
 
