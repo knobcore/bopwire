@@ -245,6 +245,30 @@ json status_body(Chain& chain, net::NetworkManager& network,
 
 } // namespace
 
+// DB2 hex helper — declared here so it precedes its first use in
+// handle_request's library/playlist verbs (and the ingest methods below).
+namespace {
+bool from_hex_fixed(const std::string& hex_in, uint8_t* out, size_t n) {
+    // Tolerate an optional 0x / 0X prefix so either hex form parses.
+    const std::string hex =
+        (hex_in.size() >= 2 && hex_in[0] == '0' &&
+         (hex_in[1] == 'x' || hex_in[1] == 'X')) ? hex_in.substr(2) : hex_in;
+    if (hex.size() != n * 2) return false;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        const int hi = nib(hex[2 * i]), lo = nib(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+} // namespace
+
 void RatsApi::handle_request(const std::string& peer_id,
                              const std::string& body) {
     json env;
@@ -1985,26 +2009,6 @@ void RatsApi::handle_mod_envelope(const std::string& peer_id,
 // DB2 — wallet-signed library delta: canonical bytes, verify, ingest, flood
 // ======================================================================
 namespace {
-
-bool from_hex_fixed(const std::string& hex_in, uint8_t* out, size_t n) {
-    // Tolerate an optional 0x / 0X prefix so either hex form parses.
-    const std::string hex =
-        (hex_in.size() >= 2 && hex_in[0] == '0' &&
-         (hex_in[1] == 'x' || hex_in[1] == 'X')) ? hex_in.substr(2) : hex_in;
-    if (hex.size() != n * 2) return false;
-    auto nib = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    };
-    for (size_t i = 0; i < n; ++i) {
-        const int hi = nib(hex[2*i]), lo = nib(hex[2*i+1]);
-        if (hi < 0 || lo < 0) return false;
-        out[i] = static_cast<uint8_t>((hi << 4) | lo);
-    }
-    return true;
-}
 
 void put_le(std::vector<uint8_t>& v, uint64_t x, int bytes) {
     for (int i = 0; i < bytes; ++i)
