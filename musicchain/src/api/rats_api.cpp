@@ -48,6 +48,7 @@ constexpr const char* MC_REQUEST_TYPE = "musicchain.request";
 constexpr const char* MC_REPLY_TYPE   = "musicchain.reply";
 constexpr const char* MC_MOD_TYPE     = "musicchain.mod";
 constexpr const char* MC_LIBRARY_TYPE = "musicchain.library";  // DB2 delta gossip
+constexpr const char* MC_PLAYLIST_TYPE = "musicchain.playlist"; // DB2 playlist gossip
 
 RatsApi::RatsApi(HttpServer& http,
                  Chain& chain, CandidateManager& candidates,
@@ -75,6 +76,8 @@ void RatsApi::start(rats_client_t client) {
     // DB2 — wallet-signed library deltas flood over their own broadcast type.
     rats_on_message(client_, MC_LIBRARY_TYPE,
                     &RatsApi::on_library_cb, this);
+    rats_on_message(client_, MC_PLAYLIST_TYPE,
+                    &RatsApi::on_playlist_cb, this);
     // Connection-state authoritative swarm: track who's online so
     // entries from offline peers vanish from members() without needing
     // the per-track TTL renewal that the old per-file fingerprint.submit
@@ -529,6 +532,76 @@ void RatsApi::handle_request(const std::string& peer_id,
                              {"content_hash", crypto::to_hex(ch)},
                              {"holders",      arr},
                              {"count",        ws.size()},
+                         }}};
+            }
+        }
+        // ---- DB2 playlists (ordered; signed; flood-replicated) ----------
+        //   playlist.set  { wallet,pubkey,playlist_id,version,ts,deleted,
+        //                   name,songs:[hex],sig }  -> {applied,version}
+        //   playlist.get  { wallet, playlist_id }   -> {name,version,songs}
+        //   playlist.list { wallet }                -> {playlists:[...]}
+        else if (type == "playlist.set") {
+            const bool applied = ingest_playlist(in.dump(),
+                                                 /*broadcast_if_new=*/true);
+            reply = {{"req_id", req_id},
+                     {"status", applied ? "ok" : "rejected"},
+                     {"body", {
+                         {"applied", applied},
+                         {"version", in.value("version", static_cast<uint64_t>(0))},
+                     }}};
+            if (!applied) reply["error"] = "bad signature or stale version";
+        }
+        else if (type == "playlist.get") {
+            Address wallet{};
+            std::array<uint8_t, 16> pid{};
+            if (!crypto::parse_address_checksummed(
+                    in.value("wallet", std::string()), wallet) ||
+                !from_hex_fixed(in.value("playlist_id", std::string()),
+                                pid.data(), pid.size())) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "bad wallet or playlist_id"}};
+            } else {
+                auto pl = library_.get_playlist(wallet, pid);
+                if (!pl) {
+                    reply = {{"req_id", req_id}, {"status", "unknown"},
+                             {"error", "no such playlist"}};
+                } else {
+                    json arr = json::array();
+                    for (const auto& h : pl->songs) arr.push_back(crypto::to_hex(h));
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {
+                                 {"wallet",      crypto::to_hex(wallet.data(), wallet.size())},
+                                 {"playlist_id", in.value("playlist_id", std::string())},
+                                 {"name",        pl->name},
+                                 {"version",     pl->version},
+                                 {"songs",       arr},
+                             }}};
+                }
+            }
+        }
+        else if (type == "playlist.list") {
+            Address wallet{};
+            if (!crypto::parse_address_checksummed(
+                    in.value("wallet", std::string()), wallet)) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "wallet not a 20-byte address"}};
+            } else {
+                json arr = json::array();
+                for (const auto& pl : library_.list_playlists(wallet)) {
+                    json songs = json::array();
+                    for (const auto& h : pl.songs) songs.push_back(crypto::to_hex(h));
+                    arr.push_back({
+                        {"playlist_id", crypto::to_hex(pl.id.data(), pl.id.size())},
+                        {"name",        pl.name},
+                        {"version",     pl.version},
+                        {"count",       pl.songs.size()},
+                        {"songs",       songs},
+                    });
+                }
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {
+                             {"wallet",    crypto::to_hex(wallet.data(), wallet.size())},
+                             {"playlists", arr},
                          }}};
             }
         }
@@ -2021,6 +2094,86 @@ void RatsApi::on_library_cb(void* user_data, const char* /*peer_id*/,
     auto* self = static_cast<RatsApi*>(user_data);
     if (!self || !message_data) return;
     self->ingest_library_delta(message_data, /*broadcast_if_new=*/true);
+}
+
+// ---- DB2 playlists: signed record, verify, ingest, flood ----------------
+namespace {
+// Canonical signed bytes for a playlist record (must match the player's Dart):
+//   "mcpls1" || wallet(20) || playlist_id(16) || version(8 LE) || ts(8 LE) ||
+//   deleted(1) || name_len(2 LE) || name || count(4 LE) || song_hashes(32·n)
+std::vector<uint8_t> playlist_canonical(const Address& wallet,
+                                        const std::array<uint8_t, 16>& pid,
+                                        uint64_t version, uint64_t ts_ms,
+                                        bool deleted, const std::string& name,
+                                        const std::vector<Hash256>& songs) {
+    std::vector<uint8_t> b;
+    static const char tag[6] = {'m', 'c', 'p', 'l', 's', '1'};
+    b.insert(b.end(), tag, tag + 6);
+    b.insert(b.end(), wallet.begin(), wallet.end());
+    b.insert(b.end(), pid.begin(), pid.end());
+    put_le(b, version, 8);
+    put_le(b, ts_ms,   8);
+    b.push_back(deleted ? 1 : 0);
+    put_le(b, name.size(), 2);
+    b.insert(b.end(), name.begin(), name.end());
+    put_le(b, songs.size(), 4);
+    for (const auto& h : songs) b.insert(b.end(), h.begin(), h.end());
+    return b;
+}
+} // namespace
+
+bool RatsApi::ingest_playlist(const std::string& payload_json,
+                              bool broadcast_if_new) {
+    json env;
+    try { env = json::parse(payload_json); } catch (...) { return false; }
+    if (!env.is_object()) return false;
+
+    Address                 wallet{};
+    PubKey33                pubkey{};
+    Sig64                   sig{};
+    std::array<uint8_t, 16> pid{};
+    if (!crypto::parse_address_checksummed(env.value("wallet", std::string()), wallet))
+        return false;
+    if (!from_hex_fixed(env.value("pubkey", std::string()), pubkey.data(), pubkey.size()))
+        return false;
+    if (!from_hex_fixed(env.value("sig", std::string()), sig.data(), sig.size()))
+        return false;
+    if (!from_hex_fixed(env.value("playlist_id", std::string()), pid.data(), pid.size()))
+        return false;
+    if (crypto::address_from_pubkey(pubkey) != wallet) return false;
+
+    const uint64_t    version = env.value("version", static_cast<uint64_t>(0));
+    const uint64_t    ts_ms   = env.value("ts",      static_cast<uint64_t>(0));
+    const bool        deleted = env.value("deleted", false);
+    const std::string name    = env.value("name",    std::string());
+    std::vector<Hash256> songs;
+    if (env.contains("songs") && env["songs"].is_array())
+        for (const auto& h : env["songs"]) {
+            Hash256 ch{};
+            if (h.is_string() && crypto::parse_hash256(h.get<std::string>(), ch))
+                songs.push_back(ch);
+        }
+
+    const auto    canon  = playlist_canonical(wallet, pid, version, ts_ms,
+                                              deleted, name, songs);
+    const Hash256 digest = crypto::sha256(canon.data(), canon.size());
+    if (!crypto::verify_ecdsa(digest, sig, pubkey)) return false;
+
+    const bool applied = deleted
+        ? library_.delete_playlist(wallet, pid, version)
+        : library_.set_playlist(wallet, pid, name, songs, version);
+    if (!applied) return false;
+
+    if (broadcast_if_new && client_)
+        rats_broadcast_message(client_, MC_PLAYLIST_TYPE, payload_json.c_str());
+    return true;
+}
+
+void RatsApi::on_playlist_cb(void* user_data, const char* /*peer_id*/,
+                             const char* message_data) {
+    auto* self = static_cast<RatsApi*>(user_data);
+    if (!self || !message_data) return;
+    self->ingest_playlist(message_data, /*broadcast_if_new=*/true);
 }
 
 bool RatsApi::publish_mod_action(const std::string&         action,

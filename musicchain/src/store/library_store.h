@@ -79,6 +79,35 @@ public:
     std::vector<Address> holders(const Hash256& ch) const;
     size_t               holder_count(const Hash256& ch) const;
 
+    // ---- playlists (ordered lists; many per wallet) -----------------------
+    //
+    // A playlist is a wallet-owned, ORDERED list of song hashes with a name,
+    // keyed by a 16-byte playlist id. Same signed-delta + gossip plumbing as
+    // libraries — but order matters, so it is NOT a Roaring set; it is stored
+    // as an ordered hash list, leveldb-backed and version-gated for gossip
+    // convergence. A deleted playlist is kept as a version-stamped tombstone
+    // so a re-delivered older "set" can't resurrect it.
+    struct Playlist {
+        std::array<uint8_t, 16> id{};
+        std::string             name;
+        uint64_t                version = 0;
+        std::vector<Hash256>    songs;          // ORDERED
+        bool                    deleted = false;
+    };
+
+    /// Create/replace a playlist (whole ordered list + name). Version-gated +
+    /// idempotent; returns true iff applied (strictly-newer version).
+    bool set_playlist(const Address& wallet, const std::array<uint8_t, 16>& id,
+                      const std::string& name,
+                      const std::vector<Hash256>& songs, uint64_t version);
+    /// Tombstone a playlist (version-gated). Returns true iff applied.
+    bool delete_playlist(const Address& wallet,
+                         const std::array<uint8_t, 16>& id, uint64_t version);
+    std::optional<Playlist> get_playlist(
+        const Address& wallet, const std::array<uint8_t, 16>& id) const;
+    /// Every live (non-tombstoned) playlist a wallet owns.
+    std::vector<Playlist> list_playlists(const Address& wallet) const;
+
     // ---- stats -------------------------------------------------------------
 
     size_t wallet_count() const;   // wallets with a non-empty library

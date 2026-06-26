@@ -153,6 +153,14 @@ private:
     bool ingest_library_delta(const std::string& payload_json,
                               bool broadcast_if_new);
 
+    /// DB2 playlists — same wallet-signed, version-gated, flood-replicated
+    /// path as library deltas, but the record is a wallet's ordered playlist
+    /// (keyed by a 16-byte playlist id) over the MC_PLAYLIST_TYPE channel.
+    static void on_playlist_cb(void* user_data, const char* peer_id,
+                               const char* message_data);
+    bool ingest_playlist(const std::string& payload_json,
+                         bool broadcast_if_new);
+
     /// Receive a moderation envelope from a peer (broadcast or sync push)
     /// — verify the signature against the moderator set, dedupe by sig,
     /// apply the hide / unhide to db, and persist to the mod log so

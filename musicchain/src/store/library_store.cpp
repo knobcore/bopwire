@@ -6,6 +6,7 @@
 
 #include <leveldb/write_batch.h>
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -279,6 +280,135 @@ size_t LibraryStore::wallet_count() const {
 size_t LibraryStore::catalog_size() const {
     std::lock_guard<std::mutex> lk(p_->mu);
     return p_->id_to_hash.size();
+}
+
+// ---- playlists ---------------------------------------------------------
+// leveldb-backed, on-demand (no in-memory cache). Key: "Pp"<wallet:20><id:16>.
+// Value: ver:u64 | deleted:u8 | name_len:u16 | name | count:u32 | songs(32·n).
+// Ordered (NOT a Roaring set); hashes stored inline so playlists don't depend
+// on the intern table. Version-gated for gossip convergence (incl. tombstones).
+namespace {
+void w2(std::vector<uint8_t>& v, uint16_t x) {
+    v.push_back(uint8_t(x & 0xFF)); v.push_back(uint8_t((x >> 8) & 0xFF));
+}
+void w4(std::vector<uint8_t>& v, uint32_t x) {
+    for (int i = 0; i < 4; ++i) v.push_back(uint8_t((x >> (8 * i)) & 0xFF));
+}
+void w8(std::vector<uint8_t>& v, uint64_t x) {
+    for (int i = 0; i < 8; ++i) v.push_back(uint8_t((x >> (8 * i)) & 0xFF));
+}
+uint16_t r2(const std::string& s, size_t o) {
+    return (o + 2 <= s.size())
+        ? uint16_t(uint8_t(s[o]) | (uint16_t(uint8_t(s[o + 1])) << 8)) : 0;
+}
+uint32_t r4(const std::string& s, size_t o) {
+    uint32_t x = 0;
+    if (o + 4 <= s.size())
+        for (int i = 0; i < 4; ++i) x |= uint32_t(uint8_t(s[o + i])) << (8 * i);
+    return x;
+}
+uint64_t r8(const std::string& s, size_t o) {
+    uint64_t x = 0;
+    if (o + 8 <= s.size())
+        for (int i = 0; i < 8; ++i) x |= uint64_t(uint8_t(s[o + i])) << (8 * i);
+    return x;
+}
+std::string pl_key(const Address& w, const std::array<uint8_t, 16>& id) {
+    std::string k = "Pp";
+    k.append(reinterpret_cast<const char*>(w.data()), w.size());
+    k.append(reinterpret_cast<const char*>(id.data()), id.size());
+    return k;
+}
+} // namespace
+
+bool LibraryStore::set_playlist(const Address& wallet,
+                                const std::array<uint8_t, 16>& id,
+                                const std::string& name,
+                                const std::vector<Hash256>& songs,
+                                uint64_t version) {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    if (!p_->db) return false;
+    const std::string key = pl_key(wallet, id);
+    if (auto cur = p_->db->get(key)) {
+        const std::string s(reinterpret_cast<const char*>(cur->data()), cur->size());
+        if (version <= r8(s, 0)) return false;   // monotonic version gate
+    }
+    const uint16_t nlen =
+        static_cast<uint16_t>(std::min<size_t>(name.size(), 0xFFFF));
+    std::vector<uint8_t> v;
+    w8(v, version);
+    v.push_back(0);                              // deleted = false
+    w2(v, nlen);
+    v.insert(v.end(), name.begin(), name.begin() + nlen);
+    w4(v, static_cast<uint32_t>(songs.size()));
+    for (const auto& h : songs) v.insert(v.end(), h.begin(), h.end());
+    return p_->db->put(key, v);
+}
+
+bool LibraryStore::delete_playlist(const Address& wallet,
+                                   const std::array<uint8_t, 16>& id,
+                                   uint64_t version) {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    if (!p_->db) return false;
+    const std::string key = pl_key(wallet, id);
+    if (auto cur = p_->db->get(key)) {
+        const std::string s(reinterpret_cast<const char*>(cur->data()), cur->size());
+        if (version <= r8(s, 0)) return false;
+    }
+    std::vector<uint8_t> v;
+    w8(v, version);
+    v.push_back(1);                              // deleted = true (tombstone)
+    w2(v, 0);
+    w4(v, 0);
+    return p_->db->put(key, v);
+}
+
+static bool decode_playlist(const std::string& s, LibraryStore::Playlist& pl) {
+    if (s.size() < 9) return false;
+    pl.version = r8(s, 0);
+    pl.deleted = s[8] != 0;
+    if (pl.deleted) return false;                // hidden from queries
+    size_t off = 9;
+    const uint16_t nlen = r2(s, off); off += 2;
+    if (off + nlen > s.size()) return false;
+    pl.name.assign(s.data() + off, nlen); off += nlen;
+    const uint32_t count = r4(s, off); off += 4;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (off + 32 > s.size()) break;
+        Hash256 h{}; std::memcpy(h.data(), s.data() + off, 32); off += 32;
+        pl.songs.push_back(h);
+    }
+    return true;
+}
+
+std::optional<LibraryStore::Playlist> LibraryStore::get_playlist(
+        const Address& wallet, const std::array<uint8_t, 16>& id) const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    if (!p_->db) return std::nullopt;
+    auto cur = p_->db->get(pl_key(wallet, id));
+    if (!cur) return std::nullopt;
+    const std::string s(reinterpret_cast<const char*>(cur->data()), cur->size());
+    Playlist pl; pl.id = id;
+    if (!decode_playlist(s, pl)) return std::nullopt;
+    return pl;
+}
+
+std::vector<LibraryStore::Playlist> LibraryStore::list_playlists(
+        const Address& wallet) const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    std::vector<Playlist> out;
+    if (!p_->db) return out;
+    std::string prefix = "Pp";
+    prefix.append(reinterpret_cast<const char*>(wallet.data()), wallet.size());
+    p_->db->for_each_with_prefix(prefix, [&](const std::string& key,
+                                             const std::string& s) {
+        if (key.size() != 2 + 20 + 16) return true;
+        Playlist pl;
+        std::memcpy(pl.id.data(), key.data() + 2 + 20, 16);
+        if (decode_playlist(s, pl)) out.push_back(std::move(pl));
+        return true;
+    });
+    return out;
 }
 
 } // namespace mc::store
