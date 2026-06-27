@@ -9,7 +9,7 @@ import '../services/librats_discovery.dart';
 import '../services/rats_client.dart';
 import 'library_screen.dart';
 import 'local_library_screen.dart';
-import 'search_screen.dart';
+import 'chat_screen.dart';
 import 'wallet_screen.dart';
 import 'settings_screen.dart';
 
@@ -26,7 +26,7 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _screens = [
     LibraryScreen(),
     LocalLibraryScreen(),
-    SearchScreen(),
+    ChatScreen(),
     WalletScreen(),
     SettingsScreen(),
   ];
@@ -66,7 +66,7 @@ class _HomeScreenState extends State<HomeScreen> {
         destinations: const [
           NavigationDestination(icon: Icon(Icons.library_music),         label: 'Discover'),
           NavigationDestination(icon: Icon(Icons.folder_special),        label: 'My Library'),
-          NavigationDestination(icon: Icon(Icons.search),                label: 'Search'),
+          NavigationDestination(icon: Icon(Icons.chat_bubble_outline),   label: 'Chat'),
           NavigationDestination(icon: Icon(Icons.account_balance_wallet), label: 'Wallet'),
           NavigationDestination(icon: Icon(Icons.settings),              label: 'Settings'),
         ],

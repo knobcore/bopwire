@@ -568,6 +568,40 @@ void RatsApi::handle_request(const std::string& peer_id,
                          {"error",  e.what()}};
             }
         }
+        // ---- chat support reads -----------------------------------------
+        //
+        // Two pure-read verbs the mini-node leans on for its chat module.
+        // The mini-node holds no leveldb, so it relays these to a full node
+        // to (a) resolve a wallet's on-chain username for display and
+        // (b) fetch the active global-moderator set so it can authorize
+        // global-mod chat actions (kick/remove) beyond the room creator.
+        else if (type == "username.lookup") {
+            // body {addr} -> {username: <name or "">}. addr is the
+            // 0x-prefixed / lowercase 20-byte hex wallet address.
+            Address addr{};
+            const std::string addr_hex = in.value("addr", "");
+            if (addr_hex.empty() ||
+                !crypto::parse_address_checksummed(addr_hex, addr)) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error",  "bad or missing addr"}};
+            } else {
+                auto name = db_.get_addr_username(addr);
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {{"username",
+                                    name.has_value() ? *name
+                                                     : std::string()}}}};
+            }
+        } else if (type == "mod.list_moderators") {
+            // -> {moderators:[<hex addr>...]}. The active on-chain
+            // moderator address list; the mini-node caches it (TTL) to
+            // authorize global-mod chat.moderate actions.
+            json arr = json::array();
+            for (const auto& a : db_.list_active_moderators()) {
+                arr.push_back(crypto::to_hex(a.data(), a.size()));
+            }
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body", {{"moderators", std::move(arr)}}}};
+        }
         // ---- session control --------------------------------------------
         else if (type == "session.start") {
             // #5 attestation (record-only on the realtime path): derive a

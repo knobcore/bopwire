@@ -16,7 +16,8 @@
 #include "librats_c.h"
 #include "../src/net/load_monitor.h"
 #include "../src/crypto/keys.h"
-#include "../src/crypto/signature.h"  // sign_data for relay.report (#10)
+#include "../src/crypto/hash.h"       // from_hex / to_hex for chat sig verify
+#include "../src/crypto/signature.h"  // sign_data for relay.report (#10), verify_data for chat
 #include "../src/crypto/bip39.h"   // bip39_generate_12 / bip39_mnemonic_to_keypair
 #include <array>                    // DeliveryAccum delivery_id (#10)
 #include <fstream>
@@ -31,7 +32,9 @@
 // `relay.forward`).
 #include "json.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -274,10 +277,142 @@ std::unordered_map<std::string, ChatRoom>               g_chat_rooms;
 std::mutex                                              g_chat_msgs_mu;
 std::unordered_map<std::string, std::deque<ChatMessage>> g_chat_msgs;
 
+// ---- Chat moderation + push state (all memory-only, bounded) --------
+//
+// Wire protocol (must match the player byte-for-byte). Every chat action
+// is wallet-signed; the canonical preimage uses a 6-byte ASCII domain
+// tag, raw fields, and 0x1F (unit separator) between variable-length
+// fields, u64 little-endian for timestamps. NO pre-hashing —
+// crypto::verify_data() sha256's internally then verify_ecdsa.
+constexpr const char* kChatModTopic = "chat:mod";
+constexpr uint8_t     kUnitSep      = 0x1F;
+
+// Per-room ban list (set of 0x-prefixed lowercase wallet hex addresses
+// the room creator / a global moderator has kicked). Bounded by
+// kMaxChatRooms rooms; per-room set is small in practice.
+std::mutex                                                      g_chat_bans_mu;
+std::unordered_map<std::string, std::unordered_set<std::string>> g_chat_bans;
+
+// Dedup set of moderation-action signatures already processed + re-published
+// to chat:mod, so a re-broadcast doesn't loop. TTL-evicted by the reaper.
+constexpr size_t   kMaxChatModSeen   = 4096;
+constexpr uint64_t kChatModSeenTtlMs = 10 * 60 * 1000; // 10 min
+std::mutex                                  g_chat_mod_seen_mu;
+std::unordered_map<std::string, uint64_t>   g_chat_mod_seen; // sig hex -> first_seen_ms
+
+// Per-player watched rooms: peer_id -> set<room>. A player calls
+// chat.watch{room} so the mini-node pushes live messages for that room to
+// it (chat.message push), and chat.unwatch{room} to stop. Bounded by the
+// connected-peer count; cleaned on disconnect.
+constexpr size_t kMaxWatchedRoomsPerPlayer = 64;
+std::mutex                                                      g_chat_watchers_mu;
+std::unordered_map<std::string, std::unordered_set<std::string>> g_chat_watchers;
+
+// Cached active global-moderator set (lowercase 20-byte hex, no 0x), pulled
+// periodically from a full node via the "mod.list_moderators" RPC. chat.moderate
+// authorizes a non-creator actor only if their address is in here.
+constexpr uint64_t kChatModsTtlMs = 5 * 60 * 1000; // 5 min refresh window
+std::mutex                          g_chat_mods_mu;
+std::unordered_set<std::string>     g_chat_mods;            // lowercase hex, no 0x
+uint64_t                            g_chat_mods_fetched_ms = 0;
+
 // Forward declarations; bodies appear below the rats_client_t globals.
 void chat_subscribe_room(rats_client_t client, const std::string& name);
 void on_chat_room_announce(void*, const char*, const char*, const char*);
 void on_chat_message(void*, const char*, const char*, const char*);
+void on_chat_mod_message(void*, const char*, const char*, const char*);
+
+// ---- Chat signature verification (shared signed wire protocol) ------
+//
+// Common helper: parse a 66-hex compressed pubkey + a 128-hex sig, require
+// crypto::address_from_pubkey(pubkey) == the claimed 20-byte address, then
+// crypto::verify_data(canon, canon_len, sig, pubkey). Returns true on a
+// fully valid envelope. `claimed_addr_hex` is the 0x-prefixed/lowercase
+// 20-byte hex from the message's address field (from/creator/by).
+bool chat_verify_canon(const std::vector<uint8_t>& canon,
+                       const std::string& claimed_addr_hex,
+                       const std::string& pubkey_hex,
+                       const std::string& sig_hex) {
+    if (pubkey_hex.size() != 66 || sig_hex.size() != 128) return false;
+    auto pk_bytes  = mc::crypto::from_hex(pubkey_hex);
+    auto sig_bytes = mc::crypto::from_hex(sig_hex);
+    if (pk_bytes.size() != 33 || sig_bytes.size() != 64) return false;
+    mc::Address claimed{};
+    if (!mc::crypto::parse_address_checksummed(claimed_addr_hex, claimed))
+        return false;
+    mc::PubKey33 pub{};
+    std::copy(pk_bytes.begin(), pk_bytes.end(), pub.begin());
+    mc::Sig64 sig{};
+    std::copy(sig_bytes.begin(), sig_bytes.end(), sig.begin());
+    // Require the pubkey to actually derive the claimed wallet address.
+    if (mc::crypto::address_from_pubkey(pub) != claimed) return false;
+    return mc::crypto::verify_data(canon.data(), canon.size(), sig, pub);
+}
+
+// Append a u64 little-endian to a byte vector.
+inline void append_u64_le(std::vector<uint8_t>& v, uint64_t x) {
+    for (int i = 0; i < 8; ++i) v.push_back(uint8_t(x >> (8 * i)));
+}
+
+// Append a 20-byte raw address parsed from 0x-prefixed/lowercase hex.
+// Returns false if the address doesn't parse.
+inline bool append_addr_raw(std::vector<uint8_t>& v, const std::string& hex) {
+    mc::Address a{};
+    if (!mc::crypto::parse_address_checksummed(hex, a)) return false;
+    v.insert(v.end(), a.begin(), a.end());
+    return true;
+}
+
+// Build the "mccht1" CHAT MESSAGE preimage:
+//   "mccht1" || room(utf8) || 0x1F || from(20 raw) || ts_ms(u64 LE) || body(utf8)
+bool build_chat_msg_canon(const std::string& room, const std::string& from_hex,
+                          uint64_t ts_ms, const std::string& body,
+                          std::vector<uint8_t>& out) {
+    out.clear();
+    static const char tag[] = "mccht1";
+    out.insert(out.end(), tag, tag + 6);
+    out.insert(out.end(), room.begin(), room.end());
+    out.push_back(kUnitSep);
+    if (!append_addr_raw(out, from_hex)) return false;
+    append_u64_le(out, ts_ms);
+    out.insert(out.end(), body.begin(), body.end());
+    return true;
+}
+
+// Build the "mccrm1" ROOM CREATE preimage:
+//   "mccrm1" || name(utf8) || 0x1F || creator(20 raw) || created_ms(u64 LE) || private_byte
+bool build_chat_room_canon(const std::string& name, const std::string& creator_hex,
+                           uint64_t created_ms, bool is_private,
+                           std::vector<uint8_t>& out) {
+    out.clear();
+    static const char tag[] = "mccrm1";
+    out.insert(out.end(), tag, tag + 6);
+    out.insert(out.end(), name.begin(), name.end());
+    out.push_back(kUnitSep);
+    if (!append_addr_raw(out, creator_hex)) return false;
+    append_u64_le(out, created_ms);
+    out.push_back(is_private ? 0x01 : 0x00);
+    return true;
+}
+
+// Build the "mccmd1" MOD ACTION preimage:
+//   "mccmd1" || action(utf8) || 0x1F || room(utf8) || 0x1F || target(utf8) || 0x1F || by(20 raw) || ts_ms(u64 LE)
+bool build_chat_mod_canon(const std::string& action, const std::string& room,
+                          const std::string& target, const std::string& by_hex,
+                          uint64_t ts_ms, std::vector<uint8_t>& out) {
+    out.clear();
+    static const char tag[] = "mccmd1";
+    out.insert(out.end(), tag, tag + 6);
+    out.insert(out.end(), action.begin(), action.end());
+    out.push_back(kUnitSep);
+    out.insert(out.end(), room.begin(), room.end());
+    out.push_back(kUnitSep);
+    out.insert(out.end(), target.begin(), target.end());
+    out.push_back(kUnitSep);
+    if (!append_addr_raw(out, by_hex)) return false;
+    append_u64_le(out, ts_ms);
+    return true;
+}
 
 // ---- Event log (TUI monitor) ----------------------------------------
 //
@@ -571,6 +706,11 @@ void broadcast_swarm_peer_offline(const std::string& disconnected_pid);
 void broadcast_swarm_peer_online(const std::string& online_pid);
 void replay_online_players_to_home(const std::string& full_pid);
 
+// Chat push + moderation helpers — defined once g_client is in scope.
+void chat_push_message_to_watchers(const std::string& room,
+                                   const nlohmann::json& msg_envelope);
+void chat_refresh_global_mods_if_stale();
+
 // Re-test reachability if the last probe is older than this.
 constexpr uint64_t kProbeMinIntervalMs = 60'000;
 
@@ -709,6 +849,12 @@ void on_peer_disconnected(void* /*ud*/, const char* peer_id) {
     if (peer_id && !was_mininode) {
         std::lock_guard<std::mutex> lk(g_players_mu);
         g_players.erase(peer_id);
+    }
+    // Drop any chat watch subscriptions this peer held so the watcher map
+    // stays bounded to currently-connected players.
+    if (peer_id) {
+        std::lock_guard<std::mutex> lk(g_chat_watchers_mu);
+        g_chat_watchers.erase(peer_id);
     }
     // Non-mini-node disconnects need to propagate to the full nodes —
     // they otherwise have no signal that a relayed player went offline
@@ -981,6 +1127,17 @@ void on_chat_room_announce(void* /*ud*/, const char* /*peer_id*/,
         room.creator    = j.value("creator",    std::string());
         room.created_ms = j.value("created_ms", static_cast<uint64_t>(0));
         room.is_private = j.value("private",    false);
+        const std::string creator_pubkey = j.value("creator_pubkey", std::string());
+        const std::string sig            = j.value("sig",            std::string());
+        // (#1) Verify the "mccrm1" envelope so only validly-signed rooms
+        // allocate a deque + gossipsub subscription — closes the
+        // unauthenticated-announce memory note. Drop on any failure.
+        std::vector<uint8_t> canon;
+        if (!build_chat_room_canon(room.name, room.creator, room.created_ms,
+                                   room.is_private, canon))
+            return;
+        if (!chat_verify_canon(canon, room.creator, creator_pubkey, sig))
+            return;
         bool added = false;
         {
             std::lock_guard<std::mutex> lk(g_chat_rooms_mu);
@@ -1026,15 +1183,206 @@ void on_chat_message(void* /*ud*/, const char* /*peer_id*/,
         m.sig         = j.value("sig",         std::string());
         if (m.from.empty() || m.ts_ms == 0) return;
         if (m.body.size() > kMaxChatBodyBytes) return;   // (#2) drop oversized
-        std::lock_guard<std::mutex> lk(g_chat_msgs_mu);
-        // (#2) don't allocate a new room deque past the cap.
-        if (g_chat_msgs.find(room_name) == g_chat_msgs.end() &&
-            g_chat_msgs.size() >= kMaxChatRooms) return;
-        auto& dq = g_chat_msgs[room_name];
-        dq.push_back(std::move(m));
-        while (dq.size() > kChatRingPerRoom) dq.pop_front();
+        // (#1) Verify the "mccht1" preimage; drop on failure so only
+        // wallet-signed messages ever enter the ring.
+        std::vector<uint8_t> canon;
+        if (!build_chat_msg_canon(room_name, m.from, m.ts_ms, m.body, canon))
+            return;
+        if (!chat_verify_canon(canon, m.from, m.from_pubkey, m.sig))
+            return;
+        // Drop messages from banned senders so a kicked wallet can't keep
+        // talking via the gossip mesh.
+        {
+            std::lock_guard<std::mutex> lk(g_chat_bans_mu);
+            auto bit = g_chat_bans.find(room_name);
+            if (bit != g_chat_bans.end() && bit->second.count(m.from) > 0) return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_chat_msgs_mu);
+            // (#2) don't allocate a new room deque past the cap.
+            if (g_chat_msgs.find(room_name) == g_chat_msgs.end() &&
+                g_chat_msgs.size() >= kMaxChatRooms) return;
+            auto& dq = g_chat_msgs[room_name];
+            dq.push_back(m);
+            while (dq.size() > kChatRingPerRoom) dq.pop_front();
+        }
+        // Push to any players currently watching this room so they see the
+        // message live (the player reads these via its onPush hook).
+        chat_push_message_to_watchers(room_name, j);
     } catch (const nlohmann::json::exception&) {
         // Malformed message — drop.
+    }
+}
+
+// Push a chat message to every player currently watching `room`. The push
+// reuses the same fire-and-forget mechanism the relay.push.forward verb
+// uses: a `musicchain.reply` (kReplyType) envelope carrying a FRESH req_id
+// the player never issued, so the player's _dispatchReply finds no pending
+// match and routes it to its onPush hook as type "chat.message". The body
+// is the verbatim signed message envelope ({room,from,from_pubkey,ts_ms,
+// body,sig}) so the player can re-verify the signature locally.
+void chat_push_message_to_watchers(const std::string& room,
+                                   const nlohmann::json& msg_envelope) {
+    if (!g_client) return;
+    std::vector<std::string> watchers;
+    {
+        std::lock_guard<std::mutex> lk(g_chat_watchers_mu);
+        for (const auto& [pid, rooms] : g_chat_watchers) {
+            if (rooms.count(room) > 0) watchers.push_back(pid);
+        }
+    }
+    if (watchers.empty()) return;
+    // Ensure the room name travels with the push so the player can route
+    // the message to the right channel even if the envelope omitted it.
+    nlohmann::json body = msg_envelope;
+    if (!body.contains("room")) body["room"] = room;
+    nlohmann::json push = {
+        {"req_id", new_relay_req_id()},
+        {"type",   "chat.message"},
+        {"body",   body},
+    };
+    const std::string payload = push.dump();
+    for (const auto& pid : watchers) {
+        rats_send_message(g_client, pid.c_str(), kReplyType, payload.c_str());
+    }
+}
+
+// Refresh the cached global-moderator set from a full node, at most once
+// per kChatModsTtlMs. We ask the first full node in g_routes via the
+// "mod.list_moderators" RPC over our existing QUIC link (the same
+// kRequestType path we use to relay). The reply lands on kReplyType and is
+// absorbed by on_relay_reply, so we DON'T correlate it here — instead the
+// reply handler stuffs the moderator set into g_chat_mods. We just fire the
+// request when the cache is stale. Best-effort: if no full node is known we
+// simply keep whatever we have (creator-only auth still works).
+void chat_refresh_global_mods_if_stale() {
+    if (!g_client) return;
+    const uint64_t now = now_ms();
+    {
+        std::lock_guard<std::mutex> lk(g_chat_mods_mu);
+        if (g_chat_mods_fetched_ms != 0 &&
+            now - g_chat_mods_fetched_ms < kChatModsTtlMs) {
+            return; // still fresh
+        }
+        // Optimistically stamp now so concurrent callers don't all fire.
+        g_chat_mods_fetched_ms = now;
+    }
+    std::string target;
+    {
+        std::lock_guard<std::mutex> lk(g_routes_mu);
+        for (const auto& kv : g_routes) {
+            const std::string& pid = kv.second.rats_peer_id.empty()
+                ? kv.second.node_id : kv.second.rats_peer_id;
+            if (!pid.empty()) { target = pid; break; }
+        }
+    }
+    if (target.empty()) return;
+    nlohmann::json req = {
+        {"req_id", "chatmods-" + new_relay_req_id()},
+        {"type",   "mod.list_moderators"},
+        {"body",   nlohmann::json::object()},
+    };
+    rats_send_message(g_client, target.c_str(), kRequestType,
+                      req.dump().c_str());
+}
+
+// Lowercase + strip an optional 0x prefix from a 20-byte hex address so two
+// addresses compare stably regardless of EIP-55 checksum casing.
+std::string chat_norm_addr(std::string s) {
+    if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+        s = s.substr(2);
+    for (auto& ch : s)
+        ch = static_cast<char>(std::tolower((unsigned char)ch));
+    return s;
+}
+
+// Apply a verified, authorized "mccmd1" moderation action to local state.
+// Shared by the chat.moderate verb and the chat:mod gossip callback. Does
+// NOT verify or authorize — callers must do that first.
+void chat_apply_mod_action(const std::string& action, const std::string& room,
+                           const std::string& target, const std::string& by) {
+    if (action == "kick_user") {
+        if (target.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(g_chat_bans_mu);
+            g_chat_bans[room].insert(target);
+        }
+        if (g_client) {
+            std::vector<std::string> watchers;
+            {
+                std::lock_guard<std::mutex> lk(g_chat_watchers_mu);
+                for (const auto& [pid, rooms] : g_chat_watchers)
+                    if (rooms.count(room) > 0) watchers.push_back(pid);
+            }
+            nlohmann::json push = {
+                {"req_id", new_relay_req_id()},
+                {"type",   "chat.kicked"},
+                {"body",   {{"room", room}, {"target", target}, {"by", by}}},
+            };
+            const std::string payload = push.dump();
+            for (const auto& pid : watchers)
+                rats_send_message(g_client, pid.c_str(), kReplyType,
+                                  payload.c_str());
+        }
+    } else if (action == "remove_room") {
+        { std::lock_guard<std::mutex> lk(g_chat_rooms_mu); g_chat_rooms.erase(room); }
+        { std::lock_guard<std::mutex> lk(g_chat_msgs_mu);  g_chat_msgs.erase(room);  }
+        { std::lock_guard<std::mutex> lk(g_chat_bans_mu);  g_chat_bans.erase(room);  }
+        // librats (frozen) has no unsubscribe; the per-room subscription
+        // leaks but the maps are freed — matches the existing cap note.
+    }
+}
+
+// Gossip ingest for moderation actions published to the "chat:mod" topic by
+// other mini-nodes. Verify "mccmd1", authorize (creator OR cached global
+// mod), dedup on the signature, then apply locally. We do NOT re-publish
+// here (the originating mini-node already did) — gossipsub fans it out.
+void on_chat_mod_message(void* /*ud*/, const char* /*peer_id*/,
+                         const char* /*topic*/, const char* msg) {
+    if (!msg) return;
+    try {
+        auto j = nlohmann::json::parse(msg);
+        const std::string action    = j.value("action",    std::string());
+        const std::string room      = j.value("room",      std::string());
+        const std::string target    = j.value("target",    std::string());
+        const std::string by        = j.value("by",        std::string());
+        const std::string by_pubkey = j.value("by_pubkey", std::string());
+        const uint64_t    ts_ms     = j.value("ts_ms",     static_cast<uint64_t>(0));
+        const std::string sig       = j.value("sig",       std::string());
+        if ((action != "kick_user" && action != "remove_room") ||
+            room.empty() || by.empty() || ts_ms == 0) return;
+        // Dedup first (cheap) so a re-broadcast loop terminates.
+        {
+            std::lock_guard<std::mutex> lk(g_chat_mod_seen_mu);
+            if (g_chat_mod_seen.find(sig) != g_chat_mod_seen.end()) return;
+        }
+        std::vector<uint8_t> canon;
+        if (!build_chat_mod_canon(action, room, target, by, ts_ms, canon)) return;
+        if (!chat_verify_canon(canon, by, by_pubkey, sig)) return;
+        // Authorize: room creator OR cached global moderator.
+        bool is_creator = false;
+        {
+            std::lock_guard<std::mutex> lk(g_chat_rooms_mu);
+            auto it = g_chat_rooms.find(room);
+            if (it != g_chat_rooms.end())
+                is_creator = (chat_norm_addr(it->second.creator) ==
+                              chat_norm_addr(by));
+        }
+        bool is_global_mod = false;
+        {
+            std::lock_guard<std::mutex> lk(g_chat_mods_mu);
+            is_global_mod = g_chat_mods.count(chat_norm_addr(by)) > 0;
+        }
+        if (!is_creator && !is_global_mod) return;
+        // Record the signature now that it's verified + authorized.
+        {
+            std::lock_guard<std::mutex> lk(g_chat_mod_seen_mu);
+            if (g_chat_mod_seen.size() < kMaxChatModSeen)
+                g_chat_mod_seen[sig] = now_ms();
+        }
+        chat_apply_mod_action(action, room, target, by);
+    } catch (const nlohmann::json::exception&) {
+        // Malformed — drop.
     }
 }
 
@@ -1221,6 +1569,261 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
         }
         r << "{\"req_id\":\"" << req_id << "\",\"status\":\"ok\",\"body\":"
           << arr.dump() << "}";
+    } else if (type == "chat.create") {
+        // Player creates/announces a room. Verify the "mccrm1" envelope,
+        // insert into g_chat_rooms (respect the 128 cap), subscribe to the
+        // per-room topic, and re-publish the announce to chat:rooms so the
+        // rest of the mesh + every player picks it up.
+        // Body: {name, topic, creator, creator_pubkey, created_ms, private, sig}
+        const auto& b = env.value("body", nlohmann::json::object());
+        ChatRoom room;
+        room.name       = b.value("name",       std::string());
+        room.topic_str  = b.value("topic",      std::string());
+        room.creator    = b.value("creator",    std::string());
+        room.created_ms = b.value("created_ms", static_cast<uint64_t>(0));
+        room.is_private = b.value("private",    false);
+        const std::string creator_pubkey = b.value("creator_pubkey", std::string());
+        const std::string sig            = b.value("sig",            std::string());
+        std::string status = "ok";
+        std::string err;
+        std::vector<uint8_t> canon;
+        if (room.name.empty() || room.creator.empty()) {
+            status = "invalid"; err = "missing name/creator";
+        } else if (!build_chat_room_canon(room.name, room.creator,
+                                          room.created_ms, room.is_private, canon) ||
+                   !chat_verify_canon(canon, room.creator, creator_pubkey, sig)) {
+            status = "bad_signature"; err = "mccrm1 verify failed";
+        } else {
+            bool added = false, capped = false;
+            {
+                std::lock_guard<std::mutex> lk(g_chat_rooms_mu);
+                const bool known = g_chat_rooms.find(room.name) != g_chat_rooms.end();
+                if (known || g_chat_rooms.size() < kMaxChatRooms) {
+                    added = g_chat_rooms.emplace(room.name, room).second;
+                } else {
+                    capped = true;
+                }
+            }
+            if (capped) {
+                status = "room_cap"; err = "chat-room cap reached";
+            } else {
+                if (added) chat_subscribe_room(g_client, room.name);
+                // Re-publish the verbatim signed announce to chat:rooms so
+                // the gossip mesh + every other mini-node/player learn it.
+                nlohmann::json announce = {
+                    {"name",           room.name},
+                    {"topic",          room.topic_str},
+                    {"creator",        room.creator},
+                    {"creator_pubkey", creator_pubkey},
+                    {"created_ms",     room.created_ms},
+                    {"private",        room.is_private},
+                    {"sig",            sig},
+                };
+                rats_publish_to_topic(g_client, kChatRoomsTopic,
+                                      announce.dump().c_str());
+            }
+        }
+        nlohmann::json body{{"name", room.name}, {"error", err}};
+        r << "{\"req_id\":\"" << req_id << "\",\"status\":\"" << status
+          << "\",\"body\":" << body.dump() << "}";
+    } else if (type == "chat.send") {
+        // Player sends a signed message into a room. Verify "mccht1",
+        // reject banned senders, push to the local ring, publish to the
+        // per-room gossip topic, and push live to local watchers.
+        // Body: {room, from, from_pubkey, ts_ms, body, sig}
+        const auto& b = env.value("body", nlohmann::json::object());
+        const std::string room        = b.value("room",        std::string());
+        const std::string from        = b.value("from",        std::string());
+        const std::string from_pubkey = b.value("from_pubkey", std::string());
+        const uint64_t    ts_ms       = b.value("ts_ms",       static_cast<uint64_t>(0));
+        const std::string msg_body    = b.value("body",        std::string());
+        const std::string sig         = b.value("sig",         std::string());
+        std::string status = "ok";
+        std::string err;
+        std::vector<uint8_t> canon;
+        if (room.empty() || from.empty() || ts_ms == 0) {
+            status = "invalid"; err = "missing room/from/ts_ms";
+        } else if (msg_body.size() > kMaxChatBodyBytes) {
+            status = "too_large"; err = "body exceeds 8KB";
+        } else if (!build_chat_msg_canon(room, from, ts_ms, msg_body, canon) ||
+                   !chat_verify_canon(canon, from, from_pubkey, sig)) {
+            status = "bad_signature"; err = "mccht1 verify failed";
+        } else {
+            bool banned = false;
+            {
+                std::lock_guard<std::mutex> lk(g_chat_bans_mu);
+                auto bit = g_chat_bans.find(room);
+                if (bit != g_chat_bans.end() && bit->second.count(from) > 0)
+                    banned = true;
+            }
+            if (banned) {
+                status = "banned"; err = "sender is banned from room";
+            } else {
+                ChatMessage m;
+                m.from = from; m.from_pubkey = from_pubkey;
+                m.ts_ms = ts_ms; m.body = msg_body; m.sig = sig;
+                bool stored = true;
+                {
+                    std::lock_guard<std::mutex> lk(g_chat_msgs_mu);
+                    if (g_chat_msgs.find(room) == g_chat_msgs.end() &&
+                        g_chat_msgs.size() >= kMaxChatRooms) {
+                        stored = false;
+                    } else {
+                        auto& dq = g_chat_msgs[room];
+                        dq.push_back(m);
+                        while (dq.size() > kChatRingPerRoom) dq.pop_front();
+                    }
+                }
+                if (!stored) {
+                    status = "room_cap"; err = "chat-room cap reached";
+                } else {
+                    // Build the verbatim signed envelope (with room) and
+                    // publish it to the per-room gossip topic so the mesh +
+                    // every other player receives it.
+                    nlohmann::json msg_env = {
+                        {"room",        room},
+                        {"from",        from},
+                        {"from_pubkey", from_pubkey},
+                        {"ts_ms",       ts_ms},
+                        {"body",        msg_body},
+                        {"sig",         sig},
+                    };
+                    const std::string topic = std::string(kChatRoomPrefix) + room;
+                    rats_publish_json_to_topic(g_client, topic.c_str(),
+                                               msg_env.dump().c_str());
+                    // Push live to local watchers (the publish above reaches
+                    // remote subscribers; our own watchers need a direct push).
+                    chat_push_message_to_watchers(room, msg_env);
+                }
+            }
+        }
+        nlohmann::json body{{"room", room}, {"error", err}};
+        r << "{\"req_id\":\"" << req_id << "\",\"status\":\"" << status
+          << "\",\"body\":" << body.dump() << "}";
+    } else if (type == "chat.watch" || type == "chat.unwatch") {
+        // Player subscribes/unsubscribes to live pushes for a room. We
+        // record the peer_id -> set<room> mapping; on_chat_message and
+        // chat.send push to every watcher of the affected room.
+        const auto& b = env.value("body", nlohmann::json::object());
+        const std::string room = b.value("room", std::string());
+        std::string status = "ok";
+        std::string err;
+        if (room.empty()) {
+            status = "invalid"; err = "missing room";
+        } else {
+            std::lock_guard<std::mutex> lk(g_chat_watchers_mu);
+            if (type == "chat.watch") {
+                auto& rooms = g_chat_watchers[peer_id];
+                if (rooms.size() >= kMaxWatchedRoomsPerPlayer &&
+                    rooms.count(room) == 0) {
+                    status = "watch_cap"; err = "too many watched rooms";
+                    if (rooms.empty()) g_chat_watchers.erase(peer_id);
+                } else {
+                    rooms.insert(room);
+                }
+            } else {
+                auto it = g_chat_watchers.find(peer_id);
+                if (it != g_chat_watchers.end()) {
+                    it->second.erase(room);
+                    if (it->second.empty()) g_chat_watchers.erase(it);
+                }
+            }
+        }
+        nlohmann::json body{{"room", room}, {"error", err}};
+        r << "{\"req_id\":\"" << req_id << "\",\"status\":\"" << status
+          << "\",\"body\":" << body.dump() << "}";
+    } else if (type == "chat.moderate") {
+        // Moderation action. Verify "mccmd1", AUTHORIZE if the actor is the
+        // room's creator OR is in the cached global-moderator set. For
+        // kick_user: ban the target in the room and push "chat.kicked" to
+        // them if connected. For remove_room: erase the room + history.
+        // Re-publish the signed envelope to chat:mod (sig-dedup) so the mesh
+        // converges. Body: {action, room, target, by, by_pubkey, ts_ms, sig}
+        chat_refresh_global_mods_if_stale();
+        const auto& b = env.value("body", nlohmann::json::object());
+        const std::string action     = b.value("action", std::string());
+        const std::string room       = b.value("room",   std::string());
+        const std::string target     = b.value("target", std::string());
+        const std::string by         = b.value("by",     std::string());
+        const std::string by_pubkey  = b.value("by_pubkey", std::string());
+        const uint64_t    ts_ms      = b.value("ts_ms",  static_cast<uint64_t>(0));
+        const std::string sig        = b.value("sig",    std::string());
+        std::string status = "ok";
+        std::string err;
+        std::vector<uint8_t> canon;
+        const bool action_ok = (action == "kick_user" || action == "remove_room");
+        if (!action_ok || room.empty() || by.empty() || ts_ms == 0) {
+            status = "invalid"; err = "bad action/room/by/ts_ms";
+        } else if (!build_chat_mod_canon(action, room, target, by, ts_ms, canon) ||
+                   !chat_verify_canon(canon, by, by_pubkey, sig)) {
+            status = "bad_signature"; err = "mccmd1 verify failed";
+        } else {
+            // ---- Authorize: creator OR cached global moderator ----------
+            bool is_creator = false;
+            {
+                std::lock_guard<std::mutex> lk(g_chat_rooms_mu);
+                auto it = g_chat_rooms.find(room);
+                if (it != g_chat_rooms.end())
+                    is_creator = (chat_norm_addr(it->second.creator) ==
+                                  chat_norm_addr(by));
+            }
+            bool is_global_mod = false;
+            {
+                std::lock_guard<std::mutex> lk(g_chat_mods_mu);
+                is_global_mod = g_chat_mods.count(chat_norm_addr(by)) > 0;
+            }
+            if (!is_creator && !is_global_mod) {
+                status = "unauthorized";
+                err = "actor is neither room creator nor global moderator";
+            } else if (action == "kick_user" && target.empty()) {
+                status = "invalid"; err = "kick_user needs target";
+            } else {
+                // ---- Dedup on the signature so a re-broadcast is a no-op --
+                bool fresh = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_chat_mod_seen_mu);
+                    if (g_chat_mod_seen.find(sig) == g_chat_mod_seen.end()) {
+                        if (g_chat_mod_seen.size() < kMaxChatModSeen)
+                            g_chat_mod_seen[sig] = now_ms();
+                        fresh = true; // process even if the seen-cap is hit
+                    }
+                }
+                chat_apply_mod_action(action, room, target, by);
+                // Re-publish the signed envelope to chat:mod so other
+                // mini-nodes apply the same action (only on first sight).
+                if (fresh && g_client) {
+                    nlohmann::json mod_env = {
+                        {"action",    action},
+                        {"room",      room},
+                        {"target",    target},
+                        {"by",        by},
+                        {"by_pubkey", by_pubkey},
+                        {"ts_ms",     ts_ms},
+                        {"sig",       sig},
+                    };
+                    rats_publish_to_topic(g_client, kChatModTopic,
+                                          mod_env.dump().c_str());
+                }
+            }
+        }
+        nlohmann::json body{{"room", room}, {"action", action},
+                            {"error", err}};
+        r << "{\"req_id\":\"" << req_id << "\",\"status\":\"" << status
+          << "\",\"body\":" << body.dump() << "}";
+    } else if (type == "chat.bans") {
+        // Return the current ban list for a room. Body: {room}.
+        const auto& b = env.value("body", nlohmann::json::object());
+        const std::string room = b.value("room", std::string());
+        nlohmann::json arr = nlohmann::json::array();
+        if (!room.empty()) {
+            std::lock_guard<std::mutex> lk(g_chat_bans_mu);
+            auto it = g_chat_bans.find(room);
+            if (it != g_chat_bans.end())
+                for (const auto& a : it->second) arr.push_back(a);
+        }
+        r << "{\"req_id\":\"" << req_id << "\",\"status\":\"ok\",\"body\":{"
+          << "\"room\":" << nlohmann::json(room).dump()
+          << ",\"bans\":" << arr.dump() << "}}";
     } else if (type == "stun.observe") {
         // STUN-equivalent over our librats-on-QUIC link: the caller asks
         // "what address do you see me from?", we look it up in our local
@@ -1497,7 +2100,7 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
     } else {
         r << "{\"req_id\":\"" << req_id
           << "\",\"status\":\"unknown_type\","
-          << "\"error\":\"mini-node only serves routes.get/mininodes.list/mini.hello/status/stun.observe/relay.forward/relay.push.forward/ice.connect_request\"}";
+          << "\"error\":\"mini-node only serves routes.get/mininodes.list/mini.hello/status/stun.observe/relay.forward/relay.push.forward/ice.connect_request/chat.list_rooms/chat.history/chat.create/chat.send/chat.watch/chat.unwatch/chat.moderate/chat.bans\"}";
     }
 
     send_reply(peer_id, r.str());
@@ -1527,6 +2130,35 @@ void on_relay_reply(void* /*ud*/, const char* peer_id, const char* message_data)
         return;
     }
     const std::string req_id = env.value("req_id", std::string());
+
+    // Our own global-moderator cache refresh reply (fired by
+    // chat_refresh_global_mods_if_stale). Absorb it here — it's not a
+    // relayed player request, so it must not fall through to the
+    // pending-relay path. Body shape: {moderators:[<hex addr>...]}.
+    if (req_id.compare(0, 9, "chatmods-") == 0) {
+        try {
+            const auto& body = env.value("body", nlohmann::json::object());
+            if (body.contains("moderators") && body["moderators"].is_array()) {
+                std::unordered_set<std::string> mods;
+                for (const auto& v : body["moderators"]) {
+                    if (!v.is_string()) continue;
+                    std::string h = v.get<std::string>();
+                    // Normalize to lowercase, strip 0x, so comparisons
+                    // against canonical from-address hex are case-stable.
+                    if (h.size() >= 2 && h[0] == '0' && (h[1] == 'x' || h[1] == 'X'))
+                        h = h.substr(2);
+                    for (auto& c : h) c = static_cast<char>(std::tolower((unsigned char)c));
+                    if (h.size() == 40) mods.insert(h);
+                }
+                std::lock_guard<std::mutex> lk(g_chat_mods_mu);
+                g_chat_mods = std::move(mods);
+                g_chat_mods_fetched_ms = now_ms();
+            }
+        } catch (const nlohmann::json::exception&) { /* keep old cache */ }
+        rats_string_free(peer_id);
+        rats_string_free(message_data);
+        return;
+    }
 
     PendingRelay rec;
     bool matched = false;
@@ -1883,6 +2515,24 @@ void reaper_loop() {
                 push_event("relay-expire",
                            std::to_string(expired.size()) + " pending", "ttl");
         }
+
+        // 6: (chat) TTL-evict the moderation-action dedup set so a long-lived
+        // mini-node doesn't accumulate every sig it ever saw. Entries older
+        // than kChatModSeenTtlMs are well past any realistic re-broadcast.
+        {
+            std::lock_guard<std::mutex> lk(g_chat_mod_seen_mu);
+            for (auto it = g_chat_mod_seen.begin();
+                 it != g_chat_mod_seen.end(); ) {
+                if (it->second + kChatModSeenTtlMs < now) {
+                    it = g_chat_mod_seen.erase(it);
+                } else { ++it; }
+            }
+        }
+
+        // 7: (chat) periodically refresh the cached global-moderator set so
+        // chat.moderate can authorize global mods, not just room creators.
+        // Internally rate-limited to kChatModsTtlMs.
+        chat_refresh_global_mods_if_stale();
     }
 }
 
@@ -2096,6 +2746,13 @@ int main(int argc, char** argv) {
     rats_subscribe_to_topic(client, kChatRoomsTopic);
     rats_set_topic_message_callback(client, kChatRoomsTopic,
                                     on_chat_room_announce, nullptr);
+
+    // Chat moderation: subscribe to the global moderation topic so kick /
+    // remove_room actions published by any mini-node converge mesh-wide.
+    // on_chat_mod_message verifies + authorizes + applies each action.
+    rats_subscribe_to_topic(client, kChatModTopic);
+    rats_set_topic_message_callback(client, kChatModTopic,
+                                    on_chat_mod_message, nullptr);
 
     // Direct typed-message receiver for route broadcasts from full nodes (the
     // path the full node uses today, since gossipsub mesh form-up is too slow

@@ -17,6 +17,7 @@ import 'src/services/swarm_registry.dart';
 import 'src/services/audio_stream_proxy.dart';
 import 'src/services/library_service.dart';
 import 'src/services/library_scanner.dart';
+import 'src/services/chat_service.dart';
 import 'src/services/background_scanner.dart';
 import 'src/services/wallet_service.dart';
 import 'src/services/offline_play_log/heartbeat_capture.dart';
@@ -56,6 +57,11 @@ void main() async {
     // Hook the player-side server for incoming stream.open / library.list
     // requests from other peers.
     await PlayerServer.initialize();
+
+    // Claim RatsClient.onPush for chat so pushed chat.message / chat.kicked
+    // envelopes are captured app-wide, even before the Chat tab is first
+    // opened. ChatScreen also calls ensureWired() defensively on mount.
+    ChatService.instance.ensureWired();
 
     // Offline play-proof bundle pipeline. See
     // docs/offline_play_proof.md for the threat model + wire format.
@@ -150,6 +156,7 @@ class MusicChainApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => PlayerProvider()),
         ChangeNotifierProvider.value(value: LibraryService.instance),
         ChangeNotifierProvider.value(value: DownloadProvider.instance),
+        ChangeNotifierProvider.value(value: ChatService.instance),
         ChangeNotifierProvider(
           // Eager. Without lazy:false the provider only constructs the
           // LibratsDiscovery the first time some widget watches it. The
