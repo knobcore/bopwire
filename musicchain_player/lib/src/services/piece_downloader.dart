@@ -384,6 +384,12 @@ class PieceDownloader {
         continue;
       }
 
+      // One ~4 Mbit/s flow per seeder: mark this source busy for the fetch so
+      // _nextSource routes the next range to a DIFFERENT seeder; released when
+      // the range settles (success or error).
+      final sk = _keyFor(source);
+      _acquireSource(sk);
+
       try {
         // Race the range fetch against the terminal-error signal so a stalled
         // seeder doesn't pin this worker for the full timeout after another
@@ -420,6 +426,8 @@ class PieceDownloader {
         _releaseRange(range);
         _failTerminal(e);
         return;
+      } finally {
+        _releaseSource(sk);
       }
     }
   }
@@ -487,6 +495,9 @@ class PieceDownloader {
         if (now.isBefore(cd)) continue;
         _cooldownUntil.remove(k);   // cooldown elapsed — usable again
       }
+      // Swarm Transfer v2: skip a seeder already serving its max in-flight
+      // ranges (one ~4 Mbit/s flow each) so ranges fan across DISTINCT seeders.
+      if (!_sourceHasWindow(k)) continue;
       _rrCursor = (i + 1) % _sources.length;
       return s;
     }
@@ -551,48 +562,30 @@ class PieceDownloader {
 
   // ---- Per-piece RPC --------------------------------------------------
 
-  // ---- Adaptive relay congestion window (audit #1 + #4) --------------------
-  // This is NOT a throughput limit. Throughput is set by the relay link's rate,
-  // not by how many audio.piece_get are outstanding — extra in-flight requests
-  // don't transfer faster, they just pile into the relay's FIFO and overrun it,
-  // timing out the tail AND every control RPC stuck behind it (the congestion
-  // collapse behind "download messes up the connection" / bidirectional
-  // timeouts). So we run a TCP-style congestion window over in-flight pieces
-  // (shared across ALL downloads): GROW it to keep the relay pipe saturated for
-  // MAX throughput, and only back off when the relay actually signals congestion
-  // (a timeout). A 100 MB transfer then rides the link at full speed and never
-  // collapses, because it stops just short of overrunning. The window's ceiling
-  // scales with mini-node count, so adding mini-nodes raises aggregate
-  // throughput rather than just deepening one queue.
-  static double _cwnd = 12.0;            // congestion window (pieces in flight)
-  // Floor of 1 (was 4): on a constrained uplink a floor of 4 (=1 MB in flight)
-  // keeps the link perpetually saturated, so piece replies never arrive within
-  // the timeout and get re-requested while still in flight — a double-serve loop
-  // that becomes ~95x over-fetch (344 MB to move a 3.5 MB mp3). Allowing the
-  // window to settle to a single in-flight piece lets the link actually drain so
-  // replies arrive and the loop converges; it grows straight back on a fast link.
-  static const double _cwndMin = 1.0;
-  static int _relayInFlight = 0;
-  static final List<Completer<void>> _relayWaiters = <Completer<void>>[];
-  static double _cwndMax() =>
-      (RatsClient.instance.knownMiniNodes.length.clamp(1, 16) * 24).toDouble();
-  static void _cwndOnSuccess() {  // additive increase (~+1 per window of acks)
-    _cwnd = (_cwnd + 1.0 / _cwnd).clamp(_cwndMin, _cwndMax());
-  }
-  static void _cwndOnCongestion() {  // multiplicative decrease
-    _cwnd = (_cwnd / 2).clamp(_cwndMin, _cwndMax());
-  }
-  static Future<void> _acquireRelaySlot() async {
-    while (_relayInFlight >= _cwnd.floor()) {
-      final c = Completer<void>();
-      _relayWaiters.add(c);
-      await c.future;
+  // ---- Per-seeder concurrency window (Swarm Transfer v2) -------------------
+  // The old GLOBAL congestion window (cwnd capped at mininode_count*24 pieces
+  // shared across ALL downloads) is gone: each seeder now self-paces its push to
+  // 4 Mbit/s, so backpressure lives at the seeder, not a shared client cap, and
+  // a download is free to "monopolize" the relay (no global/destination limit —
+  // owner's call). The ONE limit kept: at most _kPerSeederWindow swarm.fetch
+  // ranges in flight to any single seeder, so a download opens exactly one
+  // ~4 Mbit/s flow per seeder and AGGREGATES across them (N seeders → N×4 Mbit/s).
+  // _nextSource skips a seeder at its window; the worker acquires on dispatch and
+  // releases when the range settles.
+  static const int _kPerSeederWindow = 1;
+  final Map<String, int> _inFlightPerSource = {};
+
+  bool _sourceHasWindow(String key) =>
+      (_inFlightPerSource[key] ?? 0) < _kPerSeederWindow;
+  void _acquireSource(String key) =>
+      _inFlightPerSource[key] = (_inFlightPerSource[key] ?? 0) + 1;
+  void _releaseSource(String key) {
+    final v = (_inFlightPerSource[key] ?? 1) - 1;
+    if (v <= 0) {
+      _inFlightPerSource.remove(key);
+    } else {
+      _inFlightPerSource[key] = v;
     }
-    _relayInFlight++;
-  }
-  static void _releaseRelaySlot() {
-    if (_relayInFlight > 0) _relayInFlight--;
-    if (_relayWaiters.isNotEmpty) _relayWaiters.removeAt(0).complete();
   }
 
   /// Resolve a routable librats peer_id for [source]. Full-node-swarm sources
@@ -625,7 +618,6 @@ class PieceDownloader {
   Future<_PieceReply> _fetchPiece(
       PeerSource source, int offset, int length) async {
     final target = await _resolveTarget(source);
-    await _acquireRelaySlot();
     RangeFetch result;
     try {
       // Swarm Transfer v2: fetch this piece as a BINARY range (count=1) over
@@ -638,10 +630,8 @@ class PieceDownloader {
         totalTimeout: config.pieceTimeout,
         chunkStall:   config.pieceTimeout,
       );
-      _cwndOnSuccess();        // additive increase — the pipe had room, grow it
     } on RatsRpcException catch (e) {
       if (e.status == 'timeout' || e.status == 'not_matched') {
-        _cwndOnCongestion();   // relay congested (or peer slow) — back the window off
         throw _PeerStallException();
       }
       if (e.status == 'not_held' || e.status == 'unknown_type' ||
@@ -649,8 +639,6 @@ class PieceDownloader {
         throw _PeerProtocolException('swarm.fetch ${e.status}');
       }
       rethrow;
-    } finally {
-      _releaseRelaySlot();
     }
     final bytes = result.bytes is Uint8List
         ? result.bytes as Uint8List
@@ -691,7 +679,6 @@ class PieceDownloader {
       PeerSource source, _PieceRange range) async {
     final target = await _resolveTarget(source);
     final offset = range.start * config.pieceSize;
-    await _acquireRelaySlot();
     RangeFetch result;
     try {
       result = await RatsClient.instance.fetchRange(
@@ -699,10 +686,8 @@ class PieceDownloader {
         totalTimeout: config.pieceTimeout,
         chunkStall:   config.pieceTimeout,
       );
-      _cwndOnSuccess();
     } on RatsRpcException catch (e) {
       if (e.status == 'timeout' || e.status == 'not_matched') {
-        _cwndOnCongestion();
         throw _PeerStallException();
       }
       if (e.status == 'not_held' || e.status == 'unknown_type' ||
@@ -710,8 +695,6 @@ class PieceDownloader {
         throw _PeerProtocolException('swarm.fetch ${e.status}');
       }
       rethrow;
-    } finally {
-      _releaseRelaySlot();
     }
     final total = result.totalSize > 0 ? result.totalSize : _totalSize;
     final bytes = result.bytes is Uint8List

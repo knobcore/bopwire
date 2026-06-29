@@ -192,7 +192,7 @@ class RatsClient {
   // _isBulkRequest also peeks the wrapped inner verb. Small control RPCs stay
   // retried for lossy-link resilience.
   static const Set<String> _kBulkTypes = {
-    'audio.piece_get',
+    'swarm.fetch',
     'stream.open',
   };
 
