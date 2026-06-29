@@ -102,11 +102,18 @@ class PlayerServer {
   /// the on-wire size is ~33% larger than the byte length.
   static const int kMaxPieceBytes = 512 * 1024;
 
+  /// swarm.fetch (Swarm Transfer v2): max pieces a single ranged binary fetch
+  /// may request, so a malicious caller can't make us stream the whole file in
+  /// one call. 16 * 256 KB = 4 MB per fetch — enough to amortize the request RTT
+  /// across many binary chunks while bounding per-request work.
+  static const int kMaxSwarmFetchPieces = 16;
+
   Future<Map<String, dynamic>?> _dispatch(
       String peerId, String type, Map<String, dynamic> body,
       {String originator = ''}) async {
     switch (type) {
       case 'audio.piece_get': return _handlePieceGet(body);
+      case 'swarm.fetch':     return _handleSwarmFetch(peerId, body, originator);
       case 'stream.open':     return _handleStreamOpen(peerId, body, originator);
       case 'stream.cancel':   return _handleStreamCancel(body);
       case 'library.list':    return _handleLibraryList();
@@ -183,6 +190,90 @@ class PlayerServer {
       'length':       slice.length,
       'total_size':   totalSize,
       'data_b64':     base64Encode(slice),
+    };
+  }
+
+  /// swarm.fetch — Swarm Transfer v2 ranged BINARY push. The requester asks for
+  /// `count` pieces starting at `piece_start`; we push that byte range as binary
+  /// F-frames over the SAME relay transport stream.open uses (so it still
+  /// traverses the mini-node and earns the relay reward) instead of a base64
+  /// JSON blob. The reply carries the stream_id + exact range so the receiver
+  /// can size its buffer and map bytes back to pieces. No base64 (−33%), one
+  /// request RTT amortized over the whole range. Requesters fall back to
+  /// audio.piece_get for seeders that don't answer this verb.
+  Future<Map<String, dynamic>?> _handleSwarmFetch(
+      String peerId, Map<String, dynamic> body, String originator) async {
+    final v = body['v'];
+    if (v != null && v != 1) return {'v': 1, 'status': 'bad_version'};
+    // Same relay-prefix constraint as stream.open: a non-empty originator must
+    // be exactly the 40-hex peer id we stamp into the F-frame, or the chunk loop
+    // would RangeError mid-stream.
+    if (originator.isNotEmpty && originator.length != 40) {
+      return {'v': 1, 'status': 'bad_originator'};
+    }
+    final hash = body['content_hash'] as String? ?? '';
+    if (hash.length != 64) return {'v': 1, 'status': 'bad_hash'};
+    final pieceSize  = (body['piece_size']  as num?)?.toInt() ?? 0;
+    final pieceStart = (body['piece_start'] as num?)?.toInt() ?? -1;
+    final count      = (body['count']       as num?)?.toInt() ?? 0;
+    if (pieceSize <= 0 || pieceSize > kMaxPieceBytes ||
+        pieceStart < 0 || count <= 0 || count > kMaxSwarmFetchPieces) {
+      return {'v': 1, 'status': 'bad_range'};
+    }
+    final deliveryId = body['delivery_id'] as String? ?? '';
+    final entry = _lib.entryByHash(hash);
+    if (entry == null || !entry.isLocal) {
+      return {'v': 1, 'status': 'not_held', 'content_hash': hash};
+    }
+    final file = File(entry.filePath);
+    final int totalSize;
+    try {
+      totalSize = await file.length();
+    } on FileSystemException catch (e) {
+      return {'v': 1, 'status': 'io_error', 'error': e.message};
+    }
+    final rangeOffset = pieceStart * pieceSize;
+    if (rangeOffset >= totalSize) {
+      return {'v': 1, 'status': 'bad_range', 'error': 'piece_start past EOF'};
+    }
+    final wantLen  = count * pieceSize;
+    final rangeLen = (rangeOffset + wantLen > totalSize)
+        ? totalSize - rangeOffset
+        : wantLen;
+
+    // Honor the requester's proposed stream id (unique among its own fetches),
+    // masked to the 32 bits the chunk header carries; reallocate only on a local
+    // collision with another stream we're serving. Mirrors stream.open.
+    int sid = (body['client_stream_id'] as num?)?.toInt()
+        ?? _rng.nextInt(0xFFFFFFFF);
+    sid &= 0xFFFFFFFF;
+    while (_streams.containsKey(sid)) {
+      sid = _rng.nextInt(0xFFFFFFFF);
+    }
+
+    unawaited(_streamChunks(
+      sendTo:      peerId,
+      relayTo:     originator,
+      streamId:    sid,
+      file:        file,
+      totalBytes:  totalSize,
+      deliveryId:  deliveryId,
+      startOffset: rangeOffset,
+      rangeBytes:  rangeLen,
+    ));
+
+    return {
+      'v':            1,
+      'status':       'ok',
+      'matched':      true,
+      'stream_id':    sid,
+      'content_hash': hash,
+      'piece_start':  pieceStart,
+      'piece_size':   pieceSize,
+      'range_offset': rangeOffset,
+      'range_length': rangeLen,
+      'total_size':   totalSize,
+      'source':       originator.isEmpty ? 'peer' : 'peer-relay',
     };
   }
 
@@ -290,7 +381,14 @@ class PlayerServer {
     required File   file,
     required int    totalBytes,
     String          deliveryId = '',
+    int             startOffset = 0,
+    int?            rangeBytes,
   }) async {
+    // Swarm Transfer v2: when rangeBytes is given, stream the byte RANGE
+    // [startOffset, startOffset+streamLen) instead of the whole file. Legacy
+    // stream.open passes neither, so streamLen == totalBytes and startOffset == 0
+    // — identical to before. The receiver assembles exactly `streamLen` bytes.
+    final streamLen  = rangeBytes ?? totalBytes;
     final relay      = relayTo.isNotEmpty;
     const kTagF      = 0x46; // 'F'
     // #10: on the relay path the F-frame prefix is ALWAYS 'F'(1) +
@@ -316,6 +414,7 @@ class PlayerServer {
     _streams[streamId] = active;
     try {
       raf = await file.open();
+      if (startOffset > 0) await raf.setPosition(startOffset);
       if (relay) {
         native[0] = kTagF;
         // 40 hex characters of the originator's peer id, ASCII-encoded.
@@ -334,18 +433,18 @@ class PlayerServer {
           native[1 + 40 + i] = v;
         }
       }
-      var offset = 0;
+      var offset = 0;   // bytes streamed within this range, NOT the file offset
       var seq    = 0;
-      while (offset < totalBytes) {
+      while (offset < streamLen) {
         // Cancellation gate. We check at the top of the loop so a
         // disconnect that races with the very first chunk still wins;
         // any chunk we've already framed is at most one extra send.
         if (active.cancelled || _streams[streamId] != active) break;
 
-        final n = (offset + chunkPayload > totalBytes)
-            ? totalBytes - offset
+        final n = (offset + chunkPayload > streamLen)
+            ? streamLen - offset
             : chunkPayload;
-        final eof = (offset + n) >= totalBytes;
+        final eof = (offset + n) >= streamLen;
 
         // Pull n bytes off disk. read() advances the file position, so
         // we never need to call setPosition() in the loop — sequential

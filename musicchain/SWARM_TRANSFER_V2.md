@@ -85,5 +85,7 @@ relay**, so the `RelayRewardTx`-per-byte economics stay intact.
 - Full node: `src/api/rats_api.cpp` (`stream.open` reply, manifest store/serve),
   `src/store/swarm.*`, `src/store/library_store.*`, ingestion (manifest gen+sign).
 - Mini-node: `tools/mini_node.cpp` (binary session forwarding, loosen token bucket).
-- Compatibility: capability flag in `stream.open`; `audio.piece_get` retained for
-  mixed-version swarms.
+- Compatibility: NONE required (owner decision) — `swarm.fetch` fully replaces
+  `audio.piece_get`; the network cuts over together like the DHT network-tag
+  change. The base64 `audio.piece_get` path is removed once the downloader is
+  switched.
