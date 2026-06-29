@@ -587,57 +587,45 @@ class PieceDownloader {
       }
     }
     await _acquireRelaySlot();
-    Object? reply;
+    RangeFetch result;
     try {
-      reply = await RatsClient.instance.request(
-        target,
-        'audio.piece_get',
-        {
-          'v':            1,
-          'content_hash': contentHash,
-          'offset':       offset,
-          'length':       length,
-        },
-        timeout: config.pieceTimeout,
+      // Swarm Transfer v2: fetch this piece as a BINARY range (count=1) over
+      // swarm.fetch instead of a base64 audio.piece_get JSON reply (−33% wire).
+      // Phase 3 will widen count to amortize the request RTT across a range and
+      // fan ranges across multiple seeders.
+      final pieceIndex = offset ~/ config.pieceSize;
+      result = await RatsClient.instance.fetchRange(
+        target, contentHash, pieceIndex, 1, config.pieceSize,
+        totalTimeout: config.pieceTimeout,
+        chunkStall:   config.pieceTimeout,
       );
       _cwndOnSuccess();        // additive increase — the pipe had room, grow it
     } on RatsRpcException catch (e) {
-      if (e.status == 'timeout') {
+      if (e.status == 'timeout' || e.status == 'not_matched') {
         _cwndOnCongestion();   // relay congested (or peer slow) — back the window off
         throw _PeerStallException();
+      }
+      if (e.status == 'not_held' || e.status == 'unknown_type' ||
+          e.status == 'bad_range' || e.status == 'bad_hash') {
+        throw _PeerProtocolException('swarm.fetch ${e.status}');
       }
       rethrow;
     } finally {
       _releaseRelaySlot();
     }
-    if (reply is! Map) {
-      throw _PeerProtocolException('non-map reply');
-    }
-    final m = reply.cast<String, dynamic>();
-    final status = m['status'] as String? ?? '';
-    if (status != 'ok') {
-      throw _PeerProtocolException('status=$status');
-    }
-    final replyOffset = (m['offset'] as num?)?.toInt() ?? -1;
-    if (replyOffset != offset) {
+    final bytes = result.bytes is Uint8List
+        ? result.bytes as Uint8List
+        : Uint8List.fromList(result.bytes);
+    final total = result.totalSize;
+    // Reject a piece whose length doesn't match what we asked for (full piece,
+    // or the short final piece). Uses total_size from this reply so the first-
+    // piece probe (before _totalSize is known) validates correctly too. Without
+    // it a too-long payload could scribble over adjacent good pieces.
+    final expectedLen =
+        (total > 0) ? math.min(length, total - offset) : bytes.length;
+    if (bytes.length != expectedLen) {
       throw _PeerProtocolException(
-          'offset mismatch: asked $offset got $replyOffset');
-    }
-    final dataB64 = m['data_b64'] as String? ?? '';
-    if (dataB64.isEmpty) {
-      throw _PeerProtocolException('empty data_b64');
-    }
-    final bytes = base64Decode(dataB64);
-    // Reject any peer whose payload length doesn't match what we asked
-    // for. Without this check, a too-long reply would scribble over
-    // adjacent pieces already fetched correctly from other peers — the
-    // whole-file SHA-256 at the end would catch it, but only after the
-    // download is "complete" and after good bytes have been clobbered.
-    // Treat it as a protocol violation so the peer is banned and the
-    // piece is released for retry against a different source.
-    if (bytes.length != length) {
-      throw _PeerProtocolException(
-          'length mismatch: asked $length got ${bytes.length}');
+          'length mismatch: asked $expectedLen got ${bytes.length}');
     }
     // Swarm Transfer v2: per-piece integrity. When a well-formed manifest covers
     // this download, reject any piece whose bytes don't match the manifest hash
@@ -649,7 +637,6 @@ class PieceDownloader {
         throw _PeerProtocolException('piece $idx failed manifest hash');
       }
     }
-    final total = (m['total_size'] as num?)?.toInt() ?? 0;
     return _PieceReply(
         offset:    offset,
         bytes:     bytes,

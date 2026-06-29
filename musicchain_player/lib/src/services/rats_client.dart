@@ -2356,6 +2356,64 @@ class RatsClient {
     }
   }
 
+  /// Swarm Transfer v2: fetch a contiguous PIECE RANGE as a BINARY push. Sends
+  /// swarm.fetch{piece_start,count,piece_size} to [peerId] (relayed like any RPC,
+  /// so the bytes still traverse the mini-node and earn the relay reward) and
+  /// reassembles the range off the binary channel via the same _streams +
+  /// _AudioReceiver machinery as stream.open. Returns the raw range bytes plus
+  /// the file's total size (so the first fetch doubles as the size probe). No
+  /// base64 — bytes arrive as binary F-frames. Throws RatsRpcException on
+  /// not_held / bad_range / timeout so the caller can switch source.
+  Future<RangeFetch> fetchRange(
+      String peerId, String contentHash,
+      int pieceStart, int count, int pieceSize,
+      {Duration openTimeout  = const Duration(seconds: 8),
+       Duration totalTimeout = const Duration(minutes: 5),
+       Duration chunkStall   = const Duration(seconds: 30),
+       String? deliveryId,
+       void Function(int received, int total)? onProgress}) async {
+    final reply = await request(peerId, 'swarm.fetch',
+        {'v':                1,
+         'content_hash':     contentHash,
+         'piece_size':       pieceSize,
+         'piece_start':      pieceStart,
+         'count':            count,
+         'client_stream_id': _allocClientStreamId(),
+         if (deliveryId != null) 'delivery_id': deliveryId},
+        timeout: openTimeout);
+    if (reply is! Map) {
+      throw RatsRpcException('not_matched',
+          'peer $peerId sent a non-map swarm.fetch reply');
+    }
+    final meta   = reply.cast<String, dynamic>();
+    final status = meta['status'] as String? ?? '';
+    if (status != 'ok' || meta['matched'] == false) {
+      throw RatsRpcException(status.isEmpty ? 'not_matched' : status,
+          'peer $peerId swarm.fetch $pieceStart+$count: $status');
+    }
+    final streamId    = (meta['stream_id']    as num?)?.toInt();
+    final rangeLength = (meta['range_length'] as num?)?.toInt();
+    final totalSize   = (meta['total_size']   as num?)?.toInt() ?? 0;
+    if (streamId == null || rangeLength == null) {
+      throw RatsRpcException('not_matched',
+          'peer $peerId sent malformed swarm.fetch reply');
+    }
+    final receiver = _AudioReceiver(rangeLength);
+    receiver.servingPeerId = peerId;
+    receiver.relayPeerId   = _relayVia[peerId] ?? bestMiniNodePeerId ?? '';
+    _streams[streamId] = receiver;
+    if (onProgress != null) receiver.onProgress(onProgress);
+    // Pick up chunks that raced in before this registration landed.
+    _drainEarlyChunks(streamId, receiver);
+    try {
+      final bytes =
+          await _awaitWithStallGuard(receiver, totalTimeout, chunkStall);
+      return RangeFetch(bytes, totalSize);
+    } finally {
+      _streams.remove(streamId);
+    }
+  }
+
   /// #10: send a signed relay.receipt to the broker full node. Preimage:
   /// "relay.receipt" || delivery_id(16) || content_hash(32) || bytes(u64 LE).
   /// wallet.sign hashes internally (sha256), so we pass the raw bytes; the
@@ -2672,6 +2730,15 @@ class AudioStream {
     // guard fires. Identity-check before removing.
     if (identical(_owner[_streamId], _receiver)) _owner.remove(_streamId);
   }
+}
+
+/// Result of [RatsClient.fetchRange] (Swarm Transfer v2): the raw bytes of the
+/// requested piece range, plus the serving file's total size (learned from the
+/// swarm.fetch reply so the first fetch doubles as the size probe).
+class RangeFetch {
+  RangeFetch(this.bytes, this.totalSize);
+  final List<int> bytes;
+  final int       totalSize;
 }
 
 /// A single swarm member's encoding of a song. Two players that uploaded
