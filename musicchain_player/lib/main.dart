@@ -133,14 +133,30 @@ void main() async {
     // until something re-triggered reAnnounce. The heartbeat rebinds within one
     // ~25 s tick regardless. Cheap (~150 B) and a no-op until a wallet loads.
     PresencePublisher.startHeartbeat();
+
+    // Periodic library re-scan in the MAIN isolate, using the single live
+    // client (MusicChainService keeps the process + client alive in the
+    // background). This REPLACES the old workmanager background scan, which ran
+    // in a SEPARATE isolate and brought up a SECOND librats client; on that
+    // isolate's teardown a native librats thread fired an FFI callback into the
+    // freed trampoline, aborting the WHOLE process ("Callback invoked after it
+    // has been deleted") and dropping the network connection — the SIGABRT
+    // crash and the "network flapping". One client per process, no teardown
+    // race. scanOnce() is a no-op when nothing changed, so the 30-min tick is
+    // cheap.
+    unawaited(LibraryScanner.instance.scanOnce());
+    Timer.periodic(const Duration(minutes: 30), (_) {
+      unawaited(LibraryScanner.instance.scanOnce());
+    });
   } catch (e) {
     // ignore: avoid_print
     print('[rats] init failed: $e');
   }
 
-  // Background scanning currently only has an Android workmanager backend.
-  // On other platforms the package throws UnimplementedError; we'd just
-  // crash startup if we let that propagate.
+  // BackgroundScanner now only CANCELS the legacy workmanager periodic task
+  // that older builds registered (it crashed the process on teardown — see the
+  // main-isolate scan above). The scan itself runs in the main isolate now.
+  // Android-only (workmanager throws UnimplementedError elsewhere).
   if (Platform.isAndroid) {
     try {
       await BackgroundScanner.initialize();

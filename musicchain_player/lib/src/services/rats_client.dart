@@ -176,6 +176,12 @@ class RatsClient {
   // corpse; discovery filters them out of the route list and selection/stream
   // skips them, and they are re-learned automatically once they come back.
   static const Duration _deadPeerTtl = Duration(seconds: 45);
+
+  // transient-loss retry: re-fire a relayed/direct RPC this many extra times on
+  // a TIMEOUT (lossy wifi / 4G stalls the request or its reply past the
+  // deadline even though TCP will eventually deliver) before failing, so a
+  // momentary stall becomes a slight delay rather than a hard failure.
+  static const int _kSendRetries = 2;
   final Map<String, DateTime> _deadPeers = {};
 
   /// True while [peerId] is known-dead (within the TTL). Expired entries clear
@@ -1252,41 +1258,73 @@ class RatsClient {
         'no validated relay peer for $peerId');
     }
 
-    final reqId = _newRequestId();
-    final envelope = {
-      'req_id': reqId,
-      'type':   type,
-      'body':   body,
-    };
-
-    final completer = Completer<Object?>();
-    final t = Timer(timeout, () {
-      final p = _pending.remove(reqId);
-      if (p != null && !p.completer.isCompleted) {
-        p.completer.completeError(
-            RatsRpcException('timeout', 'no reply within ${timeout.inMilliseconds}ms'));
+    // transient-loss retry loop: on a TIMEOUT, re-fire with a fresh req_id and
+    // a short backoff up to _kSendRetries times. A real reply (success or a
+    // protocol error like not_matched/rejected/402) returns/throws immediately,
+    // and an instant send_failed (peer not connected) surfaces at once so the
+    // relay-failover / rediscover path runs. Only a stalled-then-timed-out RPC
+    // is re-fired — which is exactly the lossy-link case.
+    RatsRpcException? lastTimeoutErr;
+    for (int sendAttempt = 0; sendAttempt <= _kSendRetries; sendAttempt++) {
+      if (sendAttempt > 0) {
+        await Future.delayed(Duration(milliseconds: 250 * sendAttempt)); // 250, 500
       }
-    });
-    _pending[reqId] = _PendingRequest(completer, t, peerId);
 
-    // The librats wire-level message type is always "musicchain.request" —
-    // the verb name lives inside the JSON envelope. The full node listens for
-    // exactly that type and demuxes on `type` once it parses the body.
-    final peerPtr = peerId.toNativeUtf8();
-    final typePtr = 'musicchain.request'.toNativeUtf8();
-    final bodyPtr = jsonEncode(envelope).toNativeUtf8();
-    try {
-      final rc = _b.sendMessage(_handle, peerPtr, typePtr, bodyPtr);
-      if (rc != 0) {
-        _pending.remove(reqId)?.timeout.cancel();
-        return Future.error(RatsRpcException('send_failed', 'rats_send_message rc=$rc'));
+      final reqId = _newRequestId();
+      final envelope = {
+        'req_id': reqId,
+        'type':   type,
+        'body':   body,
+      };
+
+      final completer = Completer<Object?>();
+      final t = Timer(timeout, () {
+        final p = _pending.remove(reqId);
+        if (p != null && !p.completer.isCompleted) {
+          p.completer.completeError(
+              RatsRpcException('timeout', 'no reply within ${timeout.inMilliseconds}ms'));
+        }
+      });
+      _pending[reqId] = _PendingRequest(completer, t, peerId);
+
+      // The librats wire-level message type is always "musicchain.request" —
+      // the verb name lives inside the JSON envelope. The full node listens for
+      // exactly that type and demuxes on `type` once it parses the body.
+      final peerPtr = peerId.toNativeUtf8();
+      final typePtr = 'musicchain.request'.toNativeUtf8();
+      final bodyPtr = jsonEncode(envelope).toNativeUtf8();
+      bool sendFailed = false;
+      try {
+        final rc = _b.sendMessage(_handle, peerPtr, typePtr, bodyPtr);
+        if (rc != 0) {
+          _pending.remove(reqId)?.timeout.cancel();
+          sendFailed = true;
+        }
+      } finally {
+        malloc.free(peerPtr);
+        malloc.free(typePtr);
+        malloc.free(bodyPtr);
       }
-    } finally {
-      malloc.free(peerPtr);
-      malloc.free(typePtr);
-      malloc.free(bodyPtr);
+      if (sendFailed) {
+        // Immediate librats failure (peer not connected / not handshaked) — not
+        // a transient stall; surface now so the relay/rediscover path runs.
+        throw RatsRpcException('send_failed', 'rats_send_message failed');
+      }
+
+      try {
+        return await completer.future;
+      } on RatsRpcException catch (e) {
+        if (e.status == 'timeout' && sendAttempt < _kSendRetries) {
+          lastTimeoutErr = e;
+          continue; // re-fire after backoff
+        }
+        rethrow; // protocol reply, or retries exhausted — surface it
+      }
     }
-    return completer.future;
+    // Unreachable (the last iteration returns or rethrows), but satisfies the
+    // analyzer's definite-return check.
+    throw lastTimeoutErr ??
+        RatsRpcException('timeout', 'no reply after ${_kSendRetries + 1} attempts');
   }
 
   // -- Reply demux -------------------------------------------------------
