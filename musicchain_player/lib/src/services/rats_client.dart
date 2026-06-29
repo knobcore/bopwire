@@ -24,6 +24,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../ffi/rats_bindings.dart';
 import 'player_server.dart';
+import 'seeder_flows.dart';     // #3: per-seeder flow window (streaming priority)
 import 'wallet_service.dart';   // #10: sign relay.receipt with the wallet key
 
 /// Bootstrap mini-node used as the initial peer. The mesh-discovery layer
@@ -2693,6 +2694,15 @@ class AudioStream {
     });
     // Also stop the watchdog the moment the stream finishes normally/errors.
     _receiver.future.whenComplete(_stopWatch).catchError((_) {});
+    // Swarm Transfer v2 (#3): register this streaming flow against its serving
+    // seeder so a concurrent background download yields that seeder (streaming
+    // priority). Acquired unconditionally (streaming never waits); released
+    // exactly once when the stream finishes/errors or is cancelled.
+    _flowPeer = _receiver.servingPeerId;
+    if (_flowPeer.isNotEmpty) {
+      SeederFlows.instance.acquire(_flowPeer);
+      _receiver.future.whenComplete(_releaseFlow).ignore();
+    }
   }
 
   final int                          _streamId;
@@ -2700,6 +2710,14 @@ class AudioStream {
   final _AudioReceiver               _receiver;
   final Map<int, _AudioReceiver>     _owner;
   Timer?                             _stallTimer;
+  String                             _flowPeer = '';
+  bool                               _flowReleased = false;
+
+  void _releaseFlow() {
+    if (_flowReleased) return;
+    _flowReleased = true;
+    SeederFlows.instance.release(_flowPeer);
+  }
 
   Stream<Uint8List> get bytes => _receiver.stream;
   Future<void>      get done  => _receiver.future.then((_) => null);
@@ -2723,6 +2741,7 @@ class AudioStream {
           .catchError((Object _) => null);
     }
     _receiver.cancel();
+    _releaseFlow();   // #3: hand this seeder's flow back to the download path
     // Only evict the map entry if it's still OURS. Concurrent stream.open
     // attempts (streamFromSwarm now races members) can collide on a stream_id;
     // a losing attempt cancelling must not remove the WINNER's live receiver

@@ -40,6 +40,7 @@ import 'package:crypto/crypto.dart' as crypto;
 
 import 'piece_manifest.dart';
 import 'rats_client.dart';
+import 'seeder_flows.dart';
 import 'swarm_registry.dart';
 
 /// Knobs intentionally exposed so tools/tests can override them without
@@ -384,11 +385,11 @@ class PieceDownloader {
         continue;
       }
 
-      // One ~4 Mbit/s flow per seeder: mark this source busy for the fetch so
-      // _nextSource routes the next range to a DIFFERENT seeder; released when
-      // the range settles (success or error).
+      // One ~4 Mbit/s flow per seeder: mark this source busy (process-globally,
+      // shared with streaming) so _nextSource routes the next range to a DIFFERENT
+      // seeder; released when the range settles (success or error).
       final sk = _keyFor(source);
-      _acquireSource(sk);
+      SeederFlows.instance.acquire(sk);
 
       try {
         // Race the range fetch against the terminal-error signal so a stalled
@@ -427,7 +428,7 @@ class PieceDownloader {
         _failTerminal(e);
         return;
       } finally {
-        _releaseSource(sk);
+        SeederFlows.instance.release(sk);
       }
     }
   }
@@ -495,9 +496,10 @@ class PieceDownloader {
         if (now.isBefore(cd)) continue;
         _cooldownUntil.remove(k);   // cooldown elapsed — usable again
       }
-      // Swarm Transfer v2: skip a seeder already serving its max in-flight
-      // ranges (one ~4 Mbit/s flow each) so ranges fan across DISTINCT seeders.
-      if (!_sourceHasWindow(k)) continue;
+      // Swarm Transfer v2: skip a seeder already at its flow window — including
+      // one an active STREAM is using (streaming priority) — so ranges fan across
+      // DISTINCT, free seeders.
+      if (!SeederFlows.instance.downloadHasWindow(k)) continue;
       _rrCursor = (i + 1) % _sources.length;
       return s;
     }
@@ -562,31 +564,17 @@ class PieceDownloader {
 
   // ---- Per-piece RPC --------------------------------------------------
 
-  // ---- Per-seeder concurrency window (Swarm Transfer v2) -------------------
+  // ---- Per-seeder concurrency window → SeederFlows (Swarm Transfer v2 #3) ----
   // The old GLOBAL congestion window (cwnd capped at mininode_count*24 pieces
   // shared across ALL downloads) is gone: each seeder now self-paces its push to
-  // 4 Mbit/s, so backpressure lives at the seeder, not a shared client cap, and
-  // a download is free to "monopolize" the relay (no global/destination limit —
-  // owner's call). The ONE limit kept: at most _kPerSeederWindow swarm.fetch
-  // ranges in flight to any single seeder, so a download opens exactly one
-  // ~4 Mbit/s flow per seeder and AGGREGATES across them (N seeders → N×4 Mbit/s).
-  // _nextSource skips a seeder at its window; the worker acquires on dispatch and
-  // releases when the range settles.
-  static const int _kPerSeederWindow = 1;
-  final Map<String, int> _inFlightPerSource = {};
-
-  bool _sourceHasWindow(String key) =>
-      (_inFlightPerSource[key] ?? 0) < _kPerSeederWindow;
-  void _acquireSource(String key) =>
-      _inFlightPerSource[key] = (_inFlightPerSource[key] ?? 0) + 1;
-  void _releaseSource(String key) {
-    final v = (_inFlightPerSource[key] ?? 1) - 1;
-    if (v <= 0) {
-      _inFlightPerSource.remove(key);
-    } else {
-      _inFlightPerSource[key] = v;
-    }
-  }
+  // 4 Mbit/s, so backpressure lives at the seeder, not a shared client cap, and a
+  // download is free to "monopolize" the relay (no global/destination limit —
+  // owner's call). The ONE limit kept — at most one swarm.fetch flow per seeder,
+  // so a download opens one ~4 Mbit/s flow per seeder and AGGREGATES across them
+  // (N seeders → N×4 Mbit/s) — now lives in the PROCESS-GLOBAL SeederFlows, shared
+  // with the STREAMING path (which has priority): a download skips a seeder an
+  // active stream is using. _nextSource consults SeederFlows.downloadHasWindow;
+  // the worker acquire/releases around the fetch.
 
   /// Resolve a routable librats peer_id for [source]. Full-node-swarm sources
   /// already carry a peer_id; DHT sources carry only host:port and must be

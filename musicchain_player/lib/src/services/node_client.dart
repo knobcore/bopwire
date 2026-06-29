@@ -578,6 +578,11 @@ class NodeClient {
         extraSources:   seeded,
         manifest:       manifest,
         onProgress:     onProgress,
+        // Swarm Transfer v2: downloads are latency-insensitive, so fetch the
+        // widest range (16 pieces = 4 MB) per swarm.fetch to amortize the
+        // request RTT. With the per-seeder window=1, workers beyond the swarm
+        // size idle, so 8 is plenty.
+        config: const PieceDownloaderConfig(maxWorkers: 8, fetchPieces: 16),
       );
       return await downloader.run();
     } on NoPeerAvailableException {
