@@ -293,6 +293,15 @@ private:
     /// (apply_delta) over a gossip layer that lands in a follow-up.
     store::LibraryStore library_;
 
+    /// Swarm Transfer v2: per-song piece-manifest cache (content_hash hex →
+    /// manifest JSON string), populated from fingerprint.submit and served in
+    /// stream.open so downloaders can verify each chunk on arrival. In-memory and
+    /// self-healing — players re-submit on every full (re)scan, so a node restart
+    /// just repopulates. NOT consensus state. manifest_mu_ is a LEAF lock: held
+    /// only around the map op, never across a send or nested under another lock.
+    std::mutex                                   manifest_mu_;
+    std::unordered_map<std::string, std::string> manifest_by_hash_;
+
     /// Periodically prunes ghost peers from [swarm_]. Started in
     /// [start], stopped in [stop].
     std::thread        prune_thread_;
