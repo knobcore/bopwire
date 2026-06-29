@@ -501,6 +501,26 @@ void LibraryStore::store_playlist_payload(const Address& w,
     p_->db->put(key, v);
 }
 
+void LibraryStore::put_manifest(const Hash256& ch,
+                                const std::string& manifest_json) {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    if (!p_->db) return;
+    std::string key = "Lm";
+    key.append(reinterpret_cast<const char*>(ch.data()), ch.size());
+    std::vector<uint8_t> v(manifest_json.begin(), manifest_json.end());
+    p_->db->put(key, v);
+}
+
+std::optional<std::string> LibraryStore::get_manifest(const Hash256& ch) const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    if (!p_->db) return std::nullopt;
+    std::string key = "Lm";
+    key.append(reinterpret_cast<const char*>(ch.data()), ch.size());
+    auto v = p_->db->get(key);
+    if (!v) return std::nullopt;
+    return std::string(v->begin(), v->end());
+}
+
 void LibraryStore::for_each_library_payload(
         const std::function<void(const Address&, uint64_t,
                                  const std::string&)>& cb) const {

@@ -1250,18 +1250,14 @@ void RatsApi::handle_request(const std::string& peer_id,
                         });
                     }
                     // Swarm Transfer v2: hand the downloader the per-piece
-                    // manifest (if we have one for this content_hash) so it can
-                    // verify each chunk on arrival. null when unknown → the
+                    // manifest from DB2 (if we have one for this content_hash) so
+                    // it can verify each chunk on arrival. null when unknown → the
                     // player falls back to whole-file verification.
                     nlohmann::json manifest_j = nullptr;
-                    {
-                        std::lock_guard<std::mutex> lk(manifest_mu_);
-                        auto mit = manifest_by_hash_.find(hash);
-                        if (mit != manifest_by_hash_.end()) {
-                            try {
-                                manifest_j = nlohmann::json::parse(mit->second);
-                            } catch (...) { manifest_j = nullptr; }
-                        }
+                    if (auto mf = library_.get_manifest(ch)) {
+                        try {
+                            manifest_j = nlohmann::json::parse(*mf);
+                        } catch (...) { manifest_j = nullptr; }
                     }
                     reply = {{"req_id", req_id},
                              {"status", "ok"},
@@ -1311,16 +1307,14 @@ void RatsApi::handle_request(const std::string& peer_id,
                 : !origin.empty() ? origin
                 : peer_id;
 
-            // Swarm Transfer v2: cache the per-piece manifest the player
-            // submitted (keyed by the file's content_hash) so stream.open can
-            // hand it to downloaders for per-chunk verification. Stored
-            // regardless of fingerprint match — it describes the bytes, not the
-            // chain song. In-memory + self-healing (re-sent on every full scan).
+            // Swarm Transfer v2: persist the per-piece manifest the player
+            // submitted (DB2, keyed by content_hash) so stream.open can hand it
+            // to downloaders for per-chunk verification. Stored regardless of
+            // fingerprint match — it describes the bytes, not the chain song.
             if (in.contains("manifest") && in["manifest"].is_object()) {
-                const std::string mf_ch = in.value("content_hash", "");
-                if (mf_ch.size() == 64) {
-                    std::lock_guard<std::mutex> lk(manifest_mu_);
-                    manifest_by_hash_[mf_ch] = in["manifest"].dump();
+                Hash256 mf_ch{};
+                if (crypto::parse_hash256(in.value("content_hash", ""), mf_ch)) {
+                    library_.put_manifest(mf_ch, in["manifest"].dump());
                 }
             }
 

@@ -86,6 +86,17 @@ public:
     std::vector<Address> holders(const Hash256& ch) const;
     size_t               holder_count(const Hash256& ch) const;
 
+    // ---- piece manifests (Swarm Transfer v2) ------------------------------
+    //
+    // Per-song piece-hash manifest (JSON: the SHA-256 of each 256 KB piece),
+    // keyed by content_hash under the "Lm" prefix. Stored on fingerprint.submit
+    // and served by stream.open so a downloader can verify each chunk on arrival
+    // (safe multi-source). Off-chain, not consensus; last-writer-wins is fine —
+    // the bytes are deterministic, so honest submitters produce identical
+    // manifests. Returns nullopt when no manifest is stored for `ch`.
+    void put_manifest(const Hash256& ch, const std::string& manifest_json);
+    std::optional<std::string> get_manifest(const Hash256& ch) const;
+
     /// Discovery snapshot for songs.list. Given the set of currently-LIVE
     /// wallets (presence-bound + within TTL, resolved by the caller under its
     /// own presence lock), do ONE walk under this store's lock that builds
