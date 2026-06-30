@@ -181,7 +181,9 @@ int main() {
         res.set_header("Access-Control-Allow-Origin", allow);
         res.set_header("Vary", "Origin");
         res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Range");
+        // let the WASM player read the stream size (for the seek bar) cross-origin
+        res.set_header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
     };
     svr.set_post_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
         cors(req, res);

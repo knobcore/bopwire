@@ -264,7 +264,22 @@
   }
 
   // ───────────────────────── Playback ──────────────────────
+  // Two engines: the WASM decoder (low click-to-play latency, mp3/flac/ogg) and
+  // the native <audio> element as a fallback for anything WASM can't decode.
   const audio = $('audio');
+  const wasm  = window.WasmPlayer ? new window.WasmPlayer() : null;
+  let engine  = 'audio';            // which engine is currently driving playback
+
+  const engPaused = () => (engine === 'wasm' && wasm ? wasm.paused : audio.paused);
+  const engCurSec = () => ((engine === 'wasm' && wasm ? wasm.currentTime : audio.currentTime) || 0);
+  const engDurSec = () => (engine === 'wasm' && wasm ? wasm.duration : (audio.duration || 0));
+
+  function npToggleIcon() { $('np-toggle').textContent = engPaused() ? '▶' : '⏸'; }
+  function npProgress() {
+    const cur = engCurSec(), dur = engDurSec();
+    $('np-cur').textContent = fmtDur(cur * 1000);
+    if (dur) { $('np-dur').textContent = fmtDur(dur * 1000); $('np-bar').value = Math.round((cur / dur) * 1000); }
+  }
 
   function playFromQueue(i) {
     state.qIndex = i;
@@ -273,18 +288,53 @@
 
   function play(song) {
     if (!song) return;
+    if (wasm) wasm.unlock();        // resume AudioContext inside this click gesture
     completePlay();                 // finalize the previous song's reward session
     state.playing = song.contentHash;
     $('nowplaying').hidden = false;
     $('np-title').textContent  = song.title || '(untitled)';
     $('np-artist').textContent = song.artist || '';
+    $('np-cur').textContent = '0:00'; $('np-bar').value = 0;
+    $('np-dur').textContent = fmtDur(song.durationMs || 0);
     $('np-spin').hidden = false;
     $('np-toggle').textContent = '⏸';
-    audio.src = streamUrl(song.contentHash);
-    audio.play().catch(() => {/* autoplay policy: user can hit play */});
+    startEngine(song);
     startPlay(song);                // open reward session (artist/seeder/mini mint)
-    // reflect "playing" highlight in the visible list
     if (!state.query) renderTrackPane(); else renderSearch();
+  }
+
+  // Try the WASM decoder first; fall back to <audio> on unsupported codec / error.
+  async function startEngine(song) {
+    const url = streamUrl(song.contentHash);
+    const durSec = (song.durationMs || 0) / 1000;
+    audio.pause();
+    try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
+    if (wasm) {
+      wasm.onplaying    = () => { if (state.playing === song.contentHash) { $('np-spin').hidden = true; npToggleIcon(); } };
+      wasm.ontimeupdate = () => { if (state.playing === song.contentHash) npProgress(); };
+      wasm.onended      = () => onTrackEnded();
+      try {
+        await wasm.load(url, durSec);
+        if (state.playing === song.contentHash) engine = 'wasm';
+        return;
+      } catch (_) {                 // unsupported codec or decode error
+        try { await wasm.stop(); } catch (_) {}
+      }
+    }
+    if (state.playing === song.contentHash) {
+      engine = 'audio';
+      audio.src = url;
+      audio.play().catch(() => {/* autoplay policy: user can hit play */});
+    }
+  }
+
+  function onTrackEnded() {
+    if (state.qIndex >= 0 && state.qIndex + 1 < state.queue.length) {
+      playFromQueue(state.qIndex + 1);   // play() finalizes the finished session
+    } else {
+      completePlay();
+      state.playing = null; $('np-toggle').textContent = '▶'; render();
+    }
   }
 
   // ── Reward session: the play earns for the artist/seeder/mini, never the
@@ -296,13 +346,12 @@
     stopHeartbeat(); state.playId = null;
     try {
       const r = await apiPost('/api/play/start', { contentHash: song.contentHash });
-      // ignore if the user already moved on to another track
       if (state.playing === song.contentHash) {
         state.playId = r.playId;
         hbTimer = setInterval(() => {
-          if (state.playId && !audio.paused)
+          if (state.playId && !engPaused())
             apiPost('/api/play/heartbeat',
-              { playId: state.playId, positionMs: Math.floor(audio.currentTime * 1000) })
+              { playId: state.playId, positionMs: Math.floor(engCurSec() * 1000) })
               .catch(() => {});
         }, 5000);
       }
@@ -314,37 +363,35 @@
     if (id) apiPost('/api/play/complete', { playId: id }).catch(() => {});
   }
 
-  audio.addEventListener('playing',      () => { $('np-spin').hidden = true; $('np-toggle').textContent = '⏸'; });
-  audio.addEventListener('waiting',      () => { $('np-spin').hidden = false; });
-  audio.addEventListener('pause',        () => { $('np-toggle').textContent = '▶'; });
-  audio.addEventListener('play',         () => { $('np-toggle').textContent = '⏸'; });
-  audio.addEventListener('loadedmetadata', () => { $('np-dur').textContent = fmtDur(audio.duration * 1000); });
-  audio.addEventListener('timeupdate', () => {
-    $('np-cur').textContent = fmtDur(audio.currentTime * 1000);
-    if (audio.duration) $('np-bar').value = Math.round((audio.currentTime / audio.duration) * 1000);
+  // <audio> events only drive the UI when it's the active engine.
+  audio.addEventListener('playing',        () => { if (engine === 'audio') { $('np-spin').hidden = true; npToggleIcon(); } });
+  audio.addEventListener('waiting',        () => { if (engine === 'audio') $('np-spin').hidden = false; });
+  audio.addEventListener('pause',          () => { if (engine === 'audio') npToggleIcon(); });
+  audio.addEventListener('play',           () => { if (engine === 'audio') npToggleIcon(); });
+  audio.addEventListener('loadedmetadata', () => { if (engine === 'audio') $('np-dur').textContent = fmtDur(audio.duration * 1000); });
+  audio.addEventListener('timeupdate',     () => { if (engine === 'audio') npProgress(); });
+  audio.addEventListener('ended',          () => { if (engine === 'audio') onTrackEnded(); });
+  audio.addEventListener('error',          () => {
+    if (engine !== 'audio') return;
+    $('np-spin').hidden = true;
+    if (state.playing) toast('Could not stream this track — no seeders online right now.');
   });
-  audio.addEventListener('ended', () => {
-    if (state.qIndex >= 0 && state.qIndex + 1 < state.queue.length) {
-      playFromQueue(state.qIndex + 1);   // play() completes the finished session
-    } else {
-      completePlay();
-      state.playing = null; $('np-toggle').textContent = '▶'; render();
-    }
-  });
+
   // Finalize the reward session if the tab is closed mid-play.
   window.addEventListener('pagehide', () => {
     if (state.playId && navigator.sendBeacon)
       navigator.sendBeacon(CFG.gateway + '/api/play/complete',
                            JSON.stringify({ playId: state.playId }));
   });
-  audio.addEventListener('error', () => {
-    $('np-spin').hidden = true;
-    if (state.playing) toast('Could not stream this track — no seeders online right now.');
-  });
 
-  $('np-toggle').onclick = () => { audio.paused ? audio.play() : audio.pause(); };
+  $('np-toggle').onclick = () => {
+    if (engine === 'wasm' && wasm) { wasm.paused ? wasm.resume() : wasm.pause(); setTimeout(npToggleIcon, 0); }
+    else { audio.paused ? audio.play() : audio.pause(); }
+  };
   $('np-bar').oninput = () => {
-    if (audio.duration) audio.currentTime = (+$('np-bar').value / 1000) * audio.duration;
+    const frac = +$('np-bar').value / 1000;
+    if (engine === 'wasm' && wasm) { if (wasm.duration) wasm.seek(frac * wasm.duration); }
+    else if (audio.duration) audio.currentTime = frac * audio.duration;
   };
 
   // ───────────────────── Data + status ─────────────────────
