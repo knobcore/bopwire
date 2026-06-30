@@ -147,3 +147,8 @@ bopwire/scripts/deploy-vps.sh
 /dht_routing_*.json
 /peers.rats
 /peers_ever.rats
+
+# librats runtime state (untracked junk)
+bopwire/deps/librats/src/config.json
+bopwire/deps/librats/src/dht_routing_*.json
+bopwire/deps/librats/src/peers*.rats
