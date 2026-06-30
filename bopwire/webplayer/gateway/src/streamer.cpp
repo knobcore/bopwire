@@ -8,8 +8,12 @@ namespace bopwire::gw {
 
 namespace {
 constexpr int kPieceSize     = 256 * 1024;
-constexpr int kInitialPieces = 2;    // small first fetch => fast click-to-play
-constexpr int kBatchPieces   = 16;   // == kMaxSwarmFetchPieces; prefetch ahead
+constexpr int kInitialPieces = 1;    // 256 KB first fetch => fastest click-to-play
+// Keep on-demand fetches SMALL: the HTTP layer pulls continuously (the browser
+// buffers ahead), so small 1 MB fetches let the gateway stream just ahead of
+// playback instead of blocking ~8 s on a big 4 MB batch each time playback
+// crosses into un-fetched bytes (that was the click-to-play / mid-stream stall).
+constexpr int kBatchPieces   = 4;    // 1 MB per on-demand fetch
 
 // Per-range wait: a single seeder flow is capped ~500 KB/s; size off 200 KB/s.
 int wait_ms_for(int64_t range_len) { return static_cast<int>(range_len / 200 + 8000); }

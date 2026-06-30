@@ -240,7 +240,9 @@ void RatsLink::refresh_routes() {
     std::vector<FullNode> out;
     try {
         json r = rpc_mini("routes.get", json::object(), 8000);
-        for (const auto& m : r["body"].value("peers", json::array())) {
+        const json body = (r.is_object() && r.contains("body") && r["body"].is_object())
+                          ? r["body"] : json::object();   // mini may reply null body
+        for (const auto& m : body.value("peers", json::array())) {
             const std::string pid = m.value("rats_peer_id", "");
             if (pid.empty()) continue;
             out.push_back(FullNode{pid, m.value("public_address", ""),
