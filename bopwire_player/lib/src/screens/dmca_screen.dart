@@ -22,7 +22,7 @@ class DmcaScreen extends StatelessWidget {
   const DmcaScreen({super.key});
 
   static const _body = '''
-Yes, we understand that sharing copyrighted music is illegal, and we are able to definitively hide your music from the network. Since we don't store any copyrighted material (that is handled by the users), safe harbor applies to this application.
+Yes, we understand that sharing copyrighted music is illegal, and we can remove your music from discovery on the network — it stops being listed or served through our index. Since we don't store any copyrighted material (that is handled by the users), safe harbor applies to this application.
 
 We are also able to bring it back at any time should you reconsider being an asshole and choose to claim your escrowed tokens instead and join the revolution.
 
@@ -194,7 +194,7 @@ class _ContactCardState extends State<_ContactCard> {
               "statements. Upload it here; it lands in the full node's "
               "DMCA inbox and the moderator reviews it on the node's "
               "console — when honored, the matched fingerprints are "
-              "hidden from every connected player.",
+              "delisted from discovery so players stop surfacing them.",
               style: theme.textTheme.bodyMedium,
             ),
             const SizedBox(height: 12),
