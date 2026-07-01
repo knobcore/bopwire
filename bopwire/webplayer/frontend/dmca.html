@@ -77,7 +77,8 @@
       <p class="dmca-sub">
         Use this form to report content on the Bopwire network that infringes a copyright
         you own or represent. Submissions go to the node moderators' inbox for review. A hidden
-        track is delisted from Discover; approved requests take effect once a moderator confirms them.
+        track is delisted from Discover; once a moderator approves your request, the takedown
+        usually takes <strong>5–10 minutes</strong> to take effect across the network.
         Filing knowingly false claims may carry legal liability.
       </p>
 
@@ -132,7 +133,14 @@
   <script src="config.js"></script>
   <script>
   (function () {
-    const GW = (window.BOPWIRE && window.BOPWIRE.gateway) || 'https://api.bopwire.com';
+    // Security: this form carries PII (name, phone, email). Pin the submit
+    // endpoint to the trusted gateway over HTTPS and do NOT honor a ?gateway=
+    // override the way the player does — otherwise a crafted link such as
+    // dmca.html?gateway=https://attacker.example could exfiltrate the form.
+    // Only a loopback gateway is accepted, for local development.
+    const TRUSTED_GW = 'https://api.bopwire.com';
+    const rawGw = (window.BOPWIRE && window.BOPWIRE.gateway) || TRUSTED_GW;
+    const GW = /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(rawGw) ? rawGw : TRUSTED_GW;
     const $ = (id) => document.getElementById(id);
     const norm = (s) => (s || '').toLowerCase().normalize('NFKD').replace(/[^\w\s]/g, '').trim();
 
@@ -251,7 +259,7 @@
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-        setMsg('Request submitted' + (j.reportId ? ` (ref ${j.reportId})` : '') + '. Moderators will review it.', true);
+        setMsg('Request submitted' + (j.reportId ? ` (ref ${j.reportId})` : '') + '. Moderators will review it — once approved, the takedown usually takes 5–10 minutes to take effect.', true);
         $('dmca-form').reset(); selected.clear(); renderChips();
       } catch (err) {
         setMsg('Could not submit: ' + err.message, false);

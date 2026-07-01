@@ -16,6 +16,7 @@
 #include "../src/util/traffic.h"
 
 #include <leveldb/write_batch.h>
+#include <nlohmann/json.hpp>   // parse structured DMCA takedown submissions
 
 #include <algorithm>
 #include <chrono>
@@ -280,7 +281,9 @@ std::vector<std::string> scan_inbox(const std::string& data_dir,
 }
 
 inline std::vector<std::string> scan_dmca_inbox(const std::string& data_dir) {
-    return scan_inbox(data_dir, "dmca", {".pdf"});
+    // .pdf = lawyer takedown, .json = structured form, .enc = either, encrypted
+    // to the moderators (the encrypted variants were previously uncounted).
+    return scan_inbox(data_dir, "dmca", {".pdf", ".json", ".enc"});
 }
 
 inline std::vector<std::string> scan_kyc_inbox(const std::string& data_dir) {
@@ -1454,6 +1457,257 @@ void action_review_kyc(mc::Database& db, const ModeratorState& mod,
     }
 }
 
+// ---- DMCA takedown review (structured JSON forms) -------------------
+//
+// Structured takedown forms submitted via the web (gateway -> dmca.submit)
+// or the player land in <data_dir>/dmca/ as *takedown.json[.enc]. Unlike
+// the lawyer PDFs (opened in an external viewer), these are shown INLINE:
+// who is representing, contact info, and the target artists + content
+// hashes. Approving hides every listed hash via the same hide_hash mod
+// action the library browser uses.
+struct DmcaRow {
+    std::string filename;
+    fs::path    path;
+    bool        readable = false;             // decrypt + parse succeeded
+    std::string representing, email, phone, source;
+    std::vector<std::pair<std::string, std::vector<std::string>>> targets; // artist -> hashes
+    std::vector<std::string> all_hashes;
+};
+
+std::vector<DmcaRow> load_dmca_rows(const std::string& data_dir,
+                                    const ModeratorState& mod) {
+    std::vector<DmcaRow> out;
+    const fs::path inbox = fs::path(data_dir) / "dmca";
+    std::error_code ec;
+    if (!fs::exists(inbox, ec)) return out;
+    for (auto& e : fs::directory_iterator(inbox, ec)) {
+        if (!e.is_regular_file()) continue;
+        const std::string name = e.path().filename().string();
+        if (name.find("takedown.json") == std::string::npos) continue;   // skip PDFs
+        DmcaRow r; r.filename = name; r.path = e.path();
+
+        std::ifstream f(r.path, std::ios::binary);
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                                    std::istreambuf_iterator<char>());
+        f.close();
+        std::string txt;
+        if (mc::crypto::ecies_looks_encrypted(bytes.data(), bytes.size())) {
+            if (mod.logged_in) {
+                auto pt = mc::crypto::ecies_decrypt(bytes, mod.kp.address,
+                                                    mod.kp.private_key);
+                if (pt) txt.assign(pt->begin(), pt->end());
+            }
+        } else {
+            txt.assign(bytes.begin(), bytes.end());
+        }
+        if (!txt.empty()) {
+            try {
+                auto j = nlohmann::json::parse(txt);
+                r.readable     = true;
+                r.representing = j.value("representing", std::string());
+                r.email        = j.value("email",        std::string());
+                r.phone        = j.value("phone",        std::string());
+                r.source       = j.value("source",       std::string());
+                for (const auto& t : j.value("targets", nlohmann::json::array())) {
+                    std::string artist = t.value("artist", std::string());
+                    std::vector<std::string> hashes;
+                    for (const auto& hh : t.value("contentHashes",
+                                                  nlohmann::json::array())) {
+                        if (!hh.is_string()) continue;
+                        const std::string hs = hh.get<std::string>();
+                        hashes.push_back(hs);
+                        r.all_hashes.push_back(hs);
+                    }
+                    r.targets.emplace_back(std::move(artist), std::move(hashes));
+                }
+            } catch (...) { r.readable = false; }
+        }
+        out.push_back(std::move(r));
+    }
+    std::sort(out.begin(), out.end(),
+              [](const DmcaRow& a, const DmcaRow& b){ return a.filename < b.filename; });
+    return out;
+}
+
+void action_review_dmca(mc::api::RatsApi& api, const ModeratorState& mod,
+                        ModView& mv, const std::string& data_dir) {
+    auto rows = load_dmca_rows(data_dir, mod);
+    int sel = 0, scroll = 0;
+    std::string note; int note_color = CP_OK;
+
+    while (true) {
+        int max_y = getmaxy(stdscr);
+        int max_x = getmaxx(stdscr);
+        if (sel >= (int)rows.size()) sel = std::max(0, (int)rows.size() - 1);
+        if (sel < 0) sel = 0;
+
+        erase();
+        attron(COLOR_PAIR(CP_PANEL_HDR) | A_BOLD);
+        mvhline(0, 0, ' ', max_x);
+        mvprintw(0, 2, " DMCA takedown review · %zu pending ", rows.size());
+        attroff(COLOR_PAIR(CP_PANEL_HDR) | A_BOLD);
+
+        const int left_w  = std::min(max_x / 2, 52);
+        const int right_x = left_w;
+        const int right_w = max_x - right_x;
+        const int top     = 2;
+        const int h       = max_y - top - 1;
+
+        attron(COLOR_PAIR(CP_LABEL) | A_BOLD);
+        mvprintw(top - 1, 2, "Requests");
+        attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
+
+        const int list_h = h;
+        if (sel < scroll) scroll = sel;
+        if (sel >= scroll + list_h) scroll = sel - list_h + 1;
+        if (scroll < 0) scroll = 0;
+
+        if (rows.empty()) {
+            attron(A_DIM); mvprintw(top + 1, 4, "(no pending takedown forms)"); attroff(A_DIM);
+        }
+        for (int i = 0; i < list_h && scroll + i < (int)rows.size(); ++i) {
+            const DmcaRow& r = rows[scroll + i];
+            int y = top + i;
+            bool activ = (scroll + i == sel);
+            if (activ) { attron(COLOR_PAIR(CP_TAB_ON) | A_BOLD); mvhline(y, 1, ' ', left_w - 2); }
+            std::string disp = r.filename;
+            int avail = left_w - 4;
+            if ((int)disp.size() > avail) disp = disp.substr(0, avail - 1) + "…";
+            mvprintw(y, 2, " %s", disp.c_str());
+            if (activ) attroff(COLOR_PAIR(CP_TAB_ON) | A_BOLD);
+        }
+
+        attron(COLOR_PAIR(CP_BORDER));
+        mvvline(top, right_x - 1, ACS_VLINE, h);
+        attroff(COLOR_PAIR(CP_BORDER));
+
+        if (!rows.empty()) {
+            const DmcaRow& r = rows[sel];
+            int rr = top;
+            attron(COLOR_PAIR(CP_LABEL) | A_BOLD);
+            mvprintw(rr++, right_x + 1, "Request detail");
+            attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
+            ++rr;
+
+            if (!r.readable) {
+                attron(COLOR_PAIR(CP_WARN));
+                mvprintw(rr++, right_x + 1,
+                         mod.logged_in ? "encrypted to other moderators (or parse failed)"
+                                       : "log in as a moderator to decrypt");
+                attroff(COLOR_PAIR(CP_WARN));
+            } else {
+                auto kv = [&](const char* k, const std::string& v){
+                    attron(COLOR_PAIR(CP_LABEL));
+                    mvprintw(rr, right_x + 1, "%-13s", k);
+                    attroff(COLOR_PAIR(CP_LABEL));
+                    std::string val = v; int avail = right_w - 16;
+                    if ((int)val.size() > avail) val = val.substr(0, avail - 1) + "…";
+                    attron(COLOR_PAIR(CP_VALUE));
+                    mvprintw(rr, right_x + 15, "%s", val.c_str());
+                    attroff(COLOR_PAIR(CP_VALUE));
+                    ++rr;
+                };
+                kv("Representing", r.representing);
+                kv("Email",        r.email);
+                kv("Phone",        r.phone);
+                kv("Source",       r.source);
+                ++rr;
+                attron(COLOR_PAIR(CP_LABEL) | A_BOLD);
+                mvprintw(rr++, right_x + 1, "Targets (%zu hash%s)",
+                         r.all_hashes.size(), r.all_hashes.size() == 1 ? "" : "es");
+                attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
+                for (const auto& t : r.targets) {
+                    if (rr >= top + h - 6) break;
+                    std::string line = "• " + t.first + "  (" +
+                        std::to_string(t.second.size()) + " track" +
+                        (t.second.size() == 1 ? "" : "s") + ")";
+                    int avail = right_w - 3;
+                    if ((int)line.size() > avail) line = line.substr(0, avail - 1) + "…";
+                    attron(COLOR_PAIR(CP_VALUE));
+                    mvprintw(rr++, right_x + 2, "%s", line.c_str());
+                    attroff(COLOR_PAIR(CP_VALUE));
+                }
+            }
+
+            ++rr;
+            attron(COLOR_PAIR(CP_LABEL) | A_BOLD);
+            mvprintw(rr++, right_x + 1, "Actions");
+            attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
+            auto act_line = [&](char k, const char* d){
+                attron(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+                mvprintw(rr, right_x + 1, " %c ", k);
+                attroff(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+                attron(COLOR_PAIR(CP_VALUE));
+                mvprintw(rr, right_x + 5, "%s", d);
+                attroff(COLOR_PAIR(CP_VALUE));
+                ++rr;
+            };
+            act_line('A', "Approve -> hide all listed tracks");
+            act_line('D', "Reject (archive, no hide)");
+
+            if (!note.empty()) {
+                ++rr;
+                attron(COLOR_PAIR(note_color) | A_BOLD);
+                mvprintw(rr++, right_x + 1, "%s", note.c_str());
+                attroff(COLOR_PAIR(note_color) | A_BOLD);
+            }
+        }
+
+        draw_footer_bar({
+            {"↑↓",  "Move"},
+            {"A",   "Approve+Hide"},
+            {"D",   "Reject"},
+            {"ESC", "Back"},
+        });
+        refresh();
+
+        nodelay(stdscr, FALSE);
+        int key = getch();
+        nodelay(stdscr, TRUE);
+
+        if (key == 27) break;
+        if (key == KEY_UP)    { if (sel > 0) --sel; continue; }
+        if (key == KEY_DOWN)  { if (sel + 1 < (int)rows.size()) ++sel; continue; }
+        if (key == KEY_PPAGE) { sel = std::max(0, sel - list_h); continue; }
+        if (key == KEY_NPAGE) { sel = std::min((int)rows.size() - 1, sel + list_h); continue; }
+        if (rows.empty()) continue;
+        const DmcaRow& r = rows[sel];
+
+        if (key == 'A' || key == 'a') {
+            if (!mod.logged_in) { note = "no moderator key — approve aborted"; note_color = CP_WARN; continue; }
+            if (!r.readable)    { note = "cannot read request (not encrypted to you)"; note_color = CP_WARN; continue; }
+            if (r.all_hashes.empty()) { note = "no content hashes in this request"; note_color = CP_WARN; continue; }
+            int ok = 0, fail = 0;
+            for (const auto& hsh : r.all_hashes) {
+                if (hsh.size() != 64) { ++fail; continue; }
+                if (api.publish_mod_action("hide_hash", hsh, mod.kp)) ++ok; else ++fail;
+            }
+            const fs::path approved = r.path.parent_path() / "approved";
+            std::error_code ec2; fs::create_directories(approved, ec2);
+            fs::rename(r.path, approved / r.path.filename(), ec2);
+            note = "approved: hid " + std::to_string(ok) + " track(s)" +
+                   (fail ? (", " + std::to_string(fail) + " failed") : "");
+            note_color = fail ? CP_WARN : CP_OK;
+            mv.last_action = "dmca approve: hid " + std::to_string(ok) + " hash(es)";
+            mv.last_action_color = CP_OK;
+            mv.dmca_files = scan_dmca_inbox(data_dir);
+            rows = load_dmca_rows(data_dir, mod);
+            continue;
+        }
+        if (key == 'D' || key == 'd') {
+            const fs::path rejected = r.path.parent_path() / "rejected";
+            std::error_code ec2; fs::create_directories(rejected, ec2);
+            fs::rename(r.path, rejected / r.path.filename(), ec2);
+            note = "rejected " + r.filename; note_color = CP_WARN;
+            mv.last_action = "dmca reject: " + r.filename;
+            mv.last_action_color = CP_WARN;
+            mv.dmca_files = scan_dmca_inbox(data_dir);
+            rows = load_dmca_rows(data_dir, mod);
+            continue;
+        }
+    }
+}
+
 // Helper shared by the proposal-building actions: sign + enqueue. Sets
 // `mv.last_action` and returns true on success.
 bool submit_proposal_tx(mc::Database& db, const ModeratorState& mod,
@@ -2424,6 +2678,9 @@ void run_tui(mc::api::HttpServer& /*http*/,
                     candidates.wake();
                 } else if (key == 'm' || key == 'M') {
                     action_manage_labels(db, mod, mv);
+                    candidates.wake();
+                } else if (key == 'd' || key == 'D') {
+                    action_review_dmca(api, mod, mv, data_dir);
                     candidates.wake();
                 } else if (key == 'r' || key == 'R') {
                     mv.dmca_files = scan_dmca_inbox(data_dir);
