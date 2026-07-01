@@ -157,6 +157,9 @@ body {
 }
 .cta-opt { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px; color: var(--text); text-decoration: none; }
 .cta-opt:hover { background: var(--bg-elev); }
+.cta-dropdown { min-width: 210px; }
+.cta-logo { display: block; width: 72px; height: 72px; margin: 8px auto 2px; border-radius: 14px; }
+.cta-dd-title { text-align: center; font-weight: 700; font-size: 12.5px; color: var(--text); opacity: .85; padding: 2px 6px 8px; }
 
 /* ───────── Toast ───────── */
 .toast {
