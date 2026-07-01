@@ -63,11 +63,13 @@ Built with the Flutter **Linux** SDK + GTK3. On Windows this runs under **WSL**
 full node uses:
 
 ```
-sudo apt-get install -y ninja-build libgtk-3-dev clang cmake pkg-config \
+sudo apt-get install -y ninja-build libgtk-3-dev clang cmake pkg-config libmpv-dev \
   libssl-dev libchromaprint-dev libavcodec-dev libavformat-dev libavutil-dev \
   libswresample-dev libogg-dev libvorbis-dev libopus-dev libopusfile-dev \
   libleveldb-dev libminiupnpc-dev nlohmann-json3-dev libncurses-dev
 ```
+
+`libmpv-dev` matters: on Linux `media_kit_libs_linux` is only a plugin stub — it does **not** ship libmpv (unlike Windows/Android), so the desktop player needs `libmpv` present. The AppImage packager bundles it (+ its codec deps) so the shipped AppImage is self-contained.
 
 The player `dlopen`s the native core at runtime, so build it first, then package:
 
