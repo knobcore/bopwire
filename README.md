@@ -6,15 +6,15 @@ A peer-to-peer music blockchain with a content-addressed audio swarm.
 
 | Tree | Description |
 | --- | --- |
-| `bopwire/` | C++ home + mini-node, leveldb-backed chain, swarm registry, fingerprint matching (chromaprint), librats peer transport. Vendored librats sits under `bopwire/deps/librats/`. |
+| `bopwire/` | C++ full + mini-node, leveldb-backed chain, swarm registry, fingerprint matching (chromaprint), librats peer transport. Vendored librats sits under `bopwire/deps/librats/`. |
 | `bopwire_player/` | Cross-platform Flutter player. Android, Windows, Linux desktop. Streams audio from the swarm via a loopback HTTP proxy + media_kit. Foreground-service-pinned on Android so the librats client survives screen-off. |
 | `scripts/` | One build script per shipping target — see below. |
 
 ## How the pieces fit
 
-1. **Home node** (`bopwire/tools/node_main.cpp`) holds the chain in leveldb, mints blocks via a 5-min heartbeat producer, exposes RPC over librats (`bopwire.request` topic). Persists swarm membership so a restart doesn't wipe it.
+1. **Full node** (`bopwire/tools/node_main.cpp`) holds the chain in leveldb, mints blocks, exposes RPC over librats (`bopwire.request` topic). 
 2. **Mini node** (`bopwire/tools/mini_node.cpp`) — a tiny rendezvous on the VPS that relays peer addresses, forwards RPC + binary streams for peers behind symmetric NATs, and tracks player/full-node liveness.
-3. **Player** scans local folders, fingerprints with chromaprint, submits fingerprint + content hash + ID3 tags to the home node. The home node runs an exact + fuzzy match (bucket-indexed chromaprint similarity) so the same song uploaded twice at different bitrates collapses to one chain entry with two SwarmMember variants. The download dialog presents one row per quality (rounded kbps + container) and picks the rip with the most peers within each quality.
+3. **Player** scans local folders, fingerprints with chromaprint, submits fingerprint + content hash + ID3 tags to the full node. The full node runs an exact + fuzzy match (bucket-indexed chromaprint similarity) so the same song uploaded twice at different bitrates collapses to one chain entry with two SwarmMember variants. The download dialog presents one row per quality (rounded kbps + container) and picks the rip with the most peers within each quality.
 4. **Swarm** is a leveldb-persisted map `canonical_content_hash → [SwarmMember{peer_id, local_content_hash, bitrate, audio_format}, …]`. `stream.open` returns the variant list; the streaming path picks lowest bitrate; the download path either takes user's pick or falls back to highest-peer-count.
 
 ## Build scripts
@@ -58,8 +58,8 @@ The shell scripts run `apt-get install` for everything they need, so you just ne
 
 Pre-built binaries live on the GitHub Releases page:
 
-- **Windows home node** — `bopwire-node.exe` + DLLs.
-- **Linux home node** — `bopwire-node` (Ubuntu 22.04 toolchain).
+- **Windows full node** — `bopwire-node.exe` + DLLs.
+- **Linux full node** — `bopwire-node` (Ubuntu 22.04 toolchain).
 - **Linux mini node** — `bopwire-mini-node` (statically linked where possible).
 - **Windows player** — `bopwire_player.exe` + DLLs.
 - **Android player** — `app-release.apk`.
