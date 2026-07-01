@@ -234,6 +234,40 @@ std::unordered_map<std::string, std::string>  g_mininode_addr;
 // matches how routes treat the same field.
 std::unordered_map<std::string, float>        g_mininode_load;
 
+// ---- Sparse-mesh scaling knobs --------------------------------------
+//
+// The default mini-node topology is a FULL MESH: every mini heartbeats
+// every other mini, replicates every route to all of them, and returns
+// the entire peer set in mininodes.list. That's O(N^2) control-plane
+// traffic and is fine at today's handful of VPSes but does not survive
+// into the thousands of minis.
+//
+// When `g_sparse_mesh` is enabled the mesh becomes a bounded-degree
+// epidemic gossip overlay instead:
+//   * route replication + the mini.hello heartbeat fan out to at most
+//     `g_mesh_fanout` randomly-sampled peers per round (not all of them);
+//   * routes are re-forwarded from ANY source (multi-hop) with a
+//     content-signature dedup so the flood still reaches every mini but
+//     terminates instead of looping. Coverage is high-probability
+//     complete once fanout >= ~ln(N), so ~16 covers tens of thousands.
+// Disabled by default: at N <= fanout it is a strict no-op, so the live
+// deployment behaves exactly as before until an operator opts in.
+bool g_sparse_mesh = false;
+int  g_mesh_fanout = 16;   // per-round fan-out when sparse mesh is on
+// mininodes.list is always capped to a random sample of this many peers
+// (+ self). A player only needs a handful of failover targets, never the
+// whole set. Safe to leave active: no live deployment has this many minis,
+// so at small N it returns everyone exactly like before.
+int  g_mininodes_list_max = 64;
+
+// Content-signature dedup for epidemic route forwarding. Keyed by a hash
+// of the exact route body we'd re-broadcast, so an identical route seen
+// again within the window is dropped (this is what terminates the flood).
+std::mutex                            g_route_gossip_mu;
+std::unordered_map<size_t, uint64_t>  g_route_gossip_seen; // body-hash -> last-fwd ms
+constexpr uint64_t kRouteGossipDedupMs = 5 * 60 * 1000;    // re-flood window
+constexpr size_t   kRouteGossipSeenCap = 8192;             // prune above this
+
 // CLI-seeded list of mini-nodes to dial at startup. Lets a fresh VPS bootstrap
 // onto an existing mesh by knowing one already-running peer.
 std::vector<std::string> g_seed_mininodes;
@@ -759,6 +793,42 @@ void probe_reachability(std::string node_id, std::string public_address) {
 
 void ingest_route(const std::string& body, const char* peer_id);
 
+// Random sample of up to `k` elements from `all` (Fisher-Yates prefix). Used
+// to bound mesh fan-out + mininodes.list. Returns `all` unchanged when it
+// already fits, so at small N (N <= k) this is a no-op.
+std::vector<std::string> sample_up_to(std::vector<std::string> all, size_t k) {
+    if (k == 0 || all.size() <= k) return all;
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    for (size_t i = 0; i < k; ++i) {
+        std::uniform_int_distribution<size_t> pick(i, all.size() - 1);
+        std::swap(all[i], all[pick(rng)]);
+    }
+    all.resize(k);
+    return all;
+}
+
+// Epidemic-gossip dedup: true the first time we see this exact route body
+// (within kRouteGossipDedupMs), false for a repeat. Re-forwarding only the
+// first sighting is what makes multi-hop flooding terminate instead of
+// ping-ponging forever around a bounded mesh.
+bool route_gossip_should_forward(const std::string& body) {
+    const size_t   h   = std::hash<std::string>{}(body);
+    const uint64_t now = now_ms();
+    std::lock_guard<std::mutex> lk(g_route_gossip_mu);
+    auto it = g_route_gossip_seen.find(h);
+    if (it != g_route_gossip_seen.end() && now - it->second < kRouteGossipDedupMs)
+        return false;
+    // Opportunistic prune so the seen-map can't grow without bound.
+    if (g_route_gossip_seen.size() > kRouteGossipSeenCap) {
+        for (auto i = g_route_gossip_seen.begin(); i != g_route_gossip_seen.end();) {
+            if (now - i->second >= kRouteGossipDedupMs) i = g_route_gossip_seen.erase(i);
+            else ++i;
+        }
+    }
+    g_route_gossip_seen[h] = now;
+    return true;
+}
+
 // Mini-node mesh helpers — defined further down once g_client is in scope.
 // Declared here because ingest_route uses them to fan a freshly-received
 // route out to every other mini-node we know about.
@@ -841,12 +911,18 @@ void ingest_route(const std::string& body, const char* peer_id) {
         probe_reachability(e.node_id, e.public_address);
     }
 
-    // Replicate to other mini-nodes UNLESS the sender is itself a
-    // mini-node — that means we got this route as a forward and
-    // re-forwarding would loop. (#6) The replicate fan-out runs on the
-    // sender thread so ingest (on the io thread) returns promptly.
+    // Replicate to other mini-nodes. (#6) The fan-out runs on the sender
+    // thread so ingest (on the io thread) returns promptly.
+    //   * Full-mesh (default): forward UNLESS the sender is itself a
+    //     mini-node — a mini source means we got this as a one-hop replica,
+    //     so re-forwarding would loop.
+    //   * Sparse mesh: multi-hop epidemic gossip — forward from ANY source
+    //     but only the first time we've seen this exact body, which reaches
+    //     minis we aren't directly meshed with yet terminates the flood.
     const std::string source = peer_id ? peer_id : "";
-    if (!peer_is_mininode(source)) {
+    const bool do_forward = g_sparse_mesh ? route_gossip_should_forward(body)
+                                          : !peer_is_mininode(source);
+    if (do_forward) {
         std::string body_copy = body, src_copy = source;
         enqueue_send_task([body_copy, src_copy]() {
             replicate_route_to_mininodes(body_copy, src_copy);
@@ -1107,6 +1183,11 @@ void replicate_route_to_mininodes(const std::string& route_json,
             peers.push_back(p);
         }
     }
+    // Sparse mesh: fan out to at most g_mesh_fanout random peers per hop.
+    // Epidemic multi-hop + dedup still covers the network; O(fanout) per node
+    // instead of O(N). No-op at N <= fanout, so full mesh is unaffected.
+    if (g_sparse_mesh)
+        peers = sample_up_to(std::move(peers), static_cast<size_t>(g_mesh_fanout));
     for (const auto& p : peers) {
         rats_send_message(g_client, p.c_str(), kRoutesTopic,
                           route_json.c_str());
@@ -1645,7 +1726,16 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
         }
         {
             std::lock_guard<std::mutex> lk(g_mininodes_mu);
-            for (const auto& p : g_mininode_peers) {
+            // Cap to a random sample — a player only needs a handful of
+            // failover targets, not the entire mesh. Returns everyone at
+            // small N, so this matches the old behaviour until the mesh
+            // grows past g_mininodes_list_max.
+            std::vector<std::string> ids;
+            ids.reserve(g_mininode_peers.size());
+            for (const auto& p : g_mininode_peers) ids.push_back(p);
+            ids = sample_up_to(std::move(ids),
+                               static_cast<size_t>(g_mininodes_list_max));
+            for (const auto& p : ids) {
                 auto addr_it = g_mininode_addr.find(p);
                 auto load_it = g_mininode_load.find(p);
                 arr.push_back({
@@ -2841,6 +2931,11 @@ void mini_hello_heartbeat_loop() {
             peers.reserve(g_mininode_peers.size());
             for (const auto& p : g_mininode_peers) peers.push_back(p);
         }
+        // Sparse mesh: refresh a random g_mesh_fanout-sized slice each round
+        // rather than heartbeating every peer (O(N^2) network-wide). Load
+        // scores stay approximately fresh via rotation. No-op at small N.
+        if (g_sparse_mesh)
+            peers = sample_up_to(std::move(peers), static_cast<size_t>(g_mesh_fanout));
         for (const auto& p : peers) send_mini_hello(p);
         if (!peers.empty() && !g_quiet)
             push_event("mini-hello-hb",
@@ -2884,12 +2979,24 @@ int main(int argc, char** argv) {
                 }
             }
             if (!cur.empty()) g_seed_mininodes.push_back(cur);
+        } else if (a == "--sparse-mesh") {
+            // Opt into the bounded-degree epidemic gossip overlay instead of
+            // the default full mesh. See the g_sparse_mesh comment.
+            g_sparse_mesh = true;
+        } else if (a == "--mesh-fanout" && i + 1 < argc) {
+            g_mesh_fanout = std::atoi(argv[++i]);
+        } else if (a == "--mininodes-list-max" && i + 1 < argc) {
+            g_mininodes_list_max = std::atoi(argv[++i]);
         } else if (a == "-h" || a == "--help") {
             std::cout << "Usage: mini-node [--rats-port N] [--quiet]\n"
                       << "  --rats-port          librats TCP port (default " << kDefaultRatsPort << ")\n"
                       << "  --quiet              suppress per-peer log lines\n"
                       << "  --peer-vps           host:port[,host:port...] of fellow mini-nodes\n"
-                      << "                       to dial at startup so we mesh with them\n";
+                      << "                       to dial at startup so we mesh with them\n"
+                      << "  --sparse-mesh        bounded-degree epidemic gossip instead of full mesh\n"
+                      << "                       (for thousands of minis; default off)\n"
+                      << "  --mesh-fanout N      peers per gossip round when --sparse-mesh (default 16)\n"
+                      << "  --mininodes-list-max N  cap mininodes.list to N sampled peers (default 64)\n";
             return 0;
         } else {
             // legacy --http-port flag is silently accepted+ignored so existing
@@ -2934,6 +3041,19 @@ int main(int argc, char** argv) {
                         if (lm.contains("disable_cpu_metric"))
                             load_cfg.disable_cpu_metric = lm["disable_cpu_metric"];
                     }
+                    // Sparse-mesh knobs. CLI wins: only take the config value
+                    // when the global is still at its compiled-in default
+                    // (same idiom as rats_port above).
+                    if (!g_sparse_mesh && j.contains("sparse_mesh") &&
+                        j["sparse_mesh"].is_boolean())
+                        g_sparse_mesh = j["sparse_mesh"].get<bool>();
+                    if (g_mesh_fanout == 16 && j.contains("mesh_fanout") &&
+                        j["mesh_fanout"].is_number_integer())
+                        g_mesh_fanout = j["mesh_fanout"].get<int>();
+                    if (g_mininodes_list_max == 64 &&
+                        j.contains("mininodes_list_max") &&
+                        j["mininodes_list_max"].is_number_integer())
+                        g_mininodes_list_max = j["mininodes_list_max"].get<int>();
                 } catch (...) { /* keep CLI / default values */ }
             }
         }
@@ -2952,10 +3072,22 @@ int main(int argc, char** argv) {
             lm["disable_net_metric"]   = load_cfg.disable_net_metric;
             lm["disable_cpu_metric"]   = load_cfg.disable_cpu_metric;
             j["load_monitor"] = lm;
+            j["sparse_mesh"]        = g_sparse_mesh;
+            j["mesh_fanout"]        = g_mesh_fanout;
+            j["mininodes_list_max"] = g_mininodes_list_max;
             std::ofstream of(save_path);
             of << j.dump(2);
         } catch (...) {}
     }
+    // Clamp the mesh knobs to sane floors so a bad flag/config can't wedge
+    // fan-out to zero (which would silently stop route gossip / the list).
+    if (g_mesh_fanout < 1)        g_mesh_fanout = 1;
+    if (g_mininodes_list_max < 1) g_mininodes_list_max = 1;
+    std::cout << "[mini-node] mesh="
+              << (g_sparse_mesh ? "sparse" : "full")
+              << " fanout=" << g_mesh_fanout
+              << " list_max=" << g_mininodes_list_max << "\n";
+
     g_load_mon = std::make_unique<mc::net::LoadMonitor>(load_cfg);
     g_load_mon->start();
 

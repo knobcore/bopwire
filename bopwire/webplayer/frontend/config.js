@@ -9,10 +9,10 @@ window.BOPWIRE = {
   refreshMs: 20000,
 
   // "Click here" → download the native app (where the listener DOES earn).
-  // Point these at real release artifacts once published.
+  // Release assets live on knobcore/bopwire (releases/latest).
   downloads: {
-    linux:   'https://github.com/bopwire/bopwire/releases/latest/download/bopwire-linux-x64.tar.gz',
-    android: 'https://github.com/bopwire/bopwire/releases/latest/download/bopwire-android.apk',
-    windows: 'https://github.com/bopwire/bopwire/releases/latest/download/bopwire-windows-x64.zip',
+    linux:   'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-linux-x86_64.AppImage',
+    android: 'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-android.apk',
+    windows: 'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-windows-x64.zip',
   },
 };
