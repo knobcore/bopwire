@@ -404,10 +404,21 @@
     if (engine === 'wasm' && wasm) { wasm.paused ? wasm.resume() : wasm.pause(); setTimeout(npToggleIcon, 0); }
     else { audio.paused ? audio.play() : audio.pause(); }
   };
+  // While dragging (input): update the time label live, and for <audio> seek
+  // natively (cheap). For WASM, DON'T seek on every input event — each seek is a
+  // fresh fetch + decoder, so a drag would fire a storm of them and stall. Seek
+  // once on release (change).
   $('np-bar').oninput = () => {
     const frac = +$('np-bar').value / 1000;
-    if (engine === 'wasm' && wasm) { if (wasm.duration) wasm.seek(frac * wasm.duration); }
-    else if (audio.duration) audio.currentTime = frac * audio.duration;
+    const dur = engDurSec();
+    if (dur) $('np-cur').textContent = fmtDur(frac * dur * 1000);
+    if (engine === 'audio' && audio.duration) audio.currentTime = frac * audio.duration;
+  };
+  $('np-bar').onchange = () => {
+    if (engine === 'wasm' && wasm && wasm.duration) {
+      const frac = +$('np-bar').value / 1000;
+      wasm.seek(frac * wasm.duration);
+    }
   };
 
   // ───────────────────── Data + status ─────────────────────

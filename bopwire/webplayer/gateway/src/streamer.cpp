@@ -254,6 +254,11 @@ std::string PieceStore::get_range(int64_t offset, int64_t len) {
 
     const int first = static_cast<int>(offset / piece_size_);
     const int last  = static_cast<int>((end - 1) / piece_size_);
+    // A forward SEEK requests bytes far beyond where the sequential prefetcher is
+    // working. Retarget it to the seek position, otherwise it grinds through the
+    // whole skipped region first and get_range() blocks (up to 12s) then fails —
+    // the "skip ahead stalls / loses the stream" bug.
+    if (first > prefetch_next_) { prefetch_next_ = first; cv_.notify_all(); }
     for (int p = first; p <= last; ++p) {
         if (pieces_.count(p)) continue;
         // wait for the prefetcher to deliver it
