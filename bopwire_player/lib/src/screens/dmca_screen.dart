@@ -47,8 +47,6 @@ If you wish to submit a DMCA takedown request anyway, please have your lawyer su
             _EscrowClaimCard(),
             const SizedBox(height: 16),
             _ContactCard(),
-            const SizedBox(height: 16),
-            _TakedownFormCard(),
           ],
         ),
       ),
@@ -189,24 +187,31 @@ class _ContactCardState extends State<_ContactCard> {
             ),
             const SizedBox(height: 8),
             Text(
-              "Have your lawyer prepare a PDF that identifies the work "
-              "and includes the standard 17 U.S.C. § 512(c)(3) sworn "
-              "statements. Upload it here; it lands in the full node's "
-              "DMCA inbox and the moderator reviews it on the node's "
-              "console — when honored, the matched fingerprints are "
-              "delisted from discovery so players stop surfacing them.",
+              "Use the takedown form to name the specific artists/works to "
+              "remove — it goes straight to the node moderators' inbox for "
+              "review. Prefer a formal notice? A lawyer can upload a PDF with "
+              "the 17 U.S.C. § 512(c)(3) statements instead. Either way, once a "
+              "moderator approves, the matched content is delisted from "
+              "discovery (usually within 5–10 minutes).",
               style: theme.textTheme.bodyMedium,
             ),
             const SizedBox(height: 12),
             FilledButton.icon(
+              icon: const Icon(Icons.description_outlined),
+              label: const Text('Open the takedown form'),
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const TakedownFormScreen())),
+            ),
+            const SizedBox(height: 6),
+            TextButton.icon(
               icon: _uploading
                   ? const SizedBox(
-                      width: 16, height: 16,
+                      width: 14, height: 14,
                       child: CircularProgressIndicator(strokeWidth: 2))
-                  : const Icon(Icons.upload_file_outlined),
+                  : const Icon(Icons.upload_file_outlined, size: 18),
               label: Text(_uploading
                   ? 'Uploading…'
-                  : 'Upload takedown PDF'),
+                  : "Prefer a lawyer's PDF? Upload one"),
               onPressed: _uploading ? null : _pickAndSubmit,
             ),
             if (_status.isNotEmpty) ...[
@@ -217,6 +222,22 @@ class _ContactCardState extends State<_ContactCard> {
             ],
           ],
         ),
+      ),
+    );
+  }
+}
+
+// Full-screen host for the structured takedown form, opened from the
+// "Open the takedown form" button on the DMCA screen.
+class TakedownFormScreen extends StatelessWidget {
+  const TakedownFormScreen({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Takedown request')),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 32),
+        child: _TakedownFormCard(),
       ),
     );
   }
