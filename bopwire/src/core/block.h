@@ -120,7 +120,11 @@ struct SongSection {
     AudioFormat              audio_format = AudioFormat::OGG; // 1 byte
     Hash256                  content_hash;
     std::string              compressed_fingerprint; // base64
-    uint32_t                 duration_ms;
+    // MUST stay initialized: post_session_complete default-constructs a
+    // SongSection and only overwrites it if the block loads. An uninitialized
+    // duration_ms here surfaced as a ~984 h "duration" (stack garbage) that
+    // made the 50 % listen gate unsatisfiable and blocked minting.
+    uint32_t                 duration_ms  = 0;
     std::string              title;
     std::string              artist;
     Address                  artist_address;

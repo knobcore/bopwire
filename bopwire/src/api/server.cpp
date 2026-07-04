@@ -578,23 +578,20 @@ std::pair<int, std::string> HttpServer::post_session_heartbeat(
             // so a single beat could carry position_ms = 999999999 and
             // (combined with kPlaybackGraceMs) push effective_ms past
             // any threshold. Now we clamp on receipt instead of relying
-            // solely on the song_duration_hint clamp at aggregation
-            // time, which only fired when the SongSection actually
-            // loaded.
-            std::ostringstream fname;
-            fname << std::setw(8) << std::setfill('0') << *height_opt << ".blk";
-            auto block_path = std::filesystem::path(config_.data_dir)
-                            / "blocks" / fname.str();
-            std::ifstream bf(block_path, std::ios::binary);
-            if (bf) {
-                std::vector<uint8_t> fd((std::istreambuf_iterator<char>(bf)), {});
-                Block blk;
-                if (Block::deserialize(fd.data(), fd.size(), blk)) {
-                    const uint64_t dur = blk.song.duration_ms;
-                    if (dur > 0 && pos_ms > dur + kPositionSlackMs)
-                        return {400, R"({"error":"position_ms past end of song"})"};
-                }
+            // solely on the song_duration_hint clamp at aggregation time.
+            //
+            // Read the duration from the CANONICAL LevelDB block store, not
+            // the best-effort .blk dump: that dump is bucketed by the producer
+            // path but read flat here, so a locally-produced song's file was
+            // missed and the clamp silently never fired (see
+            // post_session_complete for the full write/read path mismatch).
+            uint64_t dur = 0;
+            if (auto bhash = chain_.get_block_hash(*height_opt)) {
+                if (auto blk = chain_.get_block(*bhash); blk && blk->has_song)
+                    dur = blk->song.duration_ms;
             }
+            if (dur > 0 && pos_ms > dur + kPositionSlackMs)
+                return {400, R"({"error":"position_ms past end of song"})"};
         }
         it->second.last_heartbeat = now;
         it->second.heartbeat_count++;
@@ -635,20 +632,27 @@ std::pair<int, std::string> HttpServer::post_session_complete(
     if (db_.is_session_used(sess.session_id))
         return {400, R"({"error":"session already used"})"};
 
-    // Load SongSection from block file (need artist_address + royalty_splits,
-    // and duration_ms for the 50% listen threshold below).
+    // Load the SongSection (need artist_address + royalty_splits, and
+    // duration_ms for the 50% listen threshold below) from the CANONICAL
+    // block store in LevelDB — the same source /api/block uses.
+    //
+    // BUG FIX: this used to read the best-effort <data_dir>/blocks/<h>.blk
+    // dump directly. But the producer path writes those bucketed
+    // (blocks/<h/1000>/<h>.blk, candidate.cpp) while the sync path writes them
+    // flat and this reader looked flat — so any locally-produced song's file
+    // was MISSED. song_section then stayed default-constructed, which:
+    //   * zeroed artist_address  -> the artist's reward routed to the
+    //     unclaimed-escrow zero address instead of the artist, and
+    //   * left duration_ms as stack garbage (~984 h) -> the 50% coverage
+    //     gate could never be met, so real plays never minted.
+    // chain_.get_block reads "b:"+hash from LevelDB (durable, path-independent)
+    // and always resolves the true song section.
     SongSection song_section;
     auto height_opt = db_.get_content_height(sess.content_hash);
     if (height_opt) {
-        std::ostringstream fname;
-        fname << std::setw(8) << std::setfill('0') << *height_opt << ".blk";
-        auto block_path = std::filesystem::path(config_.data_dir) / "blocks" / fname.str();
-        std::ifstream bf(block_path, std::ios::binary);
-        if (bf) {
-            std::vector<uint8_t> fd((std::istreambuf_iterator<char>(bf)), {});
-            Block blk;
-            if (Block::deserialize(fd.data(), fd.size(), blk))
-                song_section = blk.song;
+        if (auto bhash = chain_.get_block_hash(*height_opt)) {
+            if (auto blk = chain_.get_block(*bhash); blk && blk->has_song)
+                song_section = blk->song;
         }
     }
 
