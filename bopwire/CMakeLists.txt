@@ -272,6 +272,13 @@ if(WIN32)
   list(APPEND MC_LINK_LIBS ws2_32 iphlpapi bcrypt advapi32)
 endif()
 
+# ---- macOS: IOKit + CoreFoundation for the IOPlatformUUID/serial in
+# src/util/hw_fingerprint.cpp (device fingerprint). Only matters if a macOS
+# build is ever configured; harmless elsewhere. ----
+if(APPLE)
+  list(APPEND MC_LINK_LIBS "-framework IOKit" "-framework CoreFoundation")
+endif()
+
 # ---- CRoaring (Roaring bitmaps) for the wallet LibraryStore (DB2) -----
 # Compiled as an isolated C static lib so the amalgamation keeps its own
 # SIMD-autodetect flags and doesn't inherit the project's C++ strictness.

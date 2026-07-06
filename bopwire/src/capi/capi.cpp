@@ -134,6 +134,20 @@ char* mc_device_fingerprint(void) {
     }
 }
 
+// Entropy tier of the hardware fingerprint: 2 = strong (a genuinely per-unit
+// hardware id was present), 1 = weak (only MAC/OS/host-class sources), 0 =
+// nothing readable. Lets the client set an honest attestation `level` instead
+// of guessing from the fingerprint string length.
+int mc_device_fingerprint_level(void) {
+    try {
+        const auto d = mc::util::device_fingerprint_ex();
+        if (d.hex.empty()) return 0;
+        return d.strong ? 2 : 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 // ---- Audio decoding -------------------------------------------------
 
 mc_decoder_t mc_decoder_open(const uint8_t* data, size_t len) {

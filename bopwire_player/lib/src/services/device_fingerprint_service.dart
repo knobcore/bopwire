@@ -39,6 +39,11 @@ class DeviceAttestation {
         'platform':   platform,
         'level':      level,
         'device_key': deviceKey,
+        // fp_v:2 => the fingerprint was produced by the hardened collector
+        // (per-unit SMBIOS/IOPlatform UUID + disk/board serials + machine-id,
+        // with a real strong/weak entropy signal). Lets the node distinguish
+        // hardened material from the legacy length-guessed tier.
+        'fp_v':       2,
       };
 }
 
@@ -69,21 +74,30 @@ class DeviceFingerprintService {
       level = _looksHashed(fp) ? 'android_hw' : 'software';
     } else if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
       platform = Platform.operatingSystem;
+      int lvl = 0;
       try {
-        fp = _nativeFingerprint();
+        fp  = _nativeFingerprint();
+        lvl = _nativeFingerprintLevel();
       } catch (_) {
         fp = null;
+        lvl = 0;
       }
-      level = _looksHashed(fp) ? 'desktop_pci' : 'software';
+      // Trust the fingerprint as a hardware id ONLY when the native collector
+      // found a genuinely per-unit source (lvl==2 "strong"). A weak fingerprint
+      // (MAC/OS/host only, lvl==1) is collision-prone across identical fleets,
+      // so it's demoted to software and gets a per-install-unique random id
+      // below — two distinct weak machines then never share a device_id.
+      level = (lvl >= 2 && _looksHashed(fp)) ? 'desktop_pci' : 'software';
     } else {
       platform = 'unknown';
       level = 'software';
     }
 
-    if (!_looksHashed(fp)) {
-      // No hardware id available — fall back to a stable per-install random,
-      // and mark the weak level so the server can choose to rate-limit
-      // software-level devices harder once a real verifier lands.
+    if (level == 'software' || !_looksHashed(fp)) {
+      // No trustworthy per-unit hardware id — fall back to a stable per-install
+      // random (unique per install, so distinct low-entropy devices are never
+      // bucketed together) and mark the weak level so the server can rate-limit
+      // software-tier devices harder.
       fp = await _fallbackRandom();
       level = 'software';
     }
@@ -103,6 +117,12 @@ class DeviceFingerprintService {
     } finally {
       NativeLibrary.bindings.mc_free(ptr.cast());
     }
+  }
+
+  // Entropy tier from the native collector: 2 = strong (per-unit hardware id
+  // present), 1 = weak, 0 = nothing readable.
+  int _nativeFingerprintLevel() {
+    return NativeLibrary.bindings.mc_device_fingerprint_level();
   }
 
   Future<String> _fallbackRandom() async {

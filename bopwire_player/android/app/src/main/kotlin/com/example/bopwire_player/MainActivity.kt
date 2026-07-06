@@ -162,6 +162,17 @@ class MainActivity : FlutterActivity() {
     private fun deviceFingerprintHex(): String {
         val androidId = Settings.Secure.getString(
             contentResolver, Settings.Secure.ANDROID_ID) ?: ""
+        // If ANDROID_ID is missing / blank / degenerate, the only remaining
+        // inputs are model-class Build.* fields — IDENTICAL across every unit of
+        // the same model — so hashing them would bucket a whole device model
+        // into ONE device_id and wrongly rate-limit unrelated users together.
+        // Return empty instead so the Dart side falls back to a per-install-
+        // unique random id (software tier). "9774d56d682e549c" is a well-known
+        // broken ANDROID_ID shared by many early/rooted devices.
+        val badAndroidId = androidId.isBlank() ||
+                           androidId == "9774d56d682e549c" ||
+                           androidId.all { it == '0' }
+        if (badAndroidId) return ""
         // Concatenate stable hardware/build identifiers. ANDROID_ID carries
         // most of the entropy; the Build.* fields disambiguate two devices
         // that (rarely) collide on ANDROID_ID and bind the fingerprint to

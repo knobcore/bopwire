@@ -27,8 +27,23 @@
 
 namespace mc::util {
 
+// A fingerprint plus its entropy quality. `strong` is true iff at least one
+// genuinely per-UNIT hardware id (SMBIOS/IOPlatform UUID, disk/board serial,
+// machine-id, non-empty ANDROID_ID) was folded in — i.e. two otherwise-
+// identical machines would differ. Material with only weak sources
+// (MAC/OS/hostname/CPU-model), or none at all, yields strong=false so the
+// caller can route it to the software tier (per-install random) instead of
+// minting a confident, collision-prone device_id.
+struct DeviceFingerprint {
+    std::string hex;            // lowercase hex SHA-256, or "" if nothing readable
+    bool        strong = false;
+};
+
+// Full result (hex + strong bit).
+DeviceFingerprint device_fingerprint_ex();
+
 // Lowercase hex SHA-256 of the concatenated hardware identifiers, or "" if
-// none could be read on this platform.
+// none could be read on this platform. (Delegates to device_fingerprint_ex.)
 std::string device_fingerprint_hex();
 
 } // namespace mc::util

@@ -173,6 +173,18 @@ class BopwireBindings {
   late final _mc_device_fingerprint = _mc_device_fingerprintPtr
       .asFunction<ffi.Pointer<ffi.Char> Function()>();
 
+  /// Entropy tier of the hardware fingerprint: 2 = strong (a per-unit hardware
+  /// id was present), 1 = weak (MAC/OS/host only), 0 = nothing readable.
+  int mc_device_fingerprint_level() {
+    return _mc_device_fingerprint_level();
+  }
+
+  late final _mc_device_fingerprint_levelPtr =
+      _lookup<ffi.NativeFunction<ffi.Int32 Function()>>(
+          'mc_device_fingerprint_level');
+  late final _mc_device_fingerprint_level = _mc_device_fingerprint_levelPtr
+      .asFunction<int Function()>();
+
   /// Sign data with the wallet private key.
   /// Returns 128-character hex string (64-byte signature), or NULL on failure.
   /// Caller must free with mc_free().

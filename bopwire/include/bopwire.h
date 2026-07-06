@@ -118,6 +118,13 @@ BOPWIRE_API char* mc_wallet_sign(mc_wallet_t wallet, const uint8_t* data, size_t
  *  Caller must free with mc_free(). */
 BOPWIRE_API char* mc_device_fingerprint(void);
 
+/*  Entropy tier of the hardware fingerprint: 2 = strong (a genuinely per-unit
+ *  hardware id was present — SMBIOS/IOPlatform UUID, disk/board serial,
+ *  machine-id), 1 = weak (only MAC/OS/host-class sources), 0 = nothing
+ *  readable. Lets the client set an honest attestation level instead of
+ *  inferring it from the fingerprint string length. */
+BOPWIRE_API int mc_device_fingerprint_level(void);
+
 // ---- Audio decoding -------------------------------------------------
 
 typedef void* mc_decoder_t;
