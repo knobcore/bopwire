@@ -49,6 +49,52 @@ static std::string random_addr() {
     return s;
 }
 
+// Behind Caddy, X-Forwarded-For is "client, proxy...". The Caddyfile resets XFF
+// to the real peer, but we still take the LAST comma-separated hop defensively
+// (a client can't append after Caddy). Fall back to the socket peer.
+static std::string client_ip(const httplib::Request& req) {
+    std::string xff = req.get_header_value("X-Forwarded-For");
+    if (!xff.empty()) {
+        auto pos = xff.find_last_of(',');
+        std::string ip = (pos == std::string::npos) ? xff : xff.substr(pos + 1);
+        size_t a = ip.find_first_not_of(" \t");
+        size_t b = ip.find_last_not_of(" \t");
+        if (a != std::string::npos) return ip.substr(a, b - a + 1);
+    }
+    return req.remote_addr;
+}
+
+// Coarse per-IP ceiling on the mint-bearing /api/play/start. This is a DoS/spam
+// ceiling, NOT the anti-farm control — web listeners earn nothing, so faking web
+// plays has no payoff; the real anti-farm is the per-DEVICE caps on the native
+// path. Kept generous so CGNAT / university / VPN egress isn't blocked. Sliding
+// 60s window.
+static bool ip_allow_start(const std::string& ip) {
+    static std::mutex m;
+    static std::unordered_map<std::string, std::deque<int64_t>> hits;
+    constexpr int     kMaxPerMin = 60;
+    constexpr int64_t kWindowMs  = 60000;
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::lock_guard<std::mutex> lk(m);
+    // Bounded-map guard: evict only genuinely-idle buckets, and do it BEFORE
+    // binding a reference into the map — clearing/erasing after `auto& dq` would
+    // dangle that reference (heap use-after-free). Active windows stay intact.
+    if (hits.size() > 50000) {
+        for (auto it = hits.begin(); it != hits.end(); ) {
+            while (!it->second.empty() && now - it->second.front() > kWindowMs)
+                it->second.pop_front();
+            if (it->second.empty()) it = hits.erase(it);
+            else ++it;
+        }
+    }
+    auto& dq = hits[ip];
+    while (!dq.empty() && now - dq.front() > kWindowMs) dq.pop_front();
+    if (static_cast<int>(dq.size()) >= kMaxPerMin) return false;
+    dq.push_back(now);
+    return true;
+}
+
 static json normalize_song(const json& s) {
     return json{
         {"contentHash", s.value("content_hash", "")},
@@ -250,6 +296,7 @@ int main() {
 
     // ── reward lifecycle (browser reports REAL playback) ──
     svr.Post("/api/play/start", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!ip_allow_start(client_ip(req))) { err(res, 429, "rate_limited"); return; }
         json in; try { in = json::parse(req.body); } catch (...) { err(res, 400, "bad json"); return; }
         const std::string h = in.value("contentHash", "");
         if (h.size() != 64) { err(res, 400, "bad contentHash"); return; }
@@ -258,7 +305,13 @@ int main() {
         try {
             json r = link.rpc_via_relay(node, "session.start", json{
                 {"content_hash", h},
-                {"player_address", random_addr()},  // ephemeral listener; earns nothing
+                // Web listeners earn NOTHING: the all-zero address makes the node
+                // skip the discoverer mint lane entirely (mint.cpp:71), so no
+                // unspendable token is minted to a throwaway address either.
+                {"player_address", std::string(40, '0')},
+                // Browser identity for analytics/anti-farm ONLY, never a payout:
+                // the page's wallet address if it sent one, else an ephemeral id.
+                {"tracking_address", in.value("playerAddress", random_addr())},
                 {"attestation", json::object()},
             }, 12000);
             const std::string sid = r.value("body", json::object()).value("session_id", "");

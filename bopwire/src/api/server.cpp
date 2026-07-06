@@ -5,8 +5,10 @@
 #include "../crypto/signature.h"
 #include "../tokens/ledger.h"
 #include "../tokens/mint.h"
+#include "device_attestation.h"
 #include "../core/transaction.h"
 #include <nlohmann/json.hpp>
+#include <cstdlib>
 #include <chrono>
 #include <iostream>
 #include <random>
@@ -106,6 +108,19 @@ static uint64_t now_ms_api() {
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
+namespace {
+// Minimal scope-exit so post_session_complete releases the device concurrency
+// slot on EVERY return path (gate reject, mint fail, success) without repeating
+// the release at each of the ~8 exits.
+template <class F> struct ScopeExit {
+    F f;
+    explicit ScopeExit(F fn) : f(std::move(fn)) {}
+    ~ScopeExit() { f(); }
+    ScopeExit(const ScopeExit&)            = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+};
+} // namespace
+
 // ---- Constructor / Destructor ---------------------------------------
 
 HttpServer::HttpServer(Chain& chain, CandidateManager& candidates,
@@ -121,10 +136,71 @@ bool HttpServer::start() {
     // microhttpd HTTP/1.1 listener removed in Phase 2c. The class is kept
     // because both RatsApi (rats RPC) and H3Server (HTTP/3) dispatch to its
     // verb_* methods. No socket is opened here.
+    //
+    // Anti-farm per-device caps are DARK by default: unless the operator sets
+    // BOPWIRE_DEVICE_CAP_ENFORCE=1, we log would-reject but still admit/mint so
+    // a soak surfaces false-positives (skips, NAT, collisions) before enforcing.
+    if (const char* e = std::getenv("BOPWIRE_DEVICE_CAP_ENFORCE"))
+        device_cap_enforce_.store(e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    std::cout << "[antifarm] per-device caps "
+              << (device_cap_enforce_.load() ? "ENFORCING" : "dark (log-only)")
+              << " (concurrency<=" << kMaxConcurrentPerDevice
+              << "/device+wallet, daily<=" << (kDailyCoverageCapMs / 3600000)
+              << "h covered/device)\n";
+    reaper_stop_.store(false);
+    reaper_thread_ = std::thread([this] { reaper_loop(); });
     return true;
 }
 
-void HttpServer::stop() {}
+void HttpServer::stop() {
+    reaper_stop_.store(true);
+    if (reaper_thread_.joinable()) reaper_thread_.join();
+}
+
+// Caller holds sessions_mutex_. Decrement the device's live concurrency slot
+// exactly once per session lifetime; slot_held guards against a retried
+// complete or a reaper sweep double-decrementing.
+void HttpServer::release_device_slot_locked(PlaySession& s) {
+    if (!s.slot_held) return;
+    s.slot_held = false;
+    if (s.slot_key.empty()) return;
+    auto it = live_by_device_.find(s.slot_key);
+    if (it != live_by_device_.end()) {
+        if (it->second <= 1) live_by_device_.erase(it);
+        else --it->second;
+    }
+}
+
+// Background sweep (off the hot path): free a device's concurrency slot after
+// kSlotIdleReleaseMs of heartbeat silence (backgrounded/crashed client) so it is
+// never locked out, and erase long-dead / old-completed sessions so sessions_
+// and the sweep stay bounded. is_session_used is durable in LevelDB, so dropping
+// a completed in-memory session cannot enable a replay mint.
+void HttpServer::reaper_loop() {
+    while (!reaper_stop_.load()) {
+        for (int i = 0; i < 10 && !reaper_stop_.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (reaper_stop_.load()) break;
+        const uint64_t now = now_ms_api();
+        std::lock_guard<std::mutex> lk(sessions_mutex_);
+        for (auto it = sessions_.begin(); it != sessions_.end(); ) {
+            PlaySession& s = it->second;
+            const uint64_t idle = now - s.last_heartbeat;
+            // Release the concurrency slot early on silence, but keep the
+            // session for a late complete until TIMEOUT_MS.
+            if (s.slot_held && idle > kSlotIdleReleaseMs)
+                release_device_slot_locked(s);
+            const bool drop = (s.completed && idle > PlaySession::TIMEOUT_MS) ||
+                              s.is_expired(now);
+            if (drop) {
+                release_device_slot_locked(s);   // idempotent
+                it = sessions_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
 
 // MHD access_handler + handle_request removed in Phase 2c — HTTP routing
 // now lives in transport/h3_server.cpp on top of msh3. The verb methods
@@ -473,6 +549,41 @@ std::pair<int, std::string> HttpServer::post_session_start(const std::string& bo
         if (!crypto::parse_hash256(ch_hex, ch)) return {400, R"({"error":"bad content_hash"})"};
         if (!crypto::parse_address_checksummed(pl_hex, pl)) return {400, R"({"error":"bad player_address"})"};
 
+        // ---- Anti-farm: server-derived device identity (never the wallet) ----
+        // The client's hardware attestation rides session.start in `attestation`.
+        // AcceptAllVerifier derives a device_id (empty when the client sent none).
+        // We derive it HERE (not in the transport dispatch) and ignore any
+        // client-supplied id, so every transport — rats RPC and a restored H3 —
+        // gets the same server-authoritative device_id.
+        static AcceptAllVerifier g_verifier;
+        AttestationResult att = g_verifier.verify(
+            j.value("attestation", json::object()), std::string(), std::string());
+        const std::string dev = att.device_id;   // "" => unidentifiable client
+
+        // UTC day bucket, bound ONCE here and carried on the session; clamped
+        // non-decreasing per device so a backward server clock step can't reset
+        // the daily counter.
+        uint64_t day = now_ms_api() / 86400000ULL;
+        if (!dev.empty()) {
+            const uint64_t hw = db_.get_u64("ddaymax:" + dev).value_or(0);
+            if (day < hw) day = hw;
+        }
+
+        // Daily coverage cap — reject at START, before any listen time is
+        // invested, so a completed genuine listen is never voided at the finish
+        // line. The durable counter is only incremented at complete.
+        if (!dev.empty()) {
+            const uint64_t cum =
+                db_.get_u64("ddur:" + dev + ":" + std::to_string(day)).value_or(0);
+            if (cum >= kDailyCoverageCapMs) {
+                std::cout << "[antifarm] would-reject daily-cap dev="
+                          << dev.substr(0, 12) << " cum_ms=" << cum
+                          << (device_cap_enforce_.load() ? " ENFORCED" : " dark") << "\n";
+                if (device_cap_enforce_.load())
+                    return {429, R"({"error":"daily_device_limit"})"};
+            }
+        }
+
         // Past the 10k-plays cliff, the listener has to burn tokens
         // per play. The required amount is dynamic — zero until the
         // chain hits SUPPLY_FLOOR, then ramps up cubically toward
@@ -519,8 +630,35 @@ std::pair<int, std::string> HttpServer::post_session_start(const std::string& bo
         // Find block_hash for this song (simplified)
         session.block_hash = {};
 
+        session.device_id  = dev;
+        session.att_level  = att.level;
+        session.day_bucket = day;
+
+        // Concurrency slot keyed on (device, wallet): one wallet can't fan out
+        // parallel streams from a device, but the device is NOT bricked to serial
+        // (track-skips, 2 accounts on one PC). Only for identified devices; an
+        // empty device_id is left to the gateway per-IP layer. Check-and-
+        // increment under the SAME lock as the insert => atomic vs. RPC workers.
+        std::string slot_key;
+        if (!dev.empty())
+            slot_key = dev + "|" + crypto::to_hex(pl.data(), pl.size());
         {
             std::lock_guard<std::mutex> lk(sessions_mutex_);
+            if (!slot_key.empty()) {
+                uint32_t cur = 0;
+                auto lit = live_by_device_.find(slot_key);
+                if (lit != live_by_device_.end()) cur = lit->second;
+                if (cur >= kMaxConcurrentPerDevice) {
+                    std::cout << "[antifarm] would-reject concurrency dev="
+                              << dev.substr(0, 12) << " live=" << cur
+                              << (device_cap_enforce_.load() ? " ENFORCED" : " dark") << "\n";
+                    if (device_cap_enforce_.load())
+                        return {429, R"({"error":"too_many_concurrent_streams"})"};
+                }
+                live_by_device_[slot_key] = cur + 1;
+                session.slot_key  = slot_key;
+                session.slot_held = true;
+            }
             sessions_[session_id_hex] = session;
         }
 
@@ -618,12 +756,35 @@ std::pair<int, std::string> HttpServer::post_session_complete(
         auto it = sessions_.find(session_id);
         if (it == sessions_.end()) return {404, R"({"error":"session not found"})"};
         if (it->second.completed) return {400, R"({"error":"already completed"})"};
+        // Atomically CLAIM the session so two concurrent completes for the same
+        // session_id can't both mint + both increment the daily counter (the
+        // `completed` flag alone is only set after the mint, and apply_mint does
+        // not re-check is_session_used).
+        if (it->second.completing) return {409, R"({"error":"completion in progress"})"};
+        it->second.completing = true;
         sess = it->second;
     }
     // Capture session_id so the success path can flip the flag without
     // re-resolving the iterator (the map could have been mutated in
     // the meantime — e.g., session expiry from a later patch).
     const std::string sid_copy = session_id;
+
+    // Free the device concurrency slot exactly once when this complete returns,
+    // whichever gate/branch exits. release_device_slot_locked is idempotent
+    // (slot_held), so a retried complete after a gate-reject can't double-
+    // decrement; the already-completed early return above returns BEFORE this
+    // guard is built, leaving the first complete's release intact.
+    ScopeExit slot_guard{[this, sid_copy] {
+        std::lock_guard<std::mutex> lk(sessions_mutex_);
+        auto it = sessions_.find(sid_copy);
+        if (it != sessions_.end()) {
+            release_device_slot_locked(it->second);
+            // Release the completion claim so a legit retry can proceed after a
+            // gate-reject / error. On success `completed` is already true (set
+            // before this guard runs) and the entry check rejects retries first.
+            it->second.completing = false;
+        }
+    }};
 
     uint64_t now = now_ms_api();
     uint64_t duration_ms = now - sess.start_timestamp;
@@ -887,17 +1048,41 @@ std::pair<int, std::string> HttpServer::post_session_complete(
         ? compute_burn_rate(db_.get_total_supply())
         : 0;
 
-    // Apply mint directly to chain state
-    leveldb::WriteBatch batch;
-    if (!chain_.apply_mint(mint, play_count, batch)) {
-        std::cout << "[session.complete] APPLY-MINT-FAIL sid="
-                  << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
-        return {500, R"({"error":"failed to apply mint"})"};
-    }
-    if (!db_.write(batch)) {
-        std::cout << "[session.complete] DB-WRITE-FAIL sid="
-                  << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
-        return {500, R"({"error":"db write failed"})"};
+    // Apply mint directly to chain state. Hold the per-device shard lock across
+    // the ENTIRE read->apply->write so two concurrent completes for the same
+    // device can't both read the old daily counter and both mint past the cap
+    // (apply_mint only BUILDS the batch; db_.write below commits it).
+    {
+        std::unique_lock<std::mutex> dev_lk;
+        if (!sess.device_id.empty())
+            dev_lk = std::unique_lock<std::mutex>(device_shard(sess.device_id));
+
+        leveldb::WriteBatch batch;
+        if (!chain_.apply_mint(mint, play_count, batch)) {
+            std::cout << "[session.complete] APPLY-MINT-FAIL sid="
+                      << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
+            return {500, R"({"error":"failed to apply mint"})"};
+        }
+
+        // Time-based daily coverage counter (node-local, non-consensus): add
+        // THIS session's covered listen-time. A session that crossed the cap
+        // mid-listen is still honored (bounded overshoot) rather than voiding a
+        // completed genuine listen. Folded into the mint batch so counter + mint
+        // commit atomically; is_session_used blocks true replays.
+        if (!sess.device_id.empty()) {
+            const std::string dk =
+                "ddur:" + sess.device_id + ":" + std::to_string(sess.day_bucket);
+            const uint64_t cum = db_.get_u64(dk).value_or(0);
+            db_.put_batch_u64(batch, dk, cum + effective_ms);
+            if (db_.get_u64("ddaymax:" + sess.device_id).value_or(0) < sess.day_bucket)
+                db_.put_batch_u64(batch, "ddaymax:" + sess.device_id, sess.day_bucket);
+        }
+
+        if (!db_.write(batch)) {
+            std::cout << "[session.complete] DB-WRITE-FAIL sid="
+                      << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
+            return {500, R"({"error":"db write failed"})"};
+        }
     }
     // Mint actually landed. NOW flip the in-memory completed flag so
     // a retry returns "already completed" instead of double-minting.

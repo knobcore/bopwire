@@ -73,7 +73,15 @@ public:
             r.device_id = fallback_device_id;
             r.level     = "none";
         } else {
-            r.device_id = player_addr_hex;   // last resort — per-wallet, not per-device
+            // No hardware attestation at all. CRITICAL: do NOT fall back to the
+            // wallet address as a "device" — that silently converts the
+            // per-device limiter into a per-wallet one, which is exactly the
+            // Sybil farmer's goal (one machine, unlimited wallets = unlimited
+            // "devices"). Leave device_id EMPTY; the caller enforces only the
+            // ephemeral / per-IP layer for an unidentifiable client and never
+            // buckets it against a durable per-device counter.
+            (void)player_addr_hex;
+            r.device_id.clear();
             r.level     = "none";
         }
         return r;

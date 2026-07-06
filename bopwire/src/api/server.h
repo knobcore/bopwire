@@ -7,6 +7,9 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <array>
+#include <atomic>
+#include <thread>
 
 namespace mc::api {
 
@@ -34,6 +37,31 @@ struct PlaySession {
     uint64_t last_heartbeat;
     uint32_t heartbeat_count;
     bool     completed = false;
+    // Claimed under sessions_mutex_ at the TOP of post_session_complete so two
+    // concurrent completes for the same session_id can't both mint (and both
+    // double-increment the daily counter): the second sees completing==true and
+    // is rejected. Cleared on any error/reject exit so a legit retry can proceed;
+    // subsumed by `completed` on success.
+    bool     completing = false;
+
+    // ---- Anti-farm device binding (#5, node-local, consensus-invisible) ----
+    // device_id is SERVER-derived at session.start from the client's hardware
+    // attestation (empty when the client sends none — never the wallet). It
+    // keys the per-device daily coverage cap and, together with player_address,
+    // the concurrency slot. att_level is "hardware"|"software"|"none".
+    std::string device_id;
+    std::string att_level;
+    // Concurrency slot: device_id + "|" + player_address. Held from start until
+    // the first terminal event (complete / reject / expiry). slot_held makes
+    // release idempotent so a ret[ried complete or a reaper sweep can't
+    // double-decrement live_by_device_.
+    std::string slot_key;
+    bool     slot_held  = false;
+    // UTC day bucket (now_ms/86400000) bound ONCE at start and carried here so
+    // the complete-time counter increment and any re-check use the SAME bucket
+    // the start-time check used (a play that straddles UTC midnight is not split
+    // across two buckets).
+    uint64_t day_bucket = 0;
 
     // Position samples in arrival order. The last entry is also reflected
     // in last_heartbeat for fast expiry checks. We don't bound this
@@ -107,6 +135,47 @@ private:
 
     mutable std::mutex                            sessions_mutex_;
     std::unordered_map<std::string, PlaySession>  sessions_;
+
+    // ---- Anti-farm per-device enforcement (node-local, consensus-invisible) ----
+    // Live concurrency counters keyed on "<device_id>|<player_address>". Guarded
+    // by sessions_mutex_ (same lock as sessions_) so check-and-increment at
+    // session.start is atomic against the RPC workers.
+    std::unordered_map<std::string, uint32_t>     live_by_device_;
+    // Sharded locks so two concurrent completes for the SAME device serialize
+    // their read-modify-write of the durable daily counter across the WHOLE
+    // apply_mint + db_.write region (the batch is not committed by apply_mint).
+    static constexpr size_t                       kDevShards = 64;
+    std::array<std::mutex, kDevShards>            device_mint_mu_;
+    // Dark by default: log would-reject but still admit/mint until an operator
+    // sets BOPWIRE_DEVICE_CAP_ENFORCE=1 after a soak. The durable daily counter
+    // is maintained in BOTH modes so the soak numbers are real.
+    std::atomic<bool>                             device_cap_enforce_{false};
+    std::thread                                   reaper_thread_;
+    std::atomic<bool>                             reaper_stop_{false};
+
+    // A device may hold a few concurrent live sessions (track-skip tear-down +
+    // new stream, or 2 accounts on one PC). Cap is on (device,wallet), not the
+    // device alone, so one wallet can't fan out — but a device is not bricked to
+    // strictly serial. Concurrency does NOT apply to the offline replay path.
+    static constexpr uint32_t kMaxConcurrentPerDevice = 3;
+    // Free a concurrency slot after this much heartbeat silence (backgrounded /
+    // crashed client) — well under PlaySession::TIMEOUT_MS so a device is never
+    // locked out; the session itself lingers to TIMEOUT_MS for a late complete.
+    static constexpr uint64_t kSlotIdleReleaseMs = 30000;
+    // Time-based daily ceiling: cumulative COVERED listen-time per device per
+    // UTC day. Length-agnostic (can't be gamed with short tracks) and encodes
+    // "a device can't listen to more than a day in a day". ~20h leaves headroom
+    // for a heavy real listener while flagging 24/7 bots.
+    static constexpr uint64_t kDailyCoverageCapMs = 20ull * 60 * 60 * 1000;
+
+    // Anti-farm helpers.
+    void reaper_loop();
+    // Decrement live_by_device_ for s's slot exactly once. Caller holds
+    // sessions_mutex_. Idempotent via s.slot_held.
+    void release_device_slot_locked(PlaySession& s);
+    std::mutex& device_shard(const std::string& device_id) {
+        return device_mint_mu_[std::hash<std::string>{}(device_id) % kDevShards];
+    }
 
     // Route handlers returning JSON response body + HTTP status code
     std::pair<int, std::string> get_status();

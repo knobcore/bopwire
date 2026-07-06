@@ -8,11 +8,15 @@
 
 api.bopwire.com {
 	encode zstd gzip
-	reverse_proxy 127.0.0.1:8090
 
-	# Audio responses can be large; don't let Caddy buffer the whole body.
+	# Single reverse_proxy (the first handler is terminal — a second bare
+	# reverse_proxy below was dead config). Audio responses can be large, so
+	# stream unbuffered. Reset X-Forwarded-For to the real peer so a client
+	# cannot spoof the gateway's per-IP rate-limit key (the gateway also takes
+	# the last XFF hop defensively).
 	reverse_proxy 127.0.0.1:8090 {
 		flush_interval -1
+		header_up X-Forwarded-For {remote_host}
 	}
 
 	log {
