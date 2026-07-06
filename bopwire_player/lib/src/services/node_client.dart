@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:path_provider/path_provider.dart';
 
+import '../models/collection.dart';
 import '../models/song.dart';
 import '../models/session.dart';
 import 'audio_stream_proxy.dart';
@@ -113,6 +114,41 @@ class NodeClient {
       // safe to treat as "missing" since we'd reupload to fix it.
       return false;
     }
+  }
+
+  /// Paged, filtered slice of the online catalog — the server applies the
+  /// filter + slice so the full songs.list never crosses the relay. Any of
+  /// [q]/[artist]/[genre]/[album] filters; [sort] is 'plays' | 'title' |
+  /// 'album'. Reply body is {total, offset, limit, songs:[...]}.
+  Future<List<Song>> getSongsPage({
+    String q = '',
+    String artist = '',
+    String genre = '',
+    String album = '',
+    String sort = '',
+    int offset = 0,
+    int limit = 100,
+  }) async {
+    final r = await _rpc('songs.list', {
+      if (q.isNotEmpty)      'q':      q,
+      if (artist.isNotEmpty) 'artist': artist,
+      if (genre.isNotEmpty)  'genre':  genre,
+      if (album.isNotEmpty)  'album':  album,
+      if (sort.isNotEmpty)   'sort':   sort,
+      'offset': offset,
+      'limit':  limit,
+    });
+    if (r is Map && r['songs'] is List) return _decodeSongs(r['songs']);
+    return _decodeSongs(r); // legacy full-array node
+  }
+
+  /// The deterministic per-epoch Discover feed (curated on the full node
+  /// from on-chain data). `embed:true` rides the deduplicated song metadata
+  /// along so one RPC renders the whole home screen. Throws a
+  /// RatsRpcException('not_ready') until the node's first epoch generates.
+  Future<CollectionSet> getCollections() async {
+    final r = await _rpc('collections.list', const {'embed': true});
+    return CollectionSet.fromJson(Map<String, dynamic>.from(r as Map));
   }
 
   Future<List<Song>> searchSongs(String query) async =>

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Bopwire — Discover</title>
+  <meta name="description" content="Discover and stream independent artists on the Bopwire P2P network." />
+  <meta name="theme-color" content="#0c0d10" />
+  <link rel="icon" type="image/png" href="/favicon.png" />
+  <link rel="apple-touch-icon" href="/logo.png" />
+  <link rel="preconnect" href="https://api.bopwire.com" crossorigin />
+  <!-- prebuilt WASM audio decoders (mp3 / flac / ogg-vorbis), wasm embedded.
+       Plain globals consumed by the player controller — kept outside the
+       bundle on purpose so they never get transformed. -->
+  <script src="./decoders/mpg123-decoder.min.js"></script>
+  <script src="./decoders/flac-decoder.min.js"></script>
+  <script src="./decoders/ogg-vorbis-decoder.min.js"></script>
+  <script src="./wasm-player.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>

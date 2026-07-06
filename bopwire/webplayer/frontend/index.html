@@ -18,8 +18,18 @@
       <span class="brand-name">bopwire</span>
     </div>
 
+    <nav class="viewnav" id="viewnav" role="tablist" aria-label="View">
+      <button class="vn-btn" data-view="home"   role="tab" aria-selected="true">
+        <span class="vn-ico">◆</span> Home
+      </button>
+      <button class="vn-btn" data-view="browse" role="tab" aria-selected="false">
+        <span class="vn-ico">≣</span> Browse
+      </button>
+    </nav>
+
     <div class="search">
-      <input id="search" type="search" placeholder="Search songs, artists, genres…"
+      <span class="search-ico">⌕</span>
+      <input id="search" type="search" placeholder="Search songs, artists, albums…"
              autocomplete="off" spellcheck="false" />
     </div>
 
@@ -31,45 +41,69 @@
     <a class="dmca-link" href="dmca.html" title="Copyright takedown request (DMCA)">DMCA</a>
   </header>
 
-  <!-- ───────────────────── Discover controls ────────────────── -->
-  <section class="controls">
-    <div class="segmented" id="mode-toggle" role="tablist" aria-label="Browse mode">
-      <button class="seg" data-mode="artist" role="tab" aria-selected="true">
-        <span class="seg-ico">👤</span> Artist
-      </button>
-      <button class="seg" data-mode="genre" role="tab" aria-selected="false">
-        <span class="seg-ico">🏷</span> Genre
-      </button>
-    </div>
+  <!-- ─────────────────────────── Views ──────────────────────── -->
+  <main class="views" id="views">
 
-    <nav class="breadcrumb" id="breadcrumb" aria-label="Breadcrumb"></nav>
-  </section>
+    <!-- Home: hero + genre tiles + carousels -->
+    <section class="view view-home" id="home">
+      <div class="home-scroll" id="home-scroll">
+        <div id="hero"></div>
+        <div id="genre-tiles"></div>
+        <div id="rows"></div>
+        <div class="empty big" id="home-empty" hidden>Loading the network’s picks…</div>
+        <div class="verify-line" id="verify-line" hidden></div>
+      </div>
+    </section>
 
-  <!-- ─────────────────────── Two-pane body ──────────────────── -->
-  <main class="panes" id="panes">
-    <div class="pane pane-chips" id="chip-pane">
-      <div class="chips" id="chips"></div>
-      <div class="empty" id="chips-empty" hidden>No streamable songs right now.</div>
-    </div>
+    <!-- Browse: facet drill (chips over tracks) -->
+    <section class="view view-browse" id="browse" hidden>
+      <div class="controls">
+        <div class="segmented" id="mode-toggle" role="tablist" aria-label="Browse mode">
+          <button class="seg" data-mode="artist" role="tab" aria-selected="true">
+            <span class="seg-ico">👤</span> Artist
+          </button>
+          <button class="seg" data-mode="genre" role="tab" aria-selected="false">
+            <span class="seg-ico">🏷</span> Genre
+          </button>
+        </div>
+        <nav class="breadcrumb" id="breadcrumb" aria-label="Breadcrumb"></nav>
+      </div>
 
-    <div class="divider" id="divider" title="Drag to resize"></div>
+      <div class="panes" id="panes">
+        <div class="pane pane-chips" id="chip-pane">
+          <div class="chips" id="chips"></div>
+          <div class="empty" id="chips-empty" hidden>No streamable songs right now.</div>
+        </div>
+        <div class="divider" id="divider" title="Drag to resize"></div>
+        <div class="pane pane-tracks" id="track-pane">
+          <div class="track-head" id="track-head" hidden></div>
+          <div class="tracks" id="tracks"></div>
+          <div class="empty" id="track-empty">Pick an album to see its tracks.</div>
+        </div>
+      </div>
+    </section>
 
-    <div class="pane pane-tracks" id="track-pane">
-      <div class="track-head" id="track-head" hidden></div>
-      <div class="tracks" id="tracks"></div>
-      <div class="empty" id="track-empty">Pick an album to see its tracks.</div>
-    </div>
+    <!-- List: "See all" for a collection / search results -->
+    <section class="view view-list" id="list" hidden>
+      <div class="list-scroll">
+        <div class="list-head" id="list-head"></div>
+        <div class="tracks" id="list-tracks"></div>
+        <div class="empty" id="list-empty" hidden>Nothing here.</div>
+      </div>
+    </section>
   </main>
 
   <!-- ─────────────────────── Now playing ────────────────────── -->
   <div class="nowplaying" id="nowplaying" hidden>
-    <div class="np-art">♪</div>
+    <div class="np-art" id="np-art">♪</div>
     <div class="np-meta">
       <div class="np-title" id="np-title">—</div>
       <div class="np-artist" id="np-artist">—</div>
     </div>
     <div class="np-controls">
+      <button id="np-prev" class="np-btn np-side" aria-label="Previous">⏮</button>
       <button id="np-toggle" class="np-btn" aria-label="Play/Pause">▶</button>
+      <button id="np-next" class="np-btn np-side" aria-label="Next">⏭</button>
       <div class="np-seek">
         <span id="np-cur">0:00</span>
         <input id="np-bar" type="range" min="0" max="1000" value="0" step="1" />

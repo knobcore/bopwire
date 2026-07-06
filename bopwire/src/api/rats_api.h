@@ -23,6 +23,7 @@ extern "C" { typedef void* rats_client_t; }
 
 namespace mc { class BlockPropagator; }
 namespace mc::net { class RelayCreditTracker; }
+namespace mc::curation { class CollectionCurator; }
 namespace mc::moderation { struct Envelope; }   // #4 forgery_report handler
 
 namespace mc::api {
@@ -69,6 +70,12 @@ public:
     /// over `mini.hello`, carrying a `wallet` field set by the
     /// bopwire mini-node patch.
     void set_relay_tracker(net::RelayCreditTracker* rt) { relay_tracker_ = rt; }
+
+    /// Plug the deterministic Discover-feed generator in. The
+    /// collections.list / collections.get verbs answer from its cached
+    /// per-epoch CollectionSet; before the first generation completes they
+    /// reply {"status":"not_ready"} (mirrors the propagator gate).
+    void set_curator(curation::CollectionCurator* c) { curator_ = c; }
 
     /// Read-only handle to the in-memory swarm index so the full node
     /// TUI can render live song-count / member stats without going
@@ -124,6 +131,7 @@ private:
     rats_client_t               client_ = nullptr;
     BlockPropagator*            propagator_ = nullptr;
     net::RelayCreditTracker*    relay_tracker_ = nullptr;
+    curation::CollectionCurator* curator_ = nullptr;
     std::string                 audio_dir_;   // for forgery re-audit (#4)
 
     /// Mini-node librats peer_id → mini-node wallet (20-byte raw EVM

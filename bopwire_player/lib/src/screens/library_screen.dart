@@ -1,21 +1,13 @@
-// "Discover" tab — the user's window into every song on the chain.
+// Browse — the chain-catalog facet drill, in the same design language as
+// the Discover home and the web player: cover-art card grids for artists
+// and albums, gradient tiles for genres, gradient cards for playlists, and
+// an album track pane with cover art + Play all / Shuffle.
 //
-// Layout: a SegmentedButton at the top toggles the browse axis between
-// Artist and Genre (Album is no longer a top-level facet — it lives one
-// level deeper inside whichever artist you drill into). A breadcrumb
-// strip just below the toggle reflects the drill path; tap any segment
-// to jump back to it. The body splits into two panes:
-//
-//   * Top pane — a ChoiceChip grid that drills down through the
-//     hierarchy. Artist mode goes Artists → Albums; Genre mode goes
-//     Genres → Artists → Albums.
-//   * Bottom pane — the track list for whichever album the user has
-//     tapped. Empty until an album is picked.
-//
-// A drag handle separates the two panes (when both are visible); the
-// user can grab it and drag to give whichever side more room. Behaves
-// like a desktop splitter on Windows and a bottom-sheet gesture on
-// mobile — same code, different feel.
+// Drill: Artist mode goes Artists → Albums; Genre mode goes Genres →
+// Artists → Albums; the Playlists facet opens saved playlists into the
+// same track pane. On wide layouts the card grid and the track pane share
+// a draggable vertical split; on phones the open album takes the whole
+// view with a back button (mirrors the web player).
 
 import 'dart:async';
 
@@ -31,8 +23,9 @@ import '../services/librats_discovery.dart';
 import '../services/library_service.dart';
 import '../services/node_client.dart';
 import '../services/node_service.dart';
-import '../services/rats_client.dart';
 import '../services/playlist_service.dart';
+import '../services/rats_client.dart';   // SwarmVariant (download quality picker)
+import '../widgets/cover_art.dart';
 import 'dmca_screen.dart';
 
 enum _FacetMode { artist, genre, playlists }
@@ -65,34 +58,18 @@ class LibraryScreen extends StatefulWidget {
 class _LibraryScreenState extends State<LibraryScreen> {
   _FacetMode _mode = _FacetMode.artist;
 
-  // Drill state. Both null = root view; setting `_drillGenre` enters
-  // an artists-of-genre view (Genre mode only); setting `_drillArtist`
-  // enters an albums-of-artist view; setting `_selectedAlbum` opens
-  // the tracks pane at the bottom.
   String? _drillGenre;
   String? _drillArtist;
   String? _selectedAlbum;
-
-  /// Playlists facet: the id of the playlist whose tracks fill the bottom
-  /// pane — the exact same track view albums open into.
   String? _selectedPlaylistId;
+  double  _topFraction = 0.5;
 
-  /// Vertical split: fraction of body height the top pane occupies.
-  /// Drag handle below the top pane updates this within a clamp so
-  /// neither pane can ever fully collapse on the user.
-  double _topFraction = 0.5;
-
-  /// Subscription bookkeeping so the chain library auto-refreshes the
-  /// moment the first full-node handshake lands (cold boot).
   String _lastSeenHomePid = '';
   LibratsDiscovery? _disc;
 
   /// Periodic poller — pulls a fresh songs.list every 20 s while the
   /// tab is alive, so a peer going offline causes their tracks to
-  /// vanish without the user having to tap refresh. Cheap on the wire
-  /// (one swarm-size scan per song on the full node, no chain reads)
-  /// and indispensable now that swarm availability is strictly
-  /// connection-state driven.
+  /// vanish without the user having to tap refresh.
   Timer? _autoRefreshTimer;
 
   @override
@@ -107,7 +84,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       if (lib.loading) return;
       lib.refresh();
     });
-    // Keep the playlists facet (chips + track pane) in sync with edits.
     PlaylistService.instance
       ..ensureLoaded()
       ..addListener(_onPlaylistsChanged);
@@ -156,12 +132,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
         .playPlaylist(playlist, index, wallet.address);
   }
 
+  void _playAll(List<Song> tracks, {bool shuffle = false}) {
+    if (tracks.isEmpty) return;
+    var q = _TrackPane.sortTracks(tracks);
+    if (shuffle) q = List.of(q)..shuffle();
+    _play(q.first, q, 0);
+  }
+
   // ---- Bucket / sort helpers ------------------------------------------
-  //
-  // Tag spellings rarely line up — "FIDLAR" / "Fidlar", "Rock" / "rock"
-  // etc. all collide on the same audio. We group case-insensitively
-  // (`*KeyNorm`) and pick the most-frequent original spelling for
-  // display so the chip shows what the user actually has.
 
   String _artistKey(Song s) {
     final t = s.artist.trim();
@@ -189,8 +167,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return a.toLowerCase().compareTo(b.toLowerCase());
   }
 
-  /// Return the earliest non-zero year across a set of songs, or 0 when
-  /// none of them carry a year. Drives chronological album ordering.
   int _earliestYear(Iterable<Song> tracks) {
     int y = 0;
     for (final s in tracks) {
@@ -199,8 +175,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return y;
   }
 
-  /// Pre-flight: collapse the full song list down to the bucket the
-  /// current drill state needs.
   Iterable<Song> _drillFilter(List<Song> songs) {
     final wantedGenre  = _drillGenre?.toLowerCase();
     final wantedArtist = _drillArtist?.toLowerCase();
@@ -223,11 +197,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  void _onPillTapped(String key, _DrillLevel level) {
+  void _onCardTapped(String key, _DrillLevel level) {
     setState(() {
       switch (level) {
         case _DrillLevel.genre:
-          // Tapping the same genre again deselects.
           _drillGenre   = _drillGenre == key ? null : key;
           _drillArtist  = null;
           _selectedAlbum = null;
@@ -242,7 +215,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   void _crumbBack(int targetDepth) {
     setState(() {
-      // targetDepth 0 = root, 1 = first crumb, 2 = second crumb
       if (targetDepth < 3) _selectedAlbum = null;
       if (targetDepth < 2) _drillArtist   = null;
       if (targetDepth < 1) _drillGenre    = null;
@@ -254,37 +226,29 @@ class _LibraryScreenState extends State<LibraryScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Discover'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: () => context.read<LibraryProvider>().refresh(),
-          ),
-        ],
-      ),
       body: Consumer<LibraryProvider>(
         builder: (context, lib, _) {
           if (lib.loading && lib.songs.isEmpty) {
             return const Center(child: CircularProgressIndicator());
           }
           if (lib.error != null && lib.songs.isEmpty) {
-            return Center(child: Text('Error: ${lib.error}'));
+            return _EmptyState(
+              icon: Icons.cloud_off,
+              text: 'Error: ${lib.error}',
+              onRetry: () => lib.refresh(),
+            );
           }
           if (lib.songs.isEmpty) {
-            return const Center(
-              child: Text('No songs on chain yet — scan a folder to upload.'),
+            return _EmptyState(
+              icon: Icons.library_music_outlined,
+              text: 'No songs on chain yet — scan a folder to upload.',
+              onRetry: () => lib.refresh(),
             );
           }
           return Column(
             children: [
-              _ModeToolbar(
-                mode: _mode,
-                onChange: _selectMode,
-              ),
-              _Breadcrumb(
-                segments: _breadcrumb(),
-              ),
+              _ModeToolbar(mode: _mode, onChange: _selectMode),
+              _Breadcrumb(segments: _breadcrumb()),
               Expanded(child: _splitBody(lib)),
             ],
           );
@@ -310,18 +274,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Widget _splitBody(LibraryProvider lib) {
-    // Use filteredSongs so the rendered library hides entries whose
-    // serving peer is currently offline (LibraryProvider.filteredSongs
-    // drops swarmSize == 0). Without this, a song that was uploaded
-    // by a phone that later disconnected stays visible but unstreamable
-    // — the original "songs stay in list when user disconnects" bug.
+    // filteredSongs hides entries whose serving peer is currently offline
+    // (swarmSize == 0) so cards never resolve to zero playable tracks.
     final live = lib.filteredSongs;
     final isPlaylists = _mode == _FacetMode.playlists;
 
-    // Bottom-pane tracks. In playlists mode, the selected playlist's songs
-    // resolved to live (online) tracks in the playlist's own order — playlists
-    // open in the exact same track pane albums do. Otherwise, the selected
-    // album's tracks.
     final Playlist? selPlaylist =
         isPlaylists ? _currentPlaylist(PlaylistService.instance) : null;
     final List<Song> selectedTracks;
@@ -348,60 +305,70 @@ class _LibraryScreenState extends State<LibraryScreen> {
       bottomTitle = _selectedAlbum ?? '';
     }
 
+    final hasBottom =
+        isPlaylists ? selPlaylist != null : _selectedAlbum != null;
+    final orderedTracks = isPlaylists
+        ? selectedTracks                       // playlist keeps its own order
+        : _TrackPane.sortTracks(selectedTracks);
+
+    void closePane() => setState(() {
+      if (isPlaylists) {
+        _selectedPlaylistId = null;
+      } else {
+        _selectedAlbum = null;
+      }
+    });
+
+    final narrow = MediaQuery.of(context).size.width < 600;
+    if (hasBottom && narrow) {
+      // Phone: the open album/playlist takes the whole view (a tiny split
+      // pane is useless at 360 px) — back arrow returns to the grid.
+      return _TrackPane(
+        albumName:      bottomTitle,
+        artistFallback: isPlaylists ? null : _drillArtist,
+        isPlaylist:     isPlaylists,
+        tracks:         orderedTracks,
+        onPlay:         _play,
+        onPlayAll:      () => _playAll(orderedTracks),
+        onShuffle:      () => _playAll(orderedTracks, shuffle: true),
+        onClose:        closePane,
+        showBack:       true,
+      );
+    }
+
     return LayoutBuilder(
       builder: (context, constraints) {
         final totalH = constraints.maxHeight;
-        // When nothing is selected the bottom pane collapses; the top
-        // pane gets all the room. Once a pick lands the drag handle
-        // springs up and the two share according to _topFraction.
-        final hasBottom =
-            isPlaylists ? selPlaylist != null : _selectedAlbum != null;
-        final topH = hasBottom ? totalH * _topFraction : totalH;
+        final topH    = hasBottom ? totalH * _topFraction : totalH;
         final bottomH = hasBottom ? totalH - topH - _kHandleHeight : 0.0;
         return Stack(
           children: [
             Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              height: topH,
+              top: 0, left: 0, right: 0, height: topH,
               child: isPlaylists ? _playlistPane() : _topPane(lib),
             ),
             if (hasBottom) ...[
               Positioned(
-                top: topH,
-                left: 0,
-                right: 0,
-                height: _kHandleHeight,
+                top: topH, left: 0, right: 0, height: _kHandleHeight,
                 child: _DragHandle(
-                  onDelta: (dy) {
-                    setState(() {
-                      _topFraction = (_topFraction + dy / totalH)
-                          .clamp(0.20, 0.80);
-                    });
-                  },
+                  onDelta: (dy) => setState(() {
+                    _topFraction =
+                        (_topFraction + dy / totalH).clamp(0.20, 0.80);
+                  }),
                 ),
               ),
               Positioned(
-                top: topH + _kHandleHeight,
-                left: 0,
-                right: 0,
-                height: bottomH,
+                top: topH + _kHandleHeight, left: 0, right: 0, height: bottomH,
                 child: _TrackPane(
                   albumName:      bottomTitle,
                   artistFallback: isPlaylists ? null : _drillArtist,
-                  // Albums sort by track number; a playlist keeps its order.
-                  tracks:         isPlaylists
-                      ? selectedTracks
-                      : _TrackPane.sortTracks(selectedTracks),
+                  isPlaylist:     isPlaylists,
+                  tracks:         orderedTracks,
                   onPlay:         _play,
-                  onClose:        () => setState(() {
-                    if (isPlaylists) {
-                      _selectedPlaylistId = null;
-                    } else {
-                      _selectedAlbum = null;
-                    }
-                  }),
+                  onPlayAll:      () => _playAll(orderedTracks),
+                  onShuffle:      () => _playAll(orderedTracks, shuffle: true),
+                  onClose:        closePane,
+                  showBack:       false,
                 ),
               ),
             ],
@@ -417,40 +384,38 @@ class _LibraryScreenState extends State<LibraryScreen> {
     for (final p in svc.playlists) {
       if (p.id == id) return p;
     }
-    return null; // selected playlist was deleted — bottom pane collapses
+    return null; // selected playlist was deleted — pane collapses
   }
 
-  /// Top pane for the playlists facet: one chip per saved playlist (tap fills
-  /// the track pane; long-press/right-click for add/rename/delete) plus a
-  /// "New playlist" chip.
+  /// Playlists facet: gradient cards (tap opens; long-press / right-click
+  /// for add/rename/delete) plus a "New playlist" card.
   Widget _playlistPane() {
     final pls = PlaylistService.instance.playlists;
-    return SingleChildScrollView(
+    return GridView.builder(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-      child: Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: [
-          for (final pl in pls)
-            _DiscoverChip(
-              icon:     Icons.queue_music,
-              label:    '${pl.name}  (${pl.songs.length})',
-              selected: _selectedPlaylistId == pl.id,
-              onTap: () => setState(() {
-                _selectedPlaylistId =
-                    _selectedPlaylistId == pl.id ? null : pl.id;
-              }),
-              onContextMenu: (pos) => _playlistMenu(pos, pl),
-            ),
-          _DiscoverChip(
-            icon:     Icons.add,
-            label:    'New playlist',
-            selected: false,
-            onTap:    _createPlaylistDialog,
-            onContextMenu: (_) {},
-          ),
-        ],
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 190,
+        mainAxisSpacing: 10,
+        crossAxisSpacing: 10,
+        childAspectRatio: 1.9,
       ),
+      itemCount: pls.length + 1,
+      itemBuilder: (context, i) {
+        if (i == pls.length) {
+          return _NewPlaylistCard(onTap: _createPlaylistDialog);
+        }
+        final pl = pls[i];
+        return _PlaylistCard(
+          name:     pl.name,
+          count:    pl.songs.length,
+          selected: _selectedPlaylistId == pl.id,
+          onTap: () => setState(() {
+            _selectedPlaylistId =
+                _selectedPlaylistId == pl.id ? null : pl.id;
+          }),
+          onMenu: (pos) => _playlistMenu(pos, pl),
+        );
+      },
     );
   }
 
@@ -573,7 +538,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
               itemBuilder: (ctx, i) {
                 final s = candidates[i];
                 return ListTile(
-                  leading: const Icon(Icons.music_note),
+                  leading: ClipRRect(
+                    borderRadius: BorderRadius.circular(6),
+                    child: CoverArt(
+                        seed: seedFromHash(s.contentHash), size: 34),
+                  ),
                   title: Text(
                       s.title.isEmpty ? s.contentHash.substring(0, 12) : s.title),
                   subtitle: Text(s.artist),
@@ -589,8 +558,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Widget _topPane(LibraryProvider lib) {
     final level = _currentLevel();
-    final pills = _pillsFor(level, lib);
-    if (pills.isEmpty) {
+    final cards = _cardsFor(level, lib);
+    if (cards.isEmpty) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(32),
@@ -603,13 +572,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
         ),
       );
     }
-    return SingleChildScrollView(
+    final isTiles = level == _DrillLevel.genre;
+    return GridView.builder(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-      child: Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: pills,
+      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: isTiles ? 190 : 150,
+        mainAxisSpacing: 10,
+        crossAxisSpacing: 10,
+        childAspectRatio: isTiles ? 1.9 : 0.74,
       ),
+      itemCount: cards.length,
+      itemBuilder: (context, i) => cards[i],
     );
   }
 
@@ -619,10 +592,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return _mode == _FacetMode.artist ? _DrillLevel.artist : _DrillLevel.genre;
   }
 
-  List<Widget> _pillsFor(_DrillLevel level, LibraryProvider lib) {
-    // Same rule as _splitBody — pills are derived from songs whose
-    // serving peer is currently online so we don't pop up genre/artist
-    // chips that resolve to zero playable tracks.
+  List<Widget> _cardsFor(_DrillLevel level, LibraryProvider lib) {
     final scoped = _drillFilter(lib.filteredSongs).toList();
     switch (level) {
       case _DrillLevel.genre:
@@ -630,12 +600,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final keys = buckets.keys.toList()..sort(_sortAlpha);
         return [
           for (final k in keys)
-            _DiscoverChip(
-              icon:     Icons.style_outlined,
-              label:    '$k  (${buckets[k]!.length})',
-              selected: false,
-              onTap:    () => _onPillTapped(k, _DrillLevel.genre),
-              onContextMenu: (pos) => _menuForBucket(pos, k, buckets[k]!),
+            _GenreTileCard(
+              name:  k,
+              count: buckets[k]!.length,
+              onTap: () => _onCardTapped(k, _DrillLevel.genre),
+              onMenu: (pos) => _menuForBucket(pos, k, buckets[k]!),
             ),
         ];
       case _DrillLevel.artist:
@@ -643,18 +612,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final keys = buckets.keys.toList()..sort(_sortAlpha);
         return [
           for (final k in keys)
-            _DiscoverChip(
-              icon:     Icons.person_outline,
-              label:    '$k  (${buckets[k]!.length})',
+            _FacetCard(
+              seed:     seedFromName(k),
+              label:    k,
+              sublabel: '${buckets[k]!.length} '
+                        'track${buckets[k]!.length == 1 ? '' : 's'}',
               selected: false,
-              onTap:    () => _onPillTapped(k, _DrillLevel.artist),
-              onContextMenu: (pos) => _menuForBucket(pos, k, buckets[k]!),
+              onTap:    () => _onCardTapped(k, _DrillLevel.artist),
+              onMenu:   (pos) => _menuForBucket(pos, k, buckets[k]!),
+              onPlay:   () => _playAll(buckets[k]!),
             ),
         ];
       case _DrillLevel.album:
         final buckets = _bucketByNorm(scoped, _albumKey, _albumKeyNorm);
-        // Albums ordered chronologically by earliest tagged year; albums
-        // without any year fall to the end alphabetically.
         final keys = buckets.keys.toList()..sort((a, b) {
           final ya = _earliestYear(buckets[a]!);
           final yb = _earliestYear(buckets[b]!);
@@ -665,21 +635,25 @@ class _LibraryScreenState extends State<LibraryScreen> {
         });
         return [
           for (final k in keys)
-            _DiscoverChip(
-              icon:     Icons.album_outlined,
-              label:    _formatAlbumLabel(k, buckets[k]!),
+            _FacetCard(
+              // Album art keys off its first track so the album keeps one
+              // face everywhere (matches the web player + My Library).
+              seed:     seedFromHash(
+                  _TrackPane.sortTracks(buckets[k]!).first.contentHash),
+              label:    k,
+              sublabel: _albumSublabel(k, buckets[k]!),
               selected: _selectedAlbum?.toLowerCase() == k.toLowerCase(),
-              onTap:    () => _onPillTapped(k, _DrillLevel.album),
-              onContextMenu: (pos) => _menuForBucket(pos, k, buckets[k]!),
+              onTap:    () => _onCardTapped(k, _DrillLevel.album),
+              onMenu:   (pos) => _menuForBucket(pos, k, buckets[k]!),
+              onPlay:   () => _playAll(buckets[k]!),
             ),
         ];
     }
   }
 
   /// Group [items] by `norm(item)` and pick the most-common spelling of
-  /// `display(item)` as the bucket key — so two tag variants like
-  /// "FIDLAR" and "Fidlar" collapse to one chip with the spelling that
-  /// appears most often in the user's library.
+  /// `display(item)` as the bucket key — "FIDLAR" + "Fidlar" collapse to
+  /// one card with whichever spelling dominates the tags.
   Map<String, List<Song>> _bucketByNorm(
       List<Song> items,
       String Function(Song) display,
@@ -695,9 +669,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
     final out = <String, List<Song>>{};
     normToVariants.forEach((n, variants) {
-      // Pick the spelling with the most occurrences; ties break in
-      // favor of the longer string (so "FIDLAR" beats "fidlar"
-      // when both appear once).
       String best = variants.keys.first;
       int    bestCount = variants[best]!;
       variants.forEach((d, c) {
@@ -711,11 +682,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return out;
   }
 
-  String _formatAlbumLabel(String name, List<Song> tracks) {
+  String _albumSublabel(String name, List<Song> tracks) {
     final year = _earliestYear(tracks);
     final n = tracks.length;
-    if (year > 0) return '$name  ($year · $n)';
-    return '$name  ($n)';
+    final t = '$n track${n == 1 ? '' : 's'}';
+    return year > 0 ? '$year · $t' : t;
   }
 
   Future<void> _menuForBucket(Offset position,
@@ -760,8 +731,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ],
     );
     if (picked == 'play' && tracks.isNotEmpty) {
-      final sorted = _TrackPane.sortTracks(tracks);
-      _play(sorted.first, sorted, 0);
+      _playAll(tracks);
     } else if (picked == 'download') {
       DownloadProvider.instance.enqueueAlbum(label, tracks);
       if (!mounted) return;
@@ -790,6 +760,41 @@ class _CrumbSeg {
 
 const double _kHandleHeight = 14;
 
+class _EmptyState extends StatelessWidget {
+  const _EmptyState({required this.icon, required this.text, this.onRetry});
+  final IconData      icon;
+  final String        text;
+  final VoidCallback? onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 48,
+                color: theme.colorScheme.onSurface.withOpacity(.4)),
+            const SizedBox(height: 14),
+            Text(text, textAlign: TextAlign.center,
+                style: theme.textTheme.bodyMedium),
+            if (onRetry != null) ...[
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: onRetry,
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('Retry'),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _ModeToolbar extends StatelessWidget {
   const _ModeToolbar({required this.mode, required this.onChange});
   final _FacetMode              mode;
@@ -798,7 +803,7 @@ class _ModeToolbar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
       child: Row(
         children: [
           Expanded(
@@ -807,7 +812,7 @@ class _ModeToolbar extends StatelessWidget {
               segments: _FacetMode.values.map((m) => ButtonSegment(
                 value: m,
                 label: Text(m.label),
-                icon:  Icon(m.icon),
+                icon:  Icon(m.icon, size: 16),
               )).toList(),
               selected: {mode},
               onSelectionChanged: (s) => onChange(s.first),
@@ -869,34 +874,278 @@ class _Breadcrumb extends StatelessWidget {
   }
 }
 
-class _DiscoverChip extends StatelessWidget {
-  const _DiscoverChip({
-    required this.icon,
+// ---- Cards (same shapes as My Library / the web player) -----------------
+
+class _FacetCard extends StatelessWidget {
+  const _FacetCard({
+    required this.seed,
     required this.label,
+    required this.sublabel,
     required this.selected,
     required this.onTap,
-    required this.onContextMenu,
+    required this.onMenu,
+    required this.onPlay,
   });
-  final IconData                   icon;
-  final String                     label;
-  final bool                       selected;
-  final VoidCallback               onTap;
-  final void Function(Offset pos)  onContextMenu;
+  final List<int>            seed;
+  final String               label;
+  final String               sublabel;
+  final bool                 selected;
+  final VoidCallback         onTap;
+  final ValueChanged<Offset> onMenu;
+  final VoidCallback         onPlay;
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return GestureDetector(
-      onSecondaryTapDown: (d) => onContextMenu(d.globalPosition),
-      onLongPressStart:   (d) => onContextMenu(d.globalPosition),
-      child: ChoiceChip(
-        avatar:   Icon(icon, size: 18),
-        label:    Text(label, overflow: TextOverflow.ellipsis),
-        selected: selected,
-        onSelected: (_) => onTap(),
+      onSecondaryTapDown: (d) => onMenu(d.globalPosition),
+      onLongPressStart:   (d) => onMenu(d.globalPosition),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            color: theme.colorScheme.surfaceContainerHighest.withOpacity(.35),
+            border: Border.all(
+              color: selected ? theme.colorScheme.primary : Colors.transparent,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: LayoutBuilder(
+                  builder: (context, c) => Stack(
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(9),
+                        child: CoverArt(seed: seed, size: c.maxWidth),
+                      ),
+                      Positioned(
+                        right: 6, bottom: 6,
+                        child: InkWell(
+                          onTap: onPlay,
+                          customBorder: const CircleBorder(),
+                          child: CircleAvatar(
+                            radius: 13,
+                            backgroundColor: selected
+                                ? theme.colorScheme.primary
+                                : theme.colorScheme.primary.withOpacity(.9),
+                            child: Icon(
+                              selected ? Icons.check : Icons.play_arrow,
+                              size: 15,
+                              color: theme.colorScheme.onPrimary,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                label,
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(fontWeight: FontWeight.w700),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              Text(
+                sublabel,
+                style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.onSurface.withOpacity(.6)),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
 }
+
+class _GenreTileCard extends StatelessWidget {
+  const _GenreTileCard({
+    required this.name,
+    required this.count,
+    required this.onTap,
+    required this.onMenu,
+  });
+  final String               name;
+  final int                  count;
+  final VoidCallback         onTap;
+  final ValueChanged<Offset> onMenu;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onSecondaryTapDown: (d) => onMenu(d.globalPosition),
+      onLongPressStart:   (d) => onMenu(d.globalPosition),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            gradient: tileGradient(seedFromName(name)),
+          ),
+          child: Stack(
+            children: [
+              Positioned(
+                top: 0, right: 0,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.black38,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text('$count',
+                      style: const TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white)),
+                ),
+              ),
+              Align(
+                alignment: Alignment.bottomLeft,
+                child: Text(
+                  name,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w800,
+                    fontSize: 13.5,
+                    color: Colors.white,
+                    shadows: [Shadow(blurRadius: 6, color: Colors.black54)],
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PlaylistCard extends StatelessWidget {
+  const _PlaylistCard({
+    required this.name,
+    required this.count,
+    required this.selected,
+    required this.onTap,
+    required this.onMenu,
+  });
+  final String               name;
+  final int                  count;
+  final bool                 selected;
+  final VoidCallback         onTap;
+  final ValueChanged<Offset> onMenu;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return GestureDetector(
+      onSecondaryTapDown: (d) => onMenu(d.globalPosition),
+      onLongPressStart:   (d) => onMenu(d.globalPosition),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            gradient: tileGradient(seedFromName(name)),
+            border: Border.all(
+              color: selected ? theme.colorScheme.primary : Colors.transparent,
+              width: 1.5,
+            ),
+          ),
+          child: Stack(
+            children: [
+              const Positioned(
+                top: 0, left: 0,
+                child: Icon(Icons.queue_music, size: 18, color: Colors.white70),
+              ),
+              Positioned(
+                top: 0, right: 0,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.black38,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text('$count',
+                      style: const TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white)),
+                ),
+              ),
+              Align(
+                alignment: Alignment.bottomLeft,
+                child: Text(
+                  name,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w800,
+                    fontSize: 13.5,
+                    color: Colors.white,
+                    shadows: [Shadow(blurRadius: 6, color: Colors.black54)],
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _NewPlaylistCard extends StatelessWidget {
+  const _NewPlaylistCard({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: theme.dividerColor),
+          color: theme.colorScheme.surfaceContainerHighest.withOpacity(.25),
+        ),
+        child: Center(
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.add, size: 18, color: theme.colorScheme.primary),
+              const SizedBox(width: 6),
+              Text('New playlist',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                      color: theme.colorScheme.primary)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---- Split-pane bits -------------------------------------------------------
 
 class _DragHandle extends StatelessWidget {
   const _DragHandle({required this.onDelta});
@@ -932,15 +1181,23 @@ class _TrackPane extends StatelessWidget {
   const _TrackPane({
     required this.albumName,
     required this.artistFallback,
+    required this.isPlaylist,
     required this.tracks,
     required this.onPlay,
+    required this.onPlayAll,
+    required this.onShuffle,
     required this.onClose,
+    required this.showBack,
   });
-  final String           albumName;
-  final String?          artistFallback;
-  final List<Song>       tracks;
+  final String       albumName;
+  final String?      artistFallback;
+  final bool         isPlaylist;
+  final List<Song>   tracks;
   final void Function(Song song, List<Song> playlist, int idx) onPlay;
-  final VoidCallback     onClose;
+  final VoidCallback onPlayAll;
+  final VoidCallback onShuffle;
+  final VoidCallback onClose;
+  final bool         showBack;   // phone: full-height pane with ← back
 
   static List<Song> sortTracks(List<Song> tracks) {
     final out = [...tracks];
@@ -965,21 +1222,32 @@ class _TrackPane extends StatelessWidget {
     final year = tracks
         .map((s) => s.year)
         .firstWhere((y) => y > 0, orElse: () => 0);
+    final seed = isPlaylist || tracks.isEmpty
+        ? seedFromName(albumName)
+        : seedFromHash(tracks.first.contentHash);
     return Material(
       elevation: 4,
       color: theme.colorScheme.surface,
       child: Column(
         children: [
           Container(
-            padding: const EdgeInsets.fromLTRB(12, 8, 6, 8),
+            padding: const EdgeInsets.fromLTRB(8, 8, 6, 8),
             decoration: BoxDecoration(
               color: theme.colorScheme.surfaceContainerHighest,
             ),
             child: Row(
               children: [
-                Icon(Icons.album_outlined,
-                    size: 18, color: theme.colorScheme.primary),
-                const SizedBox(width: 8),
+                if (showBack)
+                  IconButton(
+                    tooltip: 'Back',
+                    icon: const Icon(Icons.arrow_back, size: 20),
+                    onPressed: onClose,
+                  ),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: CoverArt(seed: seed, size: 40),
+                ),
+                const SizedBox(width: 10),
                 Expanded(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -989,7 +1257,7 @@ class _TrackPane extends StatelessWidget {
                         albumName,
                         maxLines: 1, overflow: TextOverflow.ellipsis,
                         style: theme.textTheme.titleSmall?.copyWith(
-                          fontWeight: FontWeight.w600),
+                          fontWeight: FontWeight.w700),
                       ),
                       Text(
                         [
@@ -1005,10 +1273,22 @@ class _TrackPane extends StatelessWidget {
                   ),
                 ),
                 IconButton(
-                  tooltip: 'Close',
-                  icon: const Icon(Icons.close, size: 20),
-                  onPressed: onClose,
+                  tooltip: 'Play all',
+                  icon: Icon(Icons.play_circle_fill,
+                      size: 26, color: theme.colorScheme.primary),
+                  onPressed: tracks.isEmpty ? null : onPlayAll,
                 ),
+                IconButton(
+                  tooltip: 'Shuffle',
+                  icon: const Icon(Icons.shuffle, size: 20),
+                  onPressed: tracks.isEmpty ? null : onShuffle,
+                ),
+                if (!showBack)
+                  IconButton(
+                    tooltip: 'Close',
+                    icon: const Icon(Icons.close, size: 20),
+                    onPressed: onClose,
+                  ),
               ],
             ),
           ),
@@ -1152,8 +1432,12 @@ class _SongRowState extends State<_SongRow> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final s = widget.song;
     final isLocal = _localFor(s.contentHash);
+    final playing = context.select<PlayerProvider, String>(
+        (p) => p.currentSong?.contentHash ?? '');
+    final isPlaying = playing == s.contentHash;
     final dl = context.watch<DownloadProvider>();
     DownloadJob? activeJob;
     for (final j in dl.activeJobs) {
@@ -1188,17 +1472,37 @@ class _SongRowState extends State<_SongRow> {
     final playStr = _formatPlayCount(s.playCount);
     return ListTile(
       dense: true,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 8),
       leading: SizedBox(
-        width: 28,
-        child: Text(
-          s.trackNumber > 0 ? '${s.trackNumber}' : '${widget.index + 1}',
-          textAlign: TextAlign.right,
-          style: Theme.of(context).textTheme.bodySmall,
+        width: 64,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 20,
+              child: Text(
+                s.trackNumber > 0 ? '${s.trackNumber}' : '${widget.index + 1}',
+                textAlign: TextAlign.right,
+                style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurface.withOpacity(.5)),
+              ),
+            ),
+            const SizedBox(width: 8),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: CoverArt(
+                  seed: seedFromHash(s.contentHash), size: 34),
+            ),
+          ],
         ),
       ),
       title: Text(
         s.title.isEmpty ? '(untitled)' : s.title,
         maxLines: 1, overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontWeight: isPlaying ? FontWeight.w700 : FontWeight.w500,
+          color: isPlaying ? theme.colorScheme.primary : null,
+        ),
       ),
       subtitle: Text(
         '${s.durationFormatted}  •  ▶ $playStr',

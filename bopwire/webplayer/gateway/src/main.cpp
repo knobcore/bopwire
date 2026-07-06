@@ -3,7 +3,9 @@
 // HTTPS/JSON façade (behind Caddy) over the librats network. Serves the Discover
 // feed, streams audio pulled from the swarm, and runs honest play sessions so a
 // web play mints the artist/seeder/mini reward — never the listener.
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -11,6 +13,7 @@
 #include <cstring>
 #include <deque>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -212,6 +215,73 @@ int main() {
         return arr;
     };
 
+    // collections cache (deterministic per-epoch Discover feed). The node
+    // only regenerates at epoch boundaries, so a 30 s TTL is already generous;
+    // the join against the live catalog is re-done on refresh so availability
+    // (who's seeding right now) tracks reality while MEMBERSHIP stays the
+    // node's deterministic answer — dim, don't drop.
+    std::mutex col_mu;
+    json col_cache;   // fully joined /api/collections response
+    std::chrono::steady_clock::time_point col_at{};
+
+    auto load_collections = [&]() -> json {
+        std::lock_guard<std::mutex> lk(col_mu);
+        auto now = std::chrono::steady_clock::now();
+        if (!col_cache.is_null() &&
+            now - col_at < std::chrono::seconds(30)) return col_cache;
+        const std::string node = link.pick_full_node();
+        if (node.empty()) throw std::runtime_error("no_node");
+        json r = link.rpc_via_relay(node, "collections.list",
+                                    json{{"embed", true}}, 15000);
+        if (r.value("status", std::string()) != "ok")
+            throw std::runtime_error(r.value("status", std::string("error")));
+        const json body = r.value("body", json::object());
+
+        // Live catalog keyed by hash — the availability/swarmSize overlay.
+        std::unordered_map<std::string, json> live;
+        try {
+            for (const auto& s : load_catalog())
+                live[s.value("contentHash", std::string())] = s;
+        } catch (...) { /* collections still render, just all dimmed */ }
+
+        const json emb = body.value("songs", json::object());
+        json rows = json::array();
+        for (const auto& c : body.value("collections", json::array())) {
+            json songs = json::array();
+            for (const auto& hj : c.value("song_hashes", json::array())) {
+                if (!hj.is_string()) continue;
+                const std::string h = hj.get<std::string>();
+                if (auto it = live.find(h); it != live.end()) {
+                    json s = it->second;
+                    s["available"] = true;
+                    songs.push_back(std::move(s));
+                } else if (emb.contains(h)) {
+                    // On the deterministic list but not seeded right now.
+                    json s = normalize_song(emb.at(h));
+                    s["available"] = false;
+                    songs.push_back(std::move(s));
+                }
+            }
+            rows.push_back(json{
+                {"id",       c.value("id", "")},
+                {"kind",     c.value("kind", "")},
+                {"title",    c.value("title", "")},
+                {"subtitle", c.value("subtitle", "")},
+                {"facet",    c.value("facet", "")},
+                {"songs",    std::move(songs)},
+            });
+        }
+        col_cache = json{
+            {"epoch",             body.value("epoch", 0ull)},
+            {"snapshotHeight",    body.value("snapshot_height", 0u)},
+            {"snapshotBlockHash", body.value("snapshot_block_hash", "")},
+            {"contentDigest",     body.value("content_digest", "")},
+            {"collections",       std::move(rows)},
+        };
+        col_at = now;
+        return col_cache;
+    };
+
     // active play sessions (reward lifecycle)
     struct Play { std::string hash, node; };
     std::mutex play_mu;
@@ -250,8 +320,129 @@ int main() {
         res.set_content(out.dump(), "application/json");
     });
 
-    svr.Get("/api/songs", [&](const httplib::Request&, httplib::Response& res) {
-        try { res.set_content(load_catalog().dump(), "application/json"); }
+    // /api/songs — the catalog, served from the 8 s cache. With any of
+    // ?q/?artist/?genre/?album/?offset/?limit/?sort the reply becomes a
+    // filtered, sorted SLICE ({total,offset,limit,songs}) so the browser
+    // never downloads the whole catalog; bare /api/songs keeps the legacy
+    // full-array shape for old clients.
+    svr.Get("/api/songs", [&](const httplib::Request& req, httplib::Response& res) {
+        try {
+            const json cat = load_catalog();
+            const bool paged = req.has_param("q")      || req.has_param("artist") ||
+                               req.has_param("genre")  || req.has_param("album")  ||
+                               req.has_param("offset") || req.has_param("limit")  ||
+                               req.has_param("sort");
+            if (!paged) { res.set_content(cat.dump(), "application/json"); return; }
+
+            auto lc = [](std::string s) {
+                for (auto& c : s) c = (char) std::tolower((unsigned char) c);
+                return s;
+            };
+            const std::string q      = lc(req.get_param_value("q"));
+            const std::string artist = lc(req.get_param_value("artist"));
+            const std::string genre  = lc(req.get_param_value("genre"));
+            const std::string album  = lc(req.get_param_value("album"));
+
+            std::vector<json> hits;
+            for (const auto& s : cat) {
+                if (!artist.empty() && lc(s.value("artist", "")) != artist) continue;
+                if (!genre.empty()  && lc(s.value("genre",  "")) != genre)  continue;
+                if (!album.empty()  && lc(s.value("album",  "")) != album)  continue;
+                if (!q.empty() &&
+                    lc(s.value("title",  "")).find(q) == std::string::npos &&
+                    lc(s.value("artist", "")).find(q) == std::string::npos &&
+                    lc(s.value("album",  "")).find(q) == std::string::npos &&
+                    lc(s.value("genre",  "")).find(q) == std::string::npos) continue;
+                hits.push_back(s);
+            }
+            const std::string sort = req.get_param_value("sort");
+            if (sort == "plays") {
+                std::stable_sort(hits.begin(), hits.end(), [](const json& a, const json& b) {
+                    return a.value("playCount", 0ull) > b.value("playCount", 0ull); });
+            } else if (sort == "title") {
+                std::stable_sort(hits.begin(), hits.end(), [](const json& a, const json& b) {
+                    return a.value("title", "") < b.value("title", ""); });
+            } else if (sort == "album") {
+                std::stable_sort(hits.begin(), hits.end(), [](const json& a, const json& b) {
+                    const auto aa = a.value("album", ""), ba = b.value("album", "");
+                    if (aa != ba) return aa < ba;
+                    return a.value("trackNumber", 0) < b.value("trackNumber", 0); });
+            }
+            size_t offset = 0, limit = 100;
+            try { if (req.has_param("offset")) offset = std::stoul(req.get_param_value("offset")); } catch (...) {}
+            try { if (req.has_param("limit"))  limit  = std::stoul(req.get_param_value("limit"));  } catch (...) {}
+            if (limit < 1) limit = 1; if (limit > 500) limit = 500;
+            if (offset > hits.size()) offset = hits.size();
+            json page = json::array();
+            for (size_t i = offset; i < hits.size() && page.size() < limit; ++i)
+                page.push_back(std::move(hits[i]));
+            res.set_content(json{
+                {"total",  hits.size()},
+                {"offset", offset},
+                {"limit",  limit},
+                {"songs",  std::move(page)},
+            }.dump(), "application/json");
+        }
+        catch (const std::exception& e) { err(res, 503, e.what()); }
+    });
+
+    // /api/facets — distinct artists / genres / years of the live catalog
+    // with counts. A few KB; the Browse drill renders from this and then
+    // pages /api/songs?artist=… per drill instead of holding the catalog.
+    svr.Get("/api/facets", [&](const httplib::Request&, httplib::Response& res) {
+        try {
+            const json cat = load_catalog();
+            auto lc = [](std::string s) {
+                for (auto& c : s) c = (char) std::tolower((unsigned char) c);
+                return s;
+            };
+            std::map<std::string, std::pair<std::string, size_t>> artists, genres;
+            std::map<int, size_t> years;
+            for (const auto& s : cat) {
+                const std::string ar = s.value("artist", ""), ge = s.value("genre", "");
+                if (!ar.empty()) { auto& e = artists[lc(ar)]; if (e.first.empty()) e.first = ar; ++e.second; }
+                if (!ge.empty()) { auto& e = genres[lc(ge)];  if (e.first.empty()) e.first = ge; ++e.second; }
+                const int y = s.value("year", 0);
+                if (y > 0) ++years[y];
+            }
+            auto facet_arr = [](const auto& m) {
+                json out = json::array();
+                for (const auto& [k, v] : m)
+                    out.push_back({{"name", v.first}, {"count", v.second}});
+                return out;
+            };
+            json yr = json::array();
+            for (const auto& [y, n] : years) yr.push_back({{"year", y}, {"count", n}});
+            res.set_content(json{
+                {"total",   cat.size()},
+                {"artists", facet_arr(artists)},
+                {"genres",  facet_arr(genres)},
+                {"years",   std::move(yr)},
+            }.dump(), "application/json");
+        }
+        catch (const std::exception& e) { err(res, 503, e.what()); }
+    });
+
+    // /api/collections — the node's deterministic per-epoch Discover feed,
+    // joined against the live catalog (offline members kept but flagged
+    // available:false so the client dims them instead of dropping them).
+    svr.Get("/api/collections", [&](const httplib::Request&, httplib::Response& res) {
+        try { res.set_content(load_collections().dump(), "application/json"); }
+        catch (const std::exception& e) { err(res, 503, e.what()); }
+    });
+
+    svr.Get(R"(/api/collections/(.+))", [&](const httplib::Request& req, httplib::Response& res) {
+        try {
+            const json all = load_collections();
+            const std::string id = req.matches[1];
+            for (const auto& c : all.value("collections", json::array())) {
+                if (c.value("id", std::string()) == id) {
+                    res.set_content(c.dump(), "application/json");
+                    return;
+                }
+            }
+            err(res, 404, "unknown collection");
+        }
         catch (const std::exception& e) { err(res, 503, e.what()); }
     });
 

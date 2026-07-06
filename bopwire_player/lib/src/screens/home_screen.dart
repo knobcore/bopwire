@@ -7,7 +7,8 @@ import '../providers/download_provider.dart';
 import '../models/song.dart';
 import '../services/librats_discovery.dart';
 import '../services/rats_client.dart';
-import 'library_screen.dart';
+import '../widgets/cover_art.dart';
+import 'discover_screen.dart';
 import 'local_library_screen.dart';
 import 'chat_screen.dart';
 import 'wallet_screen.dart';
@@ -24,7 +25,7 @@ class _HomeScreenState extends State<HomeScreen> {
   int _selectedIndex = 0;
 
   static const _screens = [
-    LibraryScreen(),
+    DiscoverScreen(),
     LocalLibraryScreen(),
     ChatScreen(),
     WalletScreen(),
@@ -59,7 +60,9 @@ class _HomeScreenState extends State<HomeScreen> {
         selectedIndex: _selectedIndex,
         onDestinationSelected: (i) {
           if (i == 0 && _selectedIndex != 0) {
-            context.read<LibraryProvider>().refresh();
+            final lib = context.read<LibraryProvider>();
+            lib.refresh();
+            lib.loadCollections();
           }
           setState(() => _selectedIndex = i);
         },
@@ -441,6 +444,16 @@ class _MiniPlayerState extends State<_MiniPlayer> {
     final theme     = Theme.of(context);
     final idle      = song == null;
 
+    // Dynamic accent derived from the current track's generated cover art —
+    // the bar re-tints per song, matching the web player.
+    final Color accent;
+    if (idle) {
+      accent = theme.colorScheme.primary;
+    } else {
+      final p = artParams(seedFromHash(song.contentHash));
+      accent = hslColor(p.h1, 75, 62);
+    }
+
     final durationMs = idle ? 0 : song.durationMs;
     final livePosMs  = player.positionMs.clamp(0, durationMs == 0
         ? player.positionMs
@@ -474,6 +487,8 @@ class _MiniPlayerState extends State<_MiniPlayer> {
                 child: SliderTheme(
                   data: SliderTheme.of(context).copyWith(
                     trackHeight: 3,
+                    activeTrackColor: accent,
+                    thumbColor: accent,
                     thumbShape: const RoundSliderThumbShape(
                         enabledThumbRadius: 6),
                     overlayShape: const RoundSliderOverlayShape(
@@ -506,6 +521,14 @@ class _MiniPlayerState extends State<_MiniPlayer> {
           // ---- Title / artist / play count + transport controls -----
           Row(
             children: [
+              if (!idle) ...[
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: CoverArt(
+                      seed: seedFromHash(song.contentHash), size: 40),
+                ),
+                const SizedBox(width: 10),
+              ],
               Expanded(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
@@ -560,6 +583,7 @@ class _MiniPlayerState extends State<_MiniPlayer> {
               ),
               IconButton(
                 iconSize: 28,
+                color: idle ? null : accent,
                 icon: Icon(isPlaying ? Icons.pause_circle_filled
                                       : Icons.play_circle_filled),
                 onPressed: idle ? null : () => player.togglePlayPause(),

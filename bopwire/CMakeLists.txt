@@ -323,6 +323,7 @@ set(MC_SOURCES
   src/sync/deep_audit.cpp
   src/net/load_monitor.cpp
   src/net/relay_credit_tracker.cpp
+  src/curation/collection_curator.cpp
   src/tokens/ledger.cpp
   src/tokens/mint.cpp
   src/network/manager.cpp       # thin shim now — no TCP mesh

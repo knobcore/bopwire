@@ -1,10 +1,10 @@
-// "My Library" tab — same drill + resizable split layout as the
-// Discover tab so the two surfaces feel flush. Artist / Genre at the
-// root, drill into albums, and a bottom pane shows the selected
-// album's tracks. The Folders and Scan-now actions stay in the AppBar
-// (the only difference from Discover beyond the data source).
-
-import 'dart:async';
+// "My Library" tab — same design language as the Discover tab: cover-art
+// card grids (deterministic art, no image assets), gradient genre tiles,
+// a stats header with Play all / Shuffle, and the same drill
+// (Artist / Genre → Album, plus Playlists) into a resizable track pane.
+// Only the data source differs: LibraryService (local files) instead of
+// the chain catalog, so rows keep their local / downloading / remote
+// state and the add/scan/delete/DMCA actions.
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -17,6 +17,7 @@ import '../services/library_scanner.dart';
 import '../services/library_service.dart';
 import '../services/local_library_actions.dart';
 import '../services/playlist_service.dart';
+import '../widgets/cover_art.dart';
 import 'dmca_screen.dart';
 import 'folders_screen.dart';
 
@@ -97,7 +98,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
   // Tag spellings rarely line up — "FIDLAR" / "Fidlar", "Rock" / "rock"
   // etc. all collide on the same audio. We group case-insensitively
   // and pick the most-frequent original spelling for display so the
-  // chip shows what the user actually has.
+  // card shows what the user actually has.
 
   String _artistKey(LibraryEntry e) {
     final t = e.artist.trim();
@@ -145,7 +146,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
 
   /// Distinct track count by dedup key (fingerprint > canonical > local
   /// content_hash). Mirrors the rule the previous local-library list
-  /// used so chip counts stay honest in the presence of variants.
+  /// used so card counts stay honest in the presence of variants.
   int _distinctTrackCount(Iterable<LibraryEntry> entries) {
     final seen = <String>{};
     for (final e in entries) {
@@ -172,7 +173,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
     });
   }
 
-  void _onPillTapped(String key, _DrillLevel level) {
+  void _onCardTapped(String key, _DrillLevel level) {
     setState(() {
       switch (level) {
         case _DrillLevel.genre:
@@ -252,7 +253,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
         .playPlaylist(playlist, idx, wallet.address);
   }
 
-  void _playGroup(List<LibraryEntry> entries) {
+  void _playGroup(List<LibraryEntry> entries, {bool shuffle = false}) {
     if (entries.isEmpty) return;
     final wallet = context.read<WalletProvider>().info;
     if (wallet == null) {
@@ -261,7 +262,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
       );
       return;
     }
-    final playable = _sortEntries(entries).where((e) => e.isLocal).toList();
+    var playable = _sortEntries(entries).where((e) => e.isLocal).toList();
     if (playable.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content:
@@ -269,6 +270,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
       );
       return;
     }
+    if (shuffle) playable = List.of(playable)..shuffle();
     final playlist = playable.map(_toSong).toList();
     context.read<PlayerProvider>()
         .playPlaylist(playlist, 0, wallet.address);
@@ -306,53 +308,28 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('My Library'),
-        actions: [
-          IconButton(
-            tooltip: 'Folders',
-            icon: const Icon(Icons.create_new_folder_outlined),
-            onPressed: _openFolders,
-          ),
-          IconButton(
-            tooltip: 'Scan now',
-            icon: _scanning
-                ? const SizedBox(
-                    width: 18, height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.refresh),
-            onPressed: _scanning ? null : _scanNow,
-          ),
-        ],
-      ),
       body: Consumer<LibraryService>(
         builder: (context, lib, _) {
           final entries = lib.entries;
           if (entries.isEmpty) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(32),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.library_music_outlined,
-                         size: 64,
-                         color: Theme.of(context)
-                             .colorScheme.onSurfaceVariant),
-                    const SizedBox(height: 16),
-                    const Text(
-                      'No songs yet. Tap the folder-plus icon above to add '
-                      'a music folder, then tap refresh to scan.',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.grey),
-                    ),
-                  ],
-                ),
-              ),
+            return _EmptyLibrary(
+              onFolders: _openFolders,
+              onScan:    _scanning ? null : _scanNow,
+              scanning:  _scanning,
             );
           }
           return Column(
             children: [
+              _LibraryHeader(
+                entries:    entries,
+                localCount: entries.where((e) => e.isLocal).length,
+                artistCount: entries.map(_artistKeyNorm).toSet().length,
+                scanning:   _scanning,
+                onPlayAll:  () => _playGroup(entries),
+                onShuffle:  () => _playGroup(entries, shuffle: true),
+                onFolders:  _openFolders,
+                onScan:     _scanning ? null : _scanNow,
+              ),
               _ModeToolbar(mode: _mode, onChange: _selectMode),
               _Breadcrumb(segments: _breadcrumb()),
               if (_scanning)
@@ -453,8 +430,11 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
                 child: _TrackPane(
                   albumName:      bottomTitle,
                   artistFallback: isPlaylists ? null : _drillArtist,
+                  isPlaylist:     isPlaylists,
                   tracks:         selectedTracks,
                   onPlay:         _playFromAlbum,
+                  onShuffle:      () =>
+                      _playGroup(selectedTracks, shuffle: true),
                   onClose:        () => setState(() {
                     if (isPlaylists) {
                       _selectedPlaylistId = null;
@@ -480,38 +460,35 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
     return null; // selected playlist was deleted — bottom pane collapses
   }
 
-  /// Top pane for the playlists facet: one chip per saved playlist (tap fills
-  /// the track pane; long-press / right-click for add/rename/delete) plus a
-  /// "New playlist" chip.
+  /// Top pane for the playlists facet: one gradient card per saved playlist
+  /// (tap fills the track pane; long-press / right-click for
+  /// add/rename/delete) plus a "New playlist" card.
   Widget _playlistPane() {
     final pls = PlaylistService.instance.playlists;
-    return SingleChildScrollView(
+    return GridView.builder(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-      child: Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: [
-          for (final pl in pls)
-            GestureDetector(
-              onLongPressStart: (d) => _playlistMenu(d.globalPosition, pl),
-              onSecondaryTapDown: (d) => _playlistMenu(d.globalPosition, pl),
-              child: FilterChip(
-                avatar: const Icon(Icons.queue_music, size: 18),
-                label: Text('${pl.name}  (${pl.songs.length})'),
-                selected: _selectedPlaylistId == pl.id,
-                onSelected: (_) => setState(() {
-                  _selectedPlaylistId =
-                      _selectedPlaylistId == pl.id ? null : pl.id;
-                }),
-              ),
-            ),
-          ActionChip(
-            avatar: const Icon(Icons.add, size: 18),
-            label: const Text('New playlist'),
-            onPressed: _createPlaylistDialog,
-          ),
-        ],
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 190,
+        mainAxisSpacing: 10,
+        crossAxisSpacing: 10,
+        childAspectRatio: 1.9,
       ),
+      itemCount: pls.length + 1,
+      itemBuilder: (context, i) {
+        if (i == pls.length) {
+          return _NewPlaylistCard(onTap: _createPlaylistDialog);
+        }
+        final pl = pls[i];
+        return _PlaylistCard(
+          playlist: pl,
+          selected: _selectedPlaylistId == pl.id,
+          onTap: () => setState(() {
+            _selectedPlaylistId =
+                _selectedPlaylistId == pl.id ? null : pl.id;
+          }),
+          onMenu: (pos) => _playlistMenu(pos, pl),
+        );
+      },
     );
   }
 
@@ -633,7 +610,11 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
               itemBuilder: (ctx, i) {
                 final e = candidates[i];
                 return ListTile(
-                  leading: const Icon(Icons.music_note),
+                  leading: ClipRRect(
+                    borderRadius: BorderRadius.circular(6),
+                    child: CoverArt(
+                        seed: seedFromHash(e.songId), size: 34),
+                  ),
                   title: Text(
                       e.title.isEmpty ? e.contentHash.substring(0, 12) : e.title),
                   subtitle: Text(e.artist),
@@ -648,8 +629,9 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
   }
 
   Widget _topPane(List<LibraryEntry> entries) {
-    final pills = _pillsFor(_currentLevel(), entries);
-    if (pills.isEmpty) {
+    final level = _currentLevel();
+    final cards = _cardsFor(level, entries);
+    if (cards.isEmpty) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(32),
@@ -662,13 +644,19 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
         ),
       );
     }
-    return SingleChildScrollView(
+    // Genre root uses short gradient tiles; artist/album levels use
+    // cover-art cards — both straight from the Discover design language.
+    final isTiles = level == _DrillLevel.genre;
+    return GridView.builder(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-      child: Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: pills,
+      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: isTiles ? 190 : 150,
+        mainAxisSpacing: 10,
+        crossAxisSpacing: 10,
+        childAspectRatio: isTiles ? 1.9 : 0.74,
       ),
+      itemCount: cards.length,
+      itemBuilder: (context, i) => cards[i],
     );
   }
 
@@ -678,7 +666,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
     return _mode == _FacetMode.artist ? _DrillLevel.artist : _DrillLevel.genre;
   }
 
-  List<Widget> _pillsFor(_DrillLevel level, List<LibraryEntry> entries) {
+  List<Widget> _cardsFor(_DrillLevel level, List<LibraryEntry> entries) {
     final scoped = _drillFilter(entries).toList();
     switch (level) {
       case _DrillLevel.genre:
@@ -686,13 +674,12 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
         final keys = buckets.keys.toList()..sort(_sortAlpha);
         return [
           for (final k in keys)
-            _LocalChip(
-              icon:    Icons.style_outlined,
-              label:   '$k  (${_distinctTrackCount(buckets[k]!)})',
-              selected: false,
-              onTap:    () => _onPillTapped(k, _DrillLevel.genre),
-              entries:  buckets[k]!,
-              onPlay:   () => _playGroup(buckets[k]!),
+            _GenreTileCard(
+              name:    k,
+              count:   _distinctTrackCount(buckets[k]!),
+              onTap:   () => _onCardTapped(k, _DrillLevel.genre),
+              entries: buckets[k]!,
+              onPlay:  () => _playGroup(buckets[k]!),
             ),
         ];
       case _DrillLevel.artist:
@@ -700,11 +687,13 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
         final keys = buckets.keys.toList()..sort(_sortAlpha);
         return [
           for (final k in keys)
-            _LocalChip(
-              icon:    Icons.person_outline,
-              label:   '$k  (${_distinctTrackCount(buckets[k]!)})',
+            _FacetCard(
+              seed:     seedFromName(k),
+              label:    k,
+              sublabel: '${_distinctTrackCount(buckets[k]!)} '
+                        'track${_distinctTrackCount(buckets[k]!) == 1 ? '' : 's'}',
               selected: false,
-              onTap:    () => _onPillTapped(k, _DrillLevel.artist),
+              onTap:    () => _onCardTapped(k, _DrillLevel.artist),
               entries:  buckets[k]!,
               onPlay:   () => _playGroup(buckets[k]!),
             ),
@@ -721,11 +710,15 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
         });
         return [
           for (final k in keys)
-            _LocalChip(
-              icon:     Icons.album_outlined,
-              label:    _formatAlbumLabel(k, buckets[k]!),
+            _FacetCard(
+              // Album art keys off the album's first track (sorted), so an
+              // album keeps one face no matter where it shows up.
+              seed:     seedFromHash(
+                  _sortEntries(buckets[k]!).first.songId),
+              label:    k,
+              sublabel: _albumSublabel(k, buckets[k]!),
               selected: _selectedAlbum?.toLowerCase() == k.toLowerCase(),
-              onTap:    () => _onPillTapped(k, _DrillLevel.album),
+              onTap:    () => _onCardTapped(k, _DrillLevel.album),
               entries:  buckets[k]!,
               onPlay:   () => _playGroup(buckets[k]!),
             ),
@@ -735,7 +728,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
 
   /// Group `items` by `norm(item)` and pick the most-common spelling of
   /// `display(item)` as the bucket key. Mirrors the same fix in the
-  /// Discover screen so "FIDLAR" + "Fidlar" coalesce into one chip with
+  /// Discover screen so "FIDLAR" + "Fidlar" coalesce into one card with
   /// whichever spelling dominates the user's tags.
   Map<String, List<LibraryEntry>> _bucketByNorm(
       List<LibraryEntry> items,
@@ -765,11 +758,11 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
     return out;
   }
 
-  String _formatAlbumLabel(String name, List<LibraryEntry> tracks) {
+  String _albumSublabel(String name, List<LibraryEntry> tracks) {
     final year = _earliestYear(tracks);
     final n = _distinctTrackCount(tracks);
-    if (year > 0) return '$name  ($year · $n)';
-    return '$name  ($n)';
+    final t = '$n track${n == 1 ? '' : 's'}';
+    return year > 0 ? '$year · $t' : t;
   }
 }
 
@@ -785,6 +778,193 @@ class _CrumbSeg {
 
 const double _kHandleHeight = 14;
 
+// ---- Header: stats + play all / shuffle + folders / scan ----------------
+
+class _LibraryHeader extends StatelessWidget {
+  const _LibraryHeader({
+    required this.entries,
+    required this.localCount,
+    required this.artistCount,
+    required this.scanning,
+    required this.onPlayAll,
+    required this.onShuffle,
+    required this.onFolders,
+    required this.onScan,
+  });
+
+  final List<LibraryEntry> entries;
+  final int  localCount;
+  final int  artistCount;
+  final bool scanning;
+  final VoidCallback  onPlayAll;
+  final VoidCallback  onShuffle;
+  final VoidCallback  onFolders;
+  final VoidCallback? onScan;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final p = artParams(seedFromName('my library'));
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+      padding: const EdgeInsets.fromLTRB(14, 12, 8, 12),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: theme.dividerColor.withOpacity(.4)),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [hslColor(p.h1, 45, 16), hslColor(p.h2, 45, 12)],
+        ),
+      ),
+      child: Row(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: CoverArt(seed: seedFromName('my library'), size: 56),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ShaderMask(
+                  shaderCallback: (r) => LinearGradient(colors: [
+                    theme.colorScheme.primary,
+                    theme.colorScheme.tertiary,
+                  ]).createShader(r),
+                  child: Text(
+                    'My Library',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800, color: Colors.white),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '${entries.length} track${entries.length == 1 ? '' : 's'}'
+                  ' · $artistCount artist${artistCount == 1 ? '' : 's'}'
+                  ' · $localCount on this device',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                      color: theme.colorScheme.onSurface.withOpacity(.65)),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    FilledButton.icon(
+                      onPressed: onPlayAll,
+                      icon: const Icon(Icons.play_arrow, size: 16),
+                      label: const Text('Play all'),
+                      style: FilledButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    OutlinedButton.icon(
+                      onPressed: onShuffle,
+                      icon: const Icon(Icons.shuffle, size: 14),
+                      label: const Text('Shuffle'),
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: 'Folders',
+                icon: const Icon(Icons.create_new_folder_outlined, size: 20),
+                onPressed: onFolders,
+              ),
+              IconButton(
+                tooltip: 'Scan now',
+                icon: scanning
+                    ? const SizedBox(
+                        width: 18, height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.refresh, size: 20),
+                onPressed: onScan,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EmptyLibrary extends StatelessWidget {
+  const _EmptyLibrary({
+    required this.onFolders,
+    required this.onScan,
+    required this.scanning,
+  });
+  final VoidCallback  onFolders;
+  final VoidCallback? onScan;
+  final bool          scanning;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: CoverArt(seed: seedFromName('my library'), size: 88),
+            ),
+            const SizedBox(height: 16),
+            Text('Your library is empty',
+                style: theme.textTheme.titleMedium
+                    ?.copyWith(fontWeight: FontWeight.w800)),
+            const SizedBox(height: 6),
+            Text(
+              'Add a music folder, then scan it — your files are '
+              'fingerprinted locally and never leave this device.',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                FilledButton.icon(
+                  onPressed: onFolders,
+                  icon: const Icon(Icons.create_new_folder_outlined, size: 18),
+                  label: const Text('Add folder'),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: onScan,
+                  icon: scanning
+                      ? const SizedBox(
+                          width: 14, height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.refresh, size: 16),
+                  label: const Text('Scan'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _ModeToolbar extends StatelessWidget {
   const _ModeToolbar({required this.mode, required this.onChange});
   final _FacetMode               mode;
@@ -793,7 +973,7 @@ class _ModeToolbar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
       child: Row(
         children: [
           Expanded(
@@ -802,7 +982,7 @@ class _ModeToolbar extends StatelessWidget {
               segments: _FacetMode.values.map((m) => ButtonSegment(
                 value: m,
                 label: Text(m.label),
-                icon:  Icon(m.icon),
+                icon:  Icon(m.icon, size: 16),
               )).toList(),
               selected: {mode},
               onSelectionChanged: (s) => onChange(s.first),
@@ -864,130 +1044,379 @@ class _Breadcrumb extends StatelessWidget {
   }
 }
 
-class _LocalChip extends StatelessWidget {
-  const _LocalChip({
-    required this.icon,
+// ---- Facet menu (play / delete / DMCA) — shared by the card types ------
+
+Future<void> _facetMenu(
+  BuildContext context,
+  Offset pos, {
+  required List<LibraryEntry> entries,
+  required VoidCallback onPlay,
+}) async {
+  final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+  final picked = await showMenu<String>(
+    context: context,
+    position: RelativeRect.fromRect(
+      pos & const Size(40, 40),
+      Offset.zero & overlay.size,
+    ),
+    items: const [
+      PopupMenuItem(
+        value: 'play',
+        child: ListTile(
+          dense: true,
+          leading: Icon(Icons.play_arrow, size: 18),
+          title: Text('Play'),
+          contentPadding: EdgeInsets.zero,
+        ),
+      ),
+      PopupMenuItem(
+        value: 'delete',
+        child: ListTile(
+          dense: true,
+          leading: Icon(Icons.delete_outline,
+                        size: 18, color: Colors.red),
+          title: Text('Delete'),
+          contentPadding: EdgeInsets.zero,
+        ),
+      ),
+      PopupMenuDivider(),
+      PopupMenuItem(
+        value: 'dmca',
+        child: ListTile(
+          dense: true,
+          leading: Icon(Icons.gavel_outlined, size: 18),
+          title: Text('About copyright / DMCA'),
+          contentPadding: EdgeInsets.zero,
+        ),
+      ),
+    ],
+  );
+  if (picked == 'play') {
+    onPlay();
+  } else if (picked == 'delete' && context.mounted) {
+    await _confirmAndDeleteGroup(context, entries);
+  } else if (picked == 'dmca' && context.mounted) {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => const DmcaScreen(),
+    ));
+  }
+}
+
+Future<void> _confirmAndDeleteGroup(
+    BuildContext context, List<LibraryEntry> entries) async {
+  final messenger = ScaffoldMessenger.maybeOf(context);
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Delete?'),
+      content: Text(
+        'Remove ${entries.length} track${entries.length == 1 ? "" : "s"} '
+        'from your library? Downloaded files are deleted from disk; '
+        'files in folders you scanned stay where they are.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton.tonal(
+          style: FilledButton.styleFrom(
+              foregroundColor: Theme.of(ctx).colorScheme.error),
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text('Delete'),
+        ),
+      ],
+    ),
+  );
+  if (ok != true) return;
+  final svc = LocalLibraryActions.instance;
+  int dropped = 0, fileDeleted = 0;
+  for (final e in entries) {
+    final r = await svc.deleteEntry(e);
+    dropped++;
+    if (r.fileDeleted) fileDeleted++;
+  }
+  messenger?.showSnackBar(SnackBar(
+    content: Text(
+      'Deleted $dropped track${dropped == 1 ? "" : "s"}'
+      '${fileDeleted > 0 ? " ($fileDeleted file"
+          "${fileDeleted == 1 ? "" : "s"} removed from disk)" : ""}.',
+    ),
+    duration: const Duration(seconds: 3),
+  ));
+}
+
+// ---- Cards ---------------------------------------------------------------
+
+/// Artist / album card: cover art + label + sublabel, Discover-style.
+class _FacetCard extends StatelessWidget {
+  const _FacetCard({
+    required this.seed,
     required this.label,
+    required this.sublabel,
     required this.selected,
     required this.onTap,
     required this.entries,
     required this.onPlay,
   });
-  final IconData            icon;
-  final String              label;
-  final bool                selected;
-  final VoidCallback        onTap;
-  final List<LibraryEntry>  entries;
-  final VoidCallback        onPlay;
-
-  Future<void> _showMenu(BuildContext context, Offset pos) async {
-    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
-    final picked = await showMenu<String>(
-      context: context,
-      position: RelativeRect.fromRect(
-        pos & const Size(40, 40),
-        Offset.zero & overlay.size,
-      ),
-      items: const [
-        PopupMenuItem(
-          value: 'play',
-          child: ListTile(
-            dense: true,
-            leading: Icon(Icons.play_arrow, size: 18),
-            title: Text('Play'),
-            contentPadding: EdgeInsets.zero,
-          ),
-        ),
-        PopupMenuItem(
-          value: 'delete',
-          child: ListTile(
-            dense: true,
-            leading: Icon(Icons.delete_outline,
-                          size: 18, color: Colors.red),
-            title: Text('Delete'),
-            contentPadding: EdgeInsets.zero,
-          ),
-        ),
-        PopupMenuDivider(),
-        PopupMenuItem(
-          value: 'dmca',
-          child: ListTile(
-            dense: true,
-            leading: Icon(Icons.gavel_outlined, size: 18),
-            title: Text('About copyright / DMCA'),
-            contentPadding: EdgeInsets.zero,
-          ),
-        ),
-      ],
-    );
-    if (picked == 'play') {
-      onPlay();
-    } else if (picked == 'delete' && context.mounted) {
-      await _confirmAndDelete(context);
-    } else if (picked == 'dmca' && context.mounted) {
-      Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => const DmcaScreen(),
-      ));
-    }
-  }
-
-  Future<void> _confirmAndDelete(BuildContext context) async {
-    final messenger = ScaffoldMessenger.maybeOf(context);
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete?'),
-        content: Text(
-          'Remove ${entries.length} track${entries.length == 1 ? "" : "s"} '
-          'from your library? Downloaded files are deleted from disk; '
-          'files in folders you scanned stay where they are.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton.tonal(
-            style: FilledButton.styleFrom(
-                foregroundColor: Theme.of(ctx).colorScheme.error),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    final svc = LocalLibraryActions.instance;
-    int dropped = 0, fileDeleted = 0;
-    for (final e in entries) {
-      final r = await svc.deleteEntry(e);
-      dropped++;
-      if (r.fileDeleted) fileDeleted++;
-    }
-    messenger?.showSnackBar(SnackBar(
-      content: Text(
-        'Deleted $dropped track${dropped == 1 ? "" : "s"}'
-        '${fileDeleted > 0 ? " ($fileDeleted file"
-            "${fileDeleted == 1 ? "" : "s"} removed from disk)" : ""}.',
-      ),
-      duration: const Duration(seconds: 3),
-    ));
-  }
+  final List<int>          seed;
+  final String             label;
+  final String             sublabel;
+  final bool               selected;
+  final VoidCallback       onTap;
+  final List<LibraryEntry> entries;
+  final VoidCallback       onPlay;
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return GestureDetector(
-      onSecondaryTapDown: (d) => _showMenu(context, d.globalPosition),
-      onLongPressStart:   (d) => _showMenu(context, d.globalPosition),
-      child: ChoiceChip(
-        avatar:   Icon(icon, size: 18),
-        label:    Text(label, overflow: TextOverflow.ellipsis),
-        selected: selected,
-        onSelected: (_) => onTap(),
+      onSecondaryTapDown: (d) => _facetMenu(context, d.globalPosition,
+          entries: entries, onPlay: onPlay),
+      onLongPressStart: (d) => _facetMenu(context, d.globalPosition,
+          entries: entries, onPlay: onPlay),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            color: theme.colorScheme.surfaceContainerHighest.withOpacity(.35),
+            border: Border.all(
+              color: selected ? theme.colorScheme.primary : Colors.transparent,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: LayoutBuilder(
+                  builder: (context, c) => Stack(
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(9),
+                        child: CoverArt(seed: seed, size: c.maxWidth),
+                      ),
+                      if (selected)
+                        Positioned(
+                          right: 6, bottom: 6,
+                          child: CircleAvatar(
+                            radius: 12,
+                            backgroundColor: theme.colorScheme.primary,
+                            child: Icon(Icons.check,
+                                size: 14,
+                                color: theme.colorScheme.onPrimary),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                label,
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(fontWeight: FontWeight.w700),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              Text(
+                sublabel,
+                style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.onSurface.withOpacity(.6)),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
 }
+
+/// Genre tile: the Discover genre-tile gradient, with count badge.
+class _GenreTileCard extends StatelessWidget {
+  const _GenreTileCard({
+    required this.name,
+    required this.count,
+    required this.onTap,
+    required this.entries,
+    required this.onPlay,
+  });
+  final String             name;
+  final int                count;
+  final VoidCallback       onTap;
+  final List<LibraryEntry> entries;
+  final VoidCallback       onPlay;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onSecondaryTapDown: (d) => _facetMenu(context, d.globalPosition,
+          entries: entries, onPlay: onPlay),
+      onLongPressStart: (d) => _facetMenu(context, d.globalPosition,
+          entries: entries, onPlay: onPlay),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            gradient: tileGradient(seedFromName(name)),
+          ),
+          child: Stack(
+            children: [
+              Positioned(
+                top: 0, right: 0,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.black38,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text('$count',
+                      style: const TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white)),
+                ),
+              ),
+              Align(
+                alignment: Alignment.bottomLeft,
+                child: Text(
+                  name,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w800,
+                    fontSize: 13.5,
+                    color: Colors.white,
+                    shadows: [Shadow(blurRadius: 6, color: Colors.black54)],
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PlaylistCard extends StatelessWidget {
+  const _PlaylistCard({
+    required this.playlist,
+    required this.selected,
+    required this.onTap,
+    required this.onMenu,
+  });
+  final Playlist              playlist;
+  final bool                  selected;
+  final VoidCallback          onTap;
+  final ValueChanged<Offset>  onMenu;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return GestureDetector(
+      onSecondaryTapDown: (d) => onMenu(d.globalPosition),
+      onLongPressStart:   (d) => onMenu(d.globalPosition),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            gradient: tileGradient(seedFromName(playlist.name)),
+            border: Border.all(
+              color: selected ? theme.colorScheme.primary : Colors.transparent,
+              width: 1.5,
+            ),
+          ),
+          child: Stack(
+            children: [
+              const Positioned(
+                top: 0, left: 0,
+                child: Icon(Icons.queue_music, size: 18, color: Colors.white70),
+              ),
+              Positioned(
+                top: 0, right: 0,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.black38,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text('${playlist.songs.length}',
+                      style: const TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white)),
+                ),
+              ),
+              Align(
+                alignment: Alignment.bottomLeft,
+                child: Text(
+                  playlist.name,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w800,
+                    fontSize: 13.5,
+                    color: Colors.white,
+                    shadows: [Shadow(blurRadius: 6, color: Colors.black54)],
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _NewPlaylistCard extends StatelessWidget {
+  const _NewPlaylistCard({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: theme.dividerColor),
+          color: theme.colorScheme.surfaceContainerHighest.withOpacity(.25),
+        ),
+        child: Center(
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.add, size: 18, color: theme.colorScheme.primary),
+              const SizedBox(width: 6),
+              Text('New playlist',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                      color: theme.colorScheme.primary)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---- Split-pane bits -----------------------------------------------------
 
 class _DragHandle extends StatelessWidget {
   const _DragHandle({required this.onDelta});
@@ -1023,19 +1452,22 @@ class _TrackPane extends StatelessWidget {
   const _TrackPane({
     required this.albumName,
     required this.artistFallback,
+    required this.isPlaylist,
     required this.tracks,
     required this.onPlay,
+    required this.onShuffle,
     required this.onClose,
   });
   final String                          albumName;
   final String?                         artistFallback;
+  final bool                            isPlaylist;
   final List<LibraryEntry>              tracks;
   /// Called when the user taps a row. The whole [tracks] list goes to the
   /// player as the queue; the second argument is the index of the tapped
   /// row, so playback starts there and auto-advances through the rest of
-  /// the album. (Pre-fix this was `void Function(LibraryEntry)` and only
-  /// the single tapped track was queued, which is the bug we're fixing.)
+  /// the album.
   final void Function(List<LibraryEntry> tracks, int index) onPlay;
+  final VoidCallback                    onShuffle;
   final VoidCallback                    onClose;
 
   @override
@@ -1048,6 +1480,9 @@ class _TrackPane extends StatelessWidget {
         .map((e) => e.year)
         .firstWhere((y) => y > 0, orElse: () => 0);
     final localCount = tracks.where((e) => e.isLocal).length;
+    final seed = isPlaylist || tracks.isEmpty
+        ? seedFromName(albumName)
+        : seedFromHash(tracks.first.songId);
     return Material(
       elevation: 4,
       color: theme.colorScheme.surface,
@@ -1060,9 +1495,11 @@ class _TrackPane extends StatelessWidget {
             ),
             child: Row(
               children: [
-                Icon(Icons.album_outlined,
-                    size: 18, color: theme.colorScheme.primary),
-                const SizedBox(width: 8),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: CoverArt(seed: seed, size: 40),
+                ),
+                const SizedBox(width: 10),
                 Expanded(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -1072,7 +1509,7 @@ class _TrackPane extends StatelessWidget {
                         albumName,
                         maxLines: 1, overflow: TextOverflow.ellipsis,
                         style: theme.textTheme.titleSmall?.copyWith(
-                          fontWeight: FontWeight.w600),
+                          fontWeight: FontWeight.w700),
                       ),
                       Text(
                         [
@@ -1087,6 +1524,18 @@ class _TrackPane extends StatelessWidget {
                       ),
                     ],
                   ),
+                ),
+                IconButton(
+                  tooltip: 'Play all',
+                  icon: Icon(Icons.play_circle_fill,
+                      size: 26, color: theme.colorScheme.primary),
+                  onPressed:
+                      tracks.isEmpty ? null : () => onPlay(tracks, 0),
+                ),
+                IconButton(
+                  tooltip: 'Shuffle',
+                  icon: const Icon(Icons.shuffle, size: 20),
+                  onPressed: tracks.isEmpty ? null : onShuffle,
                 ),
                 IconButton(
                   tooltip: 'Close',
@@ -1234,7 +1683,12 @@ class _LocalEntryRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme   = Theme.of(context);
     final isLocal = entry.isLocal;
+    final playing = context.select<PlayerProvider, String>(
+        (p) => p.currentSong?.contentHash ?? '');
+    final isPlaying = playing == entry.songId ||
+        playing == entry.contentHash;
     final dl = context.watch<DownloadProvider>();
     DownloadJob? activeJob;
     for (final j in dl.activeJobs) {
@@ -1303,27 +1757,50 @@ class _LocalEntryRow extends StatelessWidget {
       behavior: HitTestBehavior.translucent,
       onSecondaryTapDown: (d) => _showMenu(context, d.globalPosition),
       onLongPressStart:   (d) => _showMenu(context, d.globalPosition),
-      child: ListTile(
-        dense: true,
-        leading: SizedBox(
-          width: 28,
-          child: Text(
-            entry.trackNumber > 0 ? '${entry.trackNumber}' : '${index + 1}',
-            textAlign: TextAlign.right,
-            style: Theme.of(context).textTheme.bodySmall,
+      child: Opacity(
+        opacity: isLocal ? 1 : .55,
+        child: ListTile(
+          dense: true,
+          leading: SizedBox(
+            width: 66,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 22,
+                  child: Text(
+                    entry.trackNumber > 0
+                        ? '${entry.trackNumber}'
+                        : '${index + 1}',
+                    textAlign: TextAlign.right,
+                    style: theme.textTheme.bodySmall,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: CoverArt(
+                      seed: seedFromHash(entry.songId), size: 34),
+                ),
+              ],
+            ),
           ),
+          title: Text(
+            entry.title.isEmpty ? '(untitled)' : entry.title,
+            maxLines: 1, overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontWeight: isPlaying ? FontWeight.w700 : FontWeight.w500,
+              color: isPlaying ? theme.colorScheme.primary : null,
+            ),
+          ),
+          subtitle: Text(
+            subtitle.toString(),
+            style: const TextStyle(fontSize: 11),
+            maxLines: 1, overflow: TextOverflow.ellipsis,
+          ),
+          onTap: isLocal ? onPlay : null,
+          trailing: SizedBox(width: 96, child: trailing),
         ),
-        title: Text(
-          entry.title.isEmpty ? '(untitled)' : entry.title,
-          maxLines: 1, overflow: TextOverflow.ellipsis,
-        ),
-        subtitle: Text(
-          subtitle.toString(),
-          style: const TextStyle(fontSize: 11),
-          maxLines: 1, overflow: TextOverflow.ellipsis,
-        ),
-        onTap: isLocal ? onPlay : null,
-        trailing: SizedBox(width: 96, child: trailing),
       ),
     );
   }

@@ -1,0 +1,110 @@
+@import "tailwindcss";
+
+/* Bopwire design tokens — the same dark/mint/sky language as the native app. */
+@theme {
+  --color-bg:    #0c0d10;
+  --color-elev:  #15171c;
+  --color-elev2: #1c1f26;
+  --color-line:  #262a33;
+  --color-ink:   #e7e9ee;
+  --color-dim:   #9aa0ab;
+  --color-mint:  #6ee7b7;
+  --color-sky:   #38bdf8;
+  --color-mintink: #06231a;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+
+  --animate-pulse-dot: pulse-dot 2.2s infinite;
+  --animate-shimmer: shimmer 1.4s linear infinite;
+  --animate-rise: rise .45s ease both;
+
+  @keyframes pulse-dot {
+    0%   { box-shadow: 0 0 0 0 --alpha(var(--color-mint) / 50%); }
+    70%  { box-shadow: 0 0 0 6px --alpha(var(--color-mint) / 0%); }
+    100% { box-shadow: 0 0 0 0 --alpha(var(--color-mint) / 0%); }
+  }
+  @keyframes shimmer {
+    0%   { background-position: -400px 0; }
+    100% { background-position: 400px 0; }
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+}
+
+html, body, #root { height: 100%; }
+/* Mobile browsers: track the dynamic viewport so the player bar + CTA are
+   never hidden behind the collapsing URL bar. */
+@supports (height: 100dvh) {
+  html, body, #root { height: 100dvh; }
+}
+body {
+  @apply bg-bg text-ink antialiased overflow-hidden;
+}
+
+/* Ambient background glow — two soft brand-colored blobs. */
+body::before {
+  content: "";
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(720px 340px at 12% -10%, --alpha(var(--color-mint) / 7%), transparent 60%),
+    radial-gradient(640px 380px at 95% 110%, --alpha(var(--color-sky) / 7%), transparent 60%);
+}
+#root { position: relative; z-index: 1; }
+
+/* Slim dark scrollbars everywhere. */
+* { scrollbar-width: thin; scrollbar-color: var(--color-line) transparent; }
+*::-webkit-scrollbar { width: 9px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: var(--color-line); border-radius: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* Carousel rails: fade the clipped edges so overflow reads as scrollable. */
+.rail-mask {
+  mask-image: linear-gradient(to right, transparent, black 14px,
+      black calc(100% - 14px), transparent);
+}
+
+/* Skeleton shimmer while collections load. */
+.skel {
+  @apply rounded-lg bg-elev2;
+  background-image: linear-gradient(90deg, transparent,
+      --alpha(var(--color-ink) / 5%), transparent);
+  background-size: 400px 100%;
+  animation: var(--animate-shimmer);
+}
+
+/* Custom range input (seek bar). */
+input[type="range"].seek {
+  @apply h-1.5 w-full cursor-pointer appearance-none rounded-full bg-line;
+  background-image: linear-gradient(var(--seek-fill, var(--color-mint)),
+      var(--seek-fill, var(--color-mint)));
+  background-repeat: no-repeat;
+  background-size: var(--seek-pct, 0%) 100%;
+}
+input[type="range"].seek::-webkit-slider-thumb {
+  @apply size-3 appearance-none rounded-full;
+  background: var(--seek-fill, var(--color-mint));
+  box-shadow: 0 0 8px --alpha(var(--color-mint) / 60%);
+}
+input[type="range"].seek::-moz-range-thumb {
+  @apply size-3 rounded-full border-0;
+  background: var(--seek-fill, var(--color-mint));
+}
+
+/* Keyboard focus ring in brand color. */
+:focus-visible {
+  outline: 2px solid var(--color-sky);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

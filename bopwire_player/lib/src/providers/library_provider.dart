@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../models/collection.dart';
 import '../models/song.dart';
 import '../services/librats_discovery.dart';
 import '../services/node_client.dart';
@@ -15,6 +16,14 @@ class LibraryProvider extends ChangeNotifier {
   bool       loading  = false;
   String?    error;
   String     filter   = '';
+
+  /// Deterministic per-epoch Discover feed (collections.list). Loaded
+  /// independently of [songs]; the home screen joins the two — collection
+  /// membership comes from the node, availability from the online catalog.
+  CollectionSet? collections;
+  bool           collectionsLoading = false;
+  String?        collectionsError;
+  Future<void>?  _collectionsInFlight;
 
   /// In-flight refresh/search future. Concurrent callers (timer + user
   /// tap + discovery callback) await this instead of issuing a parallel
@@ -132,6 +141,51 @@ class LibraryProvider extends ChangeNotifier {
 
   Future<void> searchByGenre(String genre) =>
       _runSingle(() => _withRediscoverRetry((c) => c.searchSongsByGenre(genre)));
+
+  /// Content hashes the swarm can serve right now — the availability
+  /// overlay for Discover collections (dim, don't drop).
+  Set<String> get onlineHashes => {
+        for (final s in songs)
+          if (s.swarmSize > 0) s.contentHash,
+      };
+
+  /// Live catalog row for [hash], if a peer is currently seeding it.
+  /// Collections embed chain metadata only (no swarm_size); overlaying the
+  /// catalog row gets the fresher play count + swarm size when available.
+  Song? onlineSong(String hash) {
+    for (final s in songs) {
+      if (s.contentHash == hash && s.swarmSize > 0) return s;
+    }
+    return null;
+  }
+
+  Future<void> loadCollections() {
+    final existing = _collectionsInFlight;
+    if (existing != null) return existing;
+    final c = Completer<void>();
+    _collectionsInFlight = c.future;
+    () async {
+      collectionsLoading = true;
+      collectionsError   = null;
+      notifyListeners();
+      try {
+        collections = await _withRediscoverRetry((cl) => cl.getCollections());
+      } on RatsRpcException catch (e) {
+        // A freshly-started node answers not_ready until its first epoch
+        // generates — keep whatever set we already have and note the state.
+        collectionsError = e.status == 'not_ready'
+            ? 'The node is still curating — try again in a minute.'
+            : e.toString();
+      } catch (e) {
+        collectionsError = e.toString();
+      }
+      collectionsLoading = false;
+      notifyListeners();
+      _collectionsInFlight = null;
+      c.complete();
+    }();
+    return c.future;
+  }
 
   void setFilter(String value) {
     filter = value;

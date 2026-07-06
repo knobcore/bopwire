@@ -26,6 +26,7 @@
 #include "../src/sync/deep_audit.h"
 #include "../src/net/load_monitor.h"
 #include "../src/net/relay_credit_tracker.h"
+#include "../src/curation/collection_curator.h"
 #include "../src/crypto/bip39.h"
 #include "../src/core/transaction.h"
 #include "../src/crypto/keys.h"
@@ -494,6 +495,9 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     } else {
         std::cerr << "[node] rats link failed to start — continuing without NAT punch\n";
     }
+    // Set when the curation job starts below; joined explicitly at shutdown
+    // so its worker never outlives chain/db (both cmd_start locals).
+    mc::curation::CollectionCurator* curator_ptr = nullptr;
     if (rats.client()) {
         // BlockPropagator — bitcoin-style block distribution over
         // librats with BitTorrent-style DHT multi-source fetch.
@@ -600,6 +604,21 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
                           << db.hex(mini_addr) << " count=" << count
                           << " tx_hash=" << mc::crypto::to_hex(h) << "\n";
             });
+
+        // ---- Deterministic Discover curation (collections.list) -----
+        //
+        // Pure read job: once per epoch the curator scans on-chain song
+        // state and derives the curated Discover collections ("Rising",
+        // "Top 50", per-genre / per-year rows) deterministically — every
+        // honest node at the same epoch computes a byte-identical set, so
+        // clients can corroborate across nodes by comparing content_digest.
+        // No founder seed, no signing (contrast the relay mint path above).
+        // Declared static at cmd_start scope so its worker joins before
+        // rats_api dies.
+        static mc::curation::CollectionCurator curator(chain, db);
+        rats_api.set_curator(&curator);
+        curator.start();
+        curator_ptr = &curator;
     }
 
     // UPnP removed. NAT traversal is now librats's job (frozen v0.2.0):
@@ -634,6 +653,7 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     }
 
     std::cout << "[node] shutting down...\n";
+    if (curator_ptr) curator_ptr->stop();
     rats_api.stop();
     rats.stop();
     api.stop();

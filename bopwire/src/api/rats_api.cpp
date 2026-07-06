@@ -7,6 +7,7 @@
 #include "../sync/block_propagator.h"
 #include "../sync/deep_audit.h"   // audit_content + AuditResult for forgery re-audit (#4)
 #include "../net/relay_credit_tracker.h"
+#include "../curation/collection_curator.h"
 #include "../core/transaction.h"
 
 // mc_rats_quic.h was the old stub. We now link the real librats and
@@ -25,6 +26,7 @@
 #include <openssl/sha.h>
 #include <openssl/rand.h>   // RAND_bytes for delivery_id (#10)
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>   // std::getenv for the MC_RATS_DEBUG diagnostics gate (#6)
@@ -35,6 +37,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -675,6 +678,13 @@ void RatsApi::handle_request(const std::string& peer_id,
             // librats online). We drop everything else entirely so the
             // Discover surface is strictly "online files only". swarm_size
             // is the count of live holders so the client can still show it.
+            //
+            // Paged/search mode: when the body carries any of {q, artist,
+            // genre, album, offset, limit, sort}, the reply becomes
+            // {total, offset, limit, songs:[...]} with the filter + slice
+            // applied SERVER-SIDE, so a client browsing never pulls the whole
+            // catalog over the relay. A bare body keeps the legacy full-array
+            // shape for old clients.
             auto [code, body_str] = http_.verb_songs_list();
             if (code == 200) {
                 try {
@@ -698,11 +708,176 @@ void RatsApi::handle_request(const std::string& peer_id,
                                 hc == holder_counts.end() ? 0 : hc->second;
                             filtered.push_back(std::move(s));
                         }
-                        body_str = filtered.dump();
+                        const bool paged =
+                            in.contains("q") || in.contains("artist") ||
+                            in.contains("genre") || in.contains("album") ||
+                            in.contains("offset") || in.contains("limit") ||
+                            in.contains("sort");
+                        if (paged) {
+                            const auto lc = [](std::string s) {
+                                for (auto& c : s) c = static_cast<char>(
+                                    std::tolower(static_cast<unsigned char>(c)));
+                                return s;
+                            };
+                            const std::string q      = lc(in.value("q", ""));
+                            const std::string artist = lc(in.value("artist", ""));
+                            const std::string genre  = lc(in.value("genre", ""));
+                            const std::string album  = lc(in.value("album", ""));
+                            nlohmann::json hits = nlohmann::json::array();
+                            for (auto& s : filtered) {
+                                if (!artist.empty() &&
+                                    lc(s.value("artist", "")) != artist) continue;
+                                if (!genre.empty() &&
+                                    lc(s.value("genre", "")) != genre)  continue;
+                                if (!album.empty() &&
+                                    lc(s.value("album", "")) != album)  continue;
+                                if (!q.empty() &&
+                                    lc(s.value("title", "")).find(q)  == std::string::npos &&
+                                    lc(s.value("artist", "")).find(q) == std::string::npos &&
+                                    lc(s.value("album", "")).find(q)  == std::string::npos &&
+                                    lc(s.value("genre", "")).find(q)  == std::string::npos)
+                                    continue;
+                                hits.push_back(std::move(s));
+                            }
+                            const std::string sort = in.value("sort", "");
+                            if (sort == "plays") {
+                                std::stable_sort(hits.begin(), hits.end(),
+                                    [](const nlohmann::json& a, const nlohmann::json& b) {
+                                        return a.value("play_count", 0ull) >
+                                               b.value("play_count", 0ull);
+                                    });
+                            } else if (sort == "title") {
+                                std::stable_sort(hits.begin(), hits.end(),
+                                    [&](const nlohmann::json& a, const nlohmann::json& b) {
+                                        return a.value("title", "") < b.value("title", "");
+                                    });
+                            } else if (sort == "album") {
+                                // album drill order: album asc, then track number
+                                std::stable_sort(hits.begin(), hits.end(),
+                                    [](const nlohmann::json& a, const nlohmann::json& b) {
+                                        const auto aa = a.value("album", ""), ba = b.value("album", "");
+                                        if (aa != ba) return aa < ba;
+                                        return a.value("track_number", 0) <
+                                               b.value("track_number", 0);
+                                    });
+                            }
+                            const size_t total  = hits.size();
+                            size_t offset = 0, limit = 100;
+                            if (in.contains("offset") && in["offset"].is_number())
+                                offset = std::min<size_t>(
+                                    in["offset"].get<size_t>(), total);
+                            if (in.contains("limit") && in["limit"].is_number())
+                                limit = std::min<size_t>(
+                                    std::max<size_t>(in["limit"].get<size_t>(), 1), 500);
+                            nlohmann::json page = nlohmann::json::array();
+                            for (size_t i = offset;
+                                 i < total && page.size() < limit; ++i)
+                                page.push_back(std::move(hits[i]));
+                            body_str = nlohmann::json{
+                                {"total",  total},
+                                {"offset", offset},
+                                {"limit",  limit},
+                                {"songs",  std::move(page)},
+                            }.dump();
+                        } else {
+                            body_str = filtered.dump();
+                        }
                     }
                 } catch (const nlohmann::json::exception&) {/* keep raw */}
             }
             reply = wrap_handler_result(req_id, {code, body_str});
+        } else if (type == "songs.facets") {
+            // Browse without the catalog: the distinct artist / genre / year
+            // facets of the ONLINE song set, with counts. A few KB instead of
+            // the full songs.list — the client drills a facet and then pages
+            // songs.list with {artist:...} / {genre:...} server-side.
+            auto [code, body_str] = http_.verb_songs_list();
+            if (code == 200) {
+                try {
+                    auto arr = nlohmann::json::parse(body_str);
+                    if (arr.is_array()) {
+                        const auto live = live_wallets_();
+                        std::unordered_set<std::string> online;
+                        std::unordered_map<std::string, size_t> holder_counts;
+                        library_.online_snapshot(live, online, holder_counts);
+                        const auto lc = [](std::string s) {
+                            for (auto& c : s) c = static_cast<char>(
+                                std::tolower(static_cast<unsigned char>(c)));
+                            return s;
+                        };
+                        // norm key -> {display spelling (first seen), count}
+                        std::map<std::string, std::pair<std::string, size_t>> artists, genres;
+                        std::map<int, size_t> years;
+                        size_t total = 0;
+                        for (auto& s : arr) {
+                            if (online.count(s.value("content_hash", "")) == 0)
+                                continue;
+                            ++total;
+                            const std::string ar = s.value("artist", "");
+                            const std::string ge = s.value("genre", "");
+                            if (!ar.empty()) {
+                                auto& e = artists[lc(ar)];
+                                if (e.first.empty()) e.first = ar;
+                                ++e.second;
+                            }
+                            if (!ge.empty()) {
+                                auto& e = genres[lc(ge)];
+                                if (e.first.empty()) e.first = ge;
+                                ++e.second;
+                            }
+                            const int y = s.value("year", 0);
+                            if (y > 0) ++years[y];
+                        }
+                        auto facet_arr = [](const auto& m) {
+                            nlohmann::json out = nlohmann::json::array();
+                            for (const auto& [k, v] : m)
+                                out.push_back({{"name", v.first},
+                                               {"count", v.second}});
+                            return out;
+                        };
+                        nlohmann::json yr = nlohmann::json::array();
+                        for (const auto& [y, n] : years)
+                            yr.push_back({{"year", y}, {"count", n}});
+                        body_str = nlohmann::json{
+                            {"total",   total},
+                            {"artists", facet_arr(artists)},
+                            {"genres",  facet_arr(genres)},
+                            {"years",   std::move(yr)},
+                        }.dump();
+                    }
+                } catch (const nlohmann::json::exception&) {/* keep raw */}
+            }
+            reply = wrap_handler_result(req_id, {code, body_str});
+        } else if (type == "collections.list") {
+            // Deterministic per-epoch Discover feed (CollectionCurator).
+            // Default body is hashes-only (cheap, and what the cross-node
+            // digest covers); {embed:true} rides the deduplicated song
+            // metadata join along so one RPC renders the whole home screen.
+            nlohmann::json body =
+                curator_ ? curator_->list_json(in.value("embed", false))
+                         : nlohmann::json(nullptr);
+            if (body.is_null()) {
+                reply = {{"req_id", req_id}, {"status", "not_ready"},
+                         {"body", nullptr}};
+            } else {
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", std::move(body)}};
+            }
+        } else if (type == "collections.get") {
+            nlohmann::json body =
+                curator_ ? curator_->get_json(in.value("id", ""),
+                                              in.value("embed", false))
+                         : nlohmann::json(nullptr);
+            if (!curator_ || !curator_->ready()) {
+                reply = {{"req_id", req_id}, {"status", "not_ready"},
+                         {"body", nullptr}};
+            } else if (body.is_null()) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "unknown collection id"}};
+            } else {
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", std::move(body)}};
+            }
         } else if (type == "songs.get") {
             const std::string hash = in.value("content_hash", "");
             reply = wrap_handler_result(req_id, http_.verb_song_get(hash));
