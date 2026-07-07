@@ -25,6 +25,7 @@ import '../services/node_client.dart';
 import '../services/node_service.dart';
 import '../services/playlist_service.dart';
 import '../services/rats_client.dart';   // SwarmVariant (download quality picker)
+import '../widgets/album_art.dart';
 import '../widgets/cover_art.dart';
 import 'dmca_screen.dart';
 
@@ -540,8 +541,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 return ListTile(
                   leading: ClipRRect(
                     borderRadius: BorderRadius.circular(6),
-                    child: CoverArt(
-                        seed: seedFromHash(s.contentHash), size: 34),
+                    child: AlbumArt(
+                        seed: seedFromHash(s.contentHash), size: 34,
+                        artist: s.artist, album: s.album),
                   ),
                   title: Text(
                       s.title.isEmpty ? s.contentHash.substring(0, 12) : s.title),
@@ -646,6 +648,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
               onTap:    () => _onCardTapped(k, _DrillLevel.album),
               onMenu:   (pos) => _menuForBucket(pos, k, buckets[k]!),
               onPlay:   () => _playAll(buckets[k]!),
+              artArtist: _TrackPane.sortTracks(buckets[k]!).first.artist,
+              artAlbum:  k,
             ),
         ];
     }
@@ -885,6 +889,8 @@ class _FacetCard extends StatelessWidget {
     required this.onTap,
     required this.onMenu,
     required this.onPlay,
+    this.artArtist,
+    this.artAlbum,
   });
   final List<int>            seed;
   final String               label;
@@ -893,6 +899,8 @@ class _FacetCard extends StatelessWidget {
   final VoidCallback         onTap;
   final ValueChanged<Offset> onMenu;
   final VoidCallback         onPlay;
+  final String?              artArtist;   // album cards: real cover key
+  final String?              artAlbum;
 
   @override
   Widget build(BuildContext context) {
@@ -921,7 +929,8 @@ class _FacetCard extends StatelessWidget {
                     children: [
                       ClipRRect(
                         borderRadius: BorderRadius.circular(9),
-                        child: CoverArt(seed: seed, size: c.maxWidth),
+                        child: AlbumArt(seed: seed, size: c.maxWidth,
+                            artist: artArtist, album: artAlbum),
                       ),
                       Positioned(
                         right: 6, bottom: 6,
@@ -1245,7 +1254,9 @@ class _TrackPane extends StatelessWidget {
                   ),
                 ClipRRect(
                   borderRadius: BorderRadius.circular(8),
-                  child: CoverArt(seed: seed, size: 40),
+                  child: AlbumArt(seed: seed, size: 40,
+                      artist: isPlaylist ? null : artist,
+                      album: isPlaylist ? null : albumName),
                 ),
                 const SizedBox(width: 10),
                 Expanded(
@@ -1490,8 +1501,9 @@ class _SongRowState extends State<_SongRow> {
             const SizedBox(width: 8),
             ClipRRect(
               borderRadius: BorderRadius.circular(6),
-              child: CoverArt(
-                  seed: seedFromHash(s.contentHash), size: 34),
+              child: AlbumArt(
+                  seed: seedFromHash(s.contentHash), size: 34,
+                  artist: s.artist, album: s.album),
             ),
           ],
         ),

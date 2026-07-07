@@ -151,6 +151,26 @@ class NodeClient {
     return CollectionSet.fromJson(Map<String, dynamic>.from(r as Map));
   }
 
+  // ---- Album art ------------------------------------------------------
+
+  /// Real album cover the node scraped into DB2 (art.get). Returns the JPEG
+  /// bytes, or null when the node has no art for this album — the caller then
+  /// falls back to generated cover art. Artist/album are passed RAW; the node
+  /// owns normalization + keying, so there is no cross-impl key drift.
+  Future<Uint8List?> fetchAlbumArt(String artist, String album) async {
+    if (artist.trim().isEmpty) return null;
+    final r = await _rpc('art.get', {'artist': artist, 'album': album},
+        timeout: const Duration(seconds: 12));
+    if (r is! Map) return null;
+    final b64 = r['data_b64'];
+    if (b64 is! String || b64.isEmpty) return null; // {found:false} → miss
+    try {
+      return base64Decode(b64);
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<List<Song>> searchSongs(String query) async =>
       _decodeSongs(await _rpc('songs.search', {'q': query}));
 

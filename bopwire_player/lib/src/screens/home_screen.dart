@@ -7,6 +7,7 @@ import '../providers/download_provider.dart';
 import '../models/song.dart';
 import '../services/librats_discovery.dart';
 import '../services/rats_client.dart';
+import '../widgets/album_art.dart';
 import '../widgets/cover_art.dart';
 import 'discover_screen.dart';
 import 'local_library_screen.dart';
@@ -524,8 +525,9 @@ class _MiniPlayerState extends State<_MiniPlayer> {
               if (!idle) ...[
                 ClipRRect(
                   borderRadius: BorderRadius.circular(8),
-                  child: CoverArt(
-                      seed: seedFromHash(song.contentHash), size: 40),
+                  child: AlbumArt(
+                      seed: seedFromHash(song.contentHash), size: 40,
+                      artist: song.artist, album: song.album),
                 ),
                 const SizedBox(width: 10),
               ],

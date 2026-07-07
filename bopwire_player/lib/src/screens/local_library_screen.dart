@@ -17,6 +17,7 @@ import '../services/library_scanner.dart';
 import '../services/library_service.dart';
 import '../services/local_library_actions.dart';
 import '../services/playlist_service.dart';
+import '../widgets/album_art.dart';
 import '../widgets/cover_art.dart';
 import 'dmca_screen.dart';
 import 'folders_screen.dart';
@@ -612,8 +613,9 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
                 return ListTile(
                   leading: ClipRRect(
                     borderRadius: BorderRadius.circular(6),
-                    child: CoverArt(
-                        seed: seedFromHash(e.songId), size: 34),
+                    child: AlbumArt(
+                        seed: seedFromHash(e.songId), size: 34,
+                        artist: e.artist, album: e.album),
                   ),
                   title: Text(
                       e.title.isEmpty ? e.contentHash.substring(0, 12) : e.title),
@@ -721,6 +723,8 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
               onTap:    () => _onCardTapped(k, _DrillLevel.album),
               entries:  buckets[k]!,
               onPlay:   () => _playGroup(buckets[k]!),
+              artArtist: _sortEntries(buckets[k]!).first.artist,
+              artAlbum:  k,
             ),
         ];
     }
@@ -1158,6 +1162,8 @@ class _FacetCard extends StatelessWidget {
     required this.onTap,
     required this.entries,
     required this.onPlay,
+    this.artArtist,
+    this.artAlbum,
   });
   final List<int>          seed;
   final String             label;
@@ -1166,6 +1172,8 @@ class _FacetCard extends StatelessWidget {
   final VoidCallback       onTap;
   final List<LibraryEntry> entries;
   final VoidCallback       onPlay;
+  final String?            artArtist;   // album cards: real cover key
+  final String?            artAlbum;
 
   @override
   Widget build(BuildContext context) {
@@ -1196,7 +1204,8 @@ class _FacetCard extends StatelessWidget {
                     children: [
                       ClipRRect(
                         borderRadius: BorderRadius.circular(9),
-                        child: CoverArt(seed: seed, size: c.maxWidth),
+                        child: AlbumArt(seed: seed, size: c.maxWidth,
+                            artist: artArtist, album: artAlbum),
                       ),
                       if (selected)
                         Positioned(
@@ -1497,7 +1506,9 @@ class _TrackPane extends StatelessWidget {
               children: [
                 ClipRRect(
                   borderRadius: BorderRadius.circular(8),
-                  child: CoverArt(seed: seed, size: 40),
+                  child: AlbumArt(seed: seed, size: 40,
+                      artist: isPlaylist ? null : artist,
+                      album: isPlaylist ? null : albumName),
                 ),
                 const SizedBox(width: 10),
                 Expanded(
@@ -1779,8 +1790,9 @@ class _LocalEntryRow extends StatelessWidget {
                 const SizedBox(width: 8),
                 ClipRRect(
                   borderRadius: BorderRadius.circular(6),
-                  child: CoverArt(
-                      seed: seedFromHash(entry.songId), size: 34),
+                  child: AlbumArt(
+                      seed: seedFromHash(entry.songId), size: 34,
+                      artist: entry.artist, album: entry.album),
                 ),
               ],
             ),

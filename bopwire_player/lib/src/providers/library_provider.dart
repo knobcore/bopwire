@@ -159,6 +159,34 @@ class LibraryProvider extends ChangeNotifier {
     return null;
   }
 
+  // ---- album art (real covers the node scraped into DB2) ----------------
+  // Album key -> fetch. Stable for the process (art per album doesn't change),
+  // so every widget shares ONE fetch and never re-requests on rebuild. A
+  // completed null is a cached MISS; a transient failure is forgotten so a
+  // later build retries.
+  final Map<String, Future<Uint8List?>> _artCache = {};
+
+  static String _artKey(String artist, String album) {
+    String n(String s) => s.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+    final a = n(album);
+    return '${n(artist)}${a.isEmpty ? 'singles' : a}';
+  }
+
+  /// Real album cover for (artist, album), cached. Returns null on a miss (or
+  /// while no node is reachable) so the widget shows generated art. Never throws.
+  Future<Uint8List?> albumArt(String artist, String album) {
+    if (artist.trim().isEmpty) return Future<Uint8List?>.value(null);
+    final key = _artKey(artist, album);
+    return _artCache.putIfAbsent(key, () async {
+      try {
+        return await _withRediscoverRetry((c) => c.fetchAlbumArt(artist, album));
+      } catch (_) {
+        _artCache.remove(key); // transient (no node yet / flap) → allow retry
+        return null;
+      }
+    });
+  }
+
   Future<void> loadCollections() {
     final existing = _collectionsInFlight;
     if (existing != null) return existing;

@@ -27,6 +27,7 @@ import '../providers/player_provider.dart';
 import '../providers/wallet_provider.dart';
 import '../services/node_client.dart';
 import '../services/node_service.dart';
+import '../widgets/album_art.dart';
 import '../widgets/cover_art.dart';
 import 'library_screen.dart';
 
@@ -362,7 +363,8 @@ class _HeroCard extends StatelessWidget {
         children: [
           ClipRRect(
             borderRadius: BorderRadius.circular(12),
-            child: CoverArt(seed: seedFromHash(hero.contentHash), size: 104),
+            child: AlbumArt(seed: seedFromHash(hero.contentHash), size: 104,
+                artist: hero.artist, album: hero.album),
           ),
           const SizedBox(width: 14),
           Expanded(
@@ -559,8 +561,9 @@ class _SongCard extends StatelessWidget {
                 children: [
                   ClipRRect(
                     borderRadius: BorderRadius.circular(9),
-                    child: CoverArt(
-                        seed: seedFromHash(song.contentHash), size: 120),
+                    child: AlbumArt(
+                        seed: seedFromHash(song.contentHash), size: 120,
+                        artist: song.artist, album: song.album),
                   ),
                   if (off)
                     Positioned(
@@ -815,7 +818,8 @@ class CollectionScreen extends StatelessWidget {
               ClipRRect(
                 borderRadius: BorderRadius.circular(6),
                 child:
-                    CoverArt(seed: seedFromHash(s.contentHash), size: 34),
+                    AlbumArt(seed: seedFromHash(s.contentHash), size: 34,
+                        artist: s.artist, album: s.album),
               ),
             ],
           ),
@@ -1055,7 +1059,8 @@ class _SearchResultsViewState extends State<_SearchResultsView> {
               ClipRRect(
                 borderRadius: BorderRadius.circular(6),
                 child:
-                    CoverArt(seed: seedFromHash(s.contentHash), size: 34),
+                    AlbumArt(seed: seedFromHash(s.contentHash), size: 34,
+                        artist: s.artist, album: s.album),
               ),
             ],
           ),
