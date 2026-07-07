@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 import CoverArt from './CoverArt'
+import ArtistArt from './ArtistArt'
 import TrackList from './TrackList'
 import { avail, fetchSongs } from '../api'
 import { seedFromHash, seedFromName, tileGradient } from '../art'
@@ -48,7 +49,7 @@ export default function Browse({ facets, playingHash, onPlayTracks, onBlocked, o
   // ---- bucket data for the current level --------------------------------
   let buckets
   if (levelKind === 'artist' && mode === 'artist') {
-    buckets = (facets?.artists || []).map((a) => ({ key: normKey(a.name), label: a.name, count: a.count }))
+    buckets = (facets?.artists || []).map((a) => ({ key: normKey(a.name), label: a.name, count: a.count, albums: a.albums || [] }))
   } else if (levelKind === 'genre') {
     buckets = (facets?.genres || []).map((g) => ({ key: normKey(g.name), label: g.name, count: g.count }))
   } else {
@@ -202,9 +203,15 @@ function FacetGrid({ kind, buckets, loading, hasAny, selectedKey, onTap, onPlayG
         const seed = kind === 'album' && b.items?.length
           ? seedFromHash(b.items[0].contentHash)
           : seedFromName(b.label)
-        // Real cover only for album cards (needs an artist+album key); artist
-        // cards stay generated.
+        // Album cards get their real cover; artist cards cycle through the
+        // artist's album covers (see ArtistArt below).
         const artArtist = kind === 'album' ? (b.items?.[0]?.artist || '') : ''
+        const artistAlbums = kind === 'artist'
+          ? (b.albums?.length
+              ? b.albums
+              : [...new Set((b.items || [])
+                  .map((s) => (s.album || '').trim()).filter(Boolean))])
+          : []
         const selected = selectedKey && selectedKey === b.key
         const sub = kind === 'album'
           ? `${b.year ? b.year + ' · ' : ''}${b.count} track${b.count === 1 ? '' : 's'}`
@@ -219,7 +226,9 @@ function FacetGrid({ kind, buckets, loading, hasAny, selectedKey, onTap, onPlayG
               ${selected ? 'border-mint bg-elev' : 'border-transparent bg-elev hover:border-line'}`}>
             <div className="relative mb-2 aspect-square w-full overflow-hidden rounded-lg
                 shadow-[0_8px_22px_rgba(0,0,0,.45)]">
-              <CoverArt seed={seed} artist={artArtist} album={b.label} className="size-full" />
+              {kind === 'artist' && artistAlbums.length
+                ? <ArtistArt seed={seed} artist={b.label} albums={artistAlbums} className="size-full" />
+                : <CoverArt seed={seed} artist={artArtist} album={b.label} className="size-full" />}
               {b.items?.length > 0 && (
                 <button
                   aria-label={`Play ${b.label}`}

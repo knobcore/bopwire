@@ -485,10 +485,17 @@ int main() {
                 return s;
             };
             std::map<std::string, std::pair<std::string, size_t>> artists, genres;
+            // artist_lc -> (album_lc -> display album), for the artist-tile cover
+            // cycle: the client fetches /api/art for these and crossfades the hits.
+            std::map<std::string, std::map<std::string, std::string>> artistAlbums;
             std::map<int, size_t> years;
             for (const auto& s : cat) {
-                const std::string ar = s.value("artist", ""), ge = s.value("genre", "");
-                if (!ar.empty()) { auto& e = artists[lc(ar)]; if (e.first.empty()) e.first = ar; ++e.second; }
+                const std::string ar = s.value("artist", ""), ge = s.value("genre", ""),
+                                  al = s.value("album", "");
+                if (!ar.empty()) {
+                    auto& e = artists[lc(ar)]; if (e.first.empty()) e.first = ar; ++e.second;
+                    if (!al.empty()) artistAlbums[lc(ar)].emplace(lc(al), al);
+                }
                 if (!ge.empty()) { auto& e = genres[lc(ge)];  if (e.first.empty()) e.first = ge; ++e.second; }
                 const int y = s.value("year", 0);
                 if (y > 0) ++years[y];
@@ -499,11 +506,24 @@ int main() {
                     out.push_back({{"name", v.first}, {"count", v.second}});
                 return out;
             };
+            json artists_out = json::array();
+            for (const auto& [k, v] : artists) {
+                json albums = json::array();
+                if (auto it = artistAlbums.find(k); it != artistAlbums.end()) {
+                    size_t n = 0;
+                    for (const auto& [alc, disp] : it->second) {   // capped per artist
+                        albums.push_back(disp);
+                        if (++n >= 8) break;
+                    }
+                }
+                artists_out.push_back({{"name", v.first}, {"count", v.second},
+                                       {"albums", std::move(albums)}});
+            }
             json yr = json::array();
             for (const auto& [y, n] : years) yr.push_back({{"year", y}, {"count", n}});
             res.set_content(json{
                 {"total",   cat.size()},
-                {"artists", facet_arr(artists)},
+                {"artists", std::move(artists_out)},
                 {"genres",  facet_arr(genres)},
                 {"years",   std::move(yr)},
             }.dump(), "application/json");
