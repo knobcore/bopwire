@@ -2,6 +2,7 @@
 #include "server.h"
 #include "device_attestation.h"   // DeviceAttestationVerifier (#5)
 #include "../audio/fingerprint.h"
+#include "../art/album_key.h"
 #include "../moderation/mod_action.h"
 #include "../util/traffic.h"
 #include "../sync/block_propagator.h"
@@ -877,6 +878,26 @@ void RatsApi::handle_request(const std::string& peer_id,
             } else {
                 reply = {{"req_id", req_id}, {"status", "ok"},
                          {"body", std::move(body)}};
+            }
+        } else if (type == "art.get") {
+            // Real album cover (scraped by ArtScraper into art:<key>). Clients
+            // pass RAW artist+album; normalization + keying live ONLY here
+            // (album_key.h), so there is no cross-impl key drift. A miss returns
+            // found=false and the client falls back to its generated cover.
+            const std::string artist = in.value("artist", "");
+            const std::string album  = in.value("album", "");
+            if (artist.empty()) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "artist required"}};
+            } else if (auto blob = db_.get(mc::art::art_blob_key(artist, album));
+                       blob && !blob->empty()) {
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {{"content_type", "image/jpeg"},
+                                   {"data_b64",
+                                    mc::audio::base64_encode(blob->data(), blob->size())}}}};
+            } else {
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {{"found", false}}}};
             }
         } else if (type == "songs.get") {
             const std::string hash = in.value("content_hash", "");

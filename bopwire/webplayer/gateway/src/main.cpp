@@ -287,6 +287,15 @@ int main() {
     std::mutex play_mu;
     std::unordered_map<std::string, Play> plays;
 
+    // album-art cache: key "artist\x1falbum" -> decoded JPEG. A hit is stable
+    // (art per album doesn't change) so it lives for the process; a miss is kept
+    // briefly so a freshly-scraped cover appears without a gateway restart.
+    // Bounded — cleared wholesale past the cap.
+    struct ArtEnt { std::string bytes; bool found = false;
+                    std::chrono::steady_clock::time_point at{}; };
+    std::mutex art_mu;
+    std::unordered_map<std::string, ArtEnt> art_cache;
+
     // ───────────────────────── HTTP ─────────────────────────
     httplib::Server svr;
 
@@ -309,6 +318,31 @@ int main() {
     auto err = [](httplib::Response& res, int code, const std::string& msg) {
         res.status = code;
         res.set_content(json{{"error", msg}}.dump(), "application/json");
+    };
+
+    // Standard base64 decoder (art.get returns the JPEG base64-encoded over the
+    // JSON RPC). Skips whitespace/newlines; stops at '='.
+    auto b64dec = [](const std::string& s) -> std::string {
+        auto val = [](unsigned char c) -> int {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == '+') return 62;
+            if (c == '/') return 63;
+            return -1;
+        };
+        std::string out;
+        out.reserve(s.size() * 3 / 4);
+        int buf = 0, bits = 0;
+        for (unsigned char c : s) {
+            if (c == '=') break;
+            const int v = val(c);
+            if (v < 0) continue;
+            buf = (buf << 6) | v;
+            bits += 6;
+            if (bits >= 8) { bits -= 8; out.push_back(static_cast<char>((buf >> bits) & 0xff)); }
+        }
+        return out;
     };
 
     svr.Get("/api/health", [&](const httplib::Request&, httplib::Response& res) {
@@ -384,6 +418,60 @@ int main() {
             }.dump(), "application/json");
         }
         catch (const std::exception& e) { err(res, 503, e.what()); }
+    });
+
+    // /api/art?artist=<enc>&album=<enc> — real album cover (JPEG) the node
+    // scraped into DB2 via sacad. Immutable-cached in the browser; a miss is 404
+    // so the player's <img onError> falls back to generated cover art.
+    svr.Get("/api/art", [&](const httplib::Request& req, httplib::Response& res) {
+        const std::string artist = req.get_param_value("artist");
+        const std::string album  = req.get_param_value("album");
+        if (artist.empty()) { err(res, 400, "artist required"); return; }
+        const std::string key = artist + std::string(1, '\x1f') + album;
+
+        {   // cache lookup
+            std::lock_guard<std::mutex> lk(art_mu);
+            auto it = art_cache.find(key);
+            if (it != art_cache.end()) {
+                if (it->second.found) {
+                    res.set_header("Cache-Control", "public, max-age=31536000, immutable");
+                    res.set_content(it->second.bytes, "image/jpeg");
+                    return;
+                }
+                if (std::chrono::steady_clock::now() - it->second.at <
+                    std::chrono::seconds(90)) { err(res, 404, "no_art"); return; }
+            }
+        }
+
+        std::string jpeg;
+        bool found = false;
+        try {
+            const std::string node = link.pick_full_node();
+            if (node.empty()) throw std::runtime_error("no_node");
+            json r = link.rpc_via_relay(node, "art.get",
+                                        json{{"artist", artist}, {"album", album}}, 12000);
+            const json body = r.value("body", json::object());
+            if (body.is_object() && body.contains("data_b64")) {
+                jpeg  = b64dec(body.value("data_b64", std::string()));
+                found = !jpeg.empty();
+            }
+        } catch (const std::exception&) {
+            // transient node/relay error — don't negative-cache; just fall back.
+            err(res, 404, "no_art");
+            return;
+        }
+
+        {   // bounded cache update
+            std::lock_guard<std::mutex> lk(art_mu);
+            if (art_cache.size() > 4096) art_cache.clear();
+            art_cache[key] = ArtEnt{jpeg, found, std::chrono::steady_clock::now()};
+        }
+        if (found) {
+            res.set_header("Cache-Control", "public, max-age=31536000, immutable");
+            res.set_content(jpeg, "image/jpeg");
+        } else {
+            err(res, 404, "no_art");
+        }
     });
 
     // /api/facets — distinct artists / genres / years of the live catalog

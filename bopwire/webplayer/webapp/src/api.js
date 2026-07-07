@@ -22,6 +22,11 @@ export async function apiPost(path, body) {
 
 export const streamUrl = (hash) => `${GATEWAY}/api/stream/${hash}`
 
+/// Real album cover (scraped by the node). 404 on a miss → the <img> in
+/// CoverArt self-removes and the generated art shows through.
+export const artUrl = (artist, album) =>
+  `${GATEWAY}/api/art?artist=${encodeURIComponent(artist || '')}&album=${encodeURIComponent(album || '')}`
+
 /// Server-side search / facet page — the catalog never ships whole.
 export async function fetchSongs(params) {
   const qs = new URLSearchParams(params).toString()

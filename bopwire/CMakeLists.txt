@@ -19,6 +19,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Linux mini-node cross-build in WSL.
 option(MC_MINI_NODE_ONLY "Configure only the mini-node target" OFF)
 
+# Real album-art scraping via the vendored sacad Rust static library
+# (deps/sacad-ffi → libsacad_ffi.a), linked into bopwire-node ONLY. Requires a
+# Rust toolchain (cargo) on the build host. Auto-disabled if cargo is missing or
+# on Windows (the node is only deployed on Linux; the Flutter player never links
+# this). When OFF, art_scraper.cpp is not compiled and the node runs without the
+# scraper — clients fall back to generated cover art exactly as before.
+option(MC_WITH_ART "Scrape real album art via the vendored sacad Rust static lib" ON)
+
 # Build type
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -367,6 +375,43 @@ add_library(mc_rats ALIAS rats)
 # Older code paths may still reference mc_rats_quic by name — alias too.
 add_library(mc_rats_quic ALIAS rats)
 
+# ---- sacad album-art static library (bopwire-node only) ----
+#
+# Vendored Rust sacad (deps/sacad) + a thin C-ABI FFI crate (deps/sacad-ffi)
+# compiled by cargo to libsacad_ffi.a and linked into bopwire-node. It is NEVER
+# part of MC_SOURCES, so the Flutter player's `bopwire` shared lib stays
+# Rust-free. Auto-disabled on Windows or when cargo is absent.
+if(MC_WITH_ART AND WIN32)
+  message(STATUS "MC_WITH_ART: disabled on Windows (node is deployed on Linux only)")
+  set(MC_WITH_ART OFF)
+endif()
+if(MC_WITH_ART AND NOT MC_MINI_NODE_ONLY)
+  find_program(CARGO_EXECUTABLE cargo)
+  if(NOT CARGO_EXECUTABLE)
+    message(WARNING "MC_WITH_ART=ON but 'cargo' (Rust) not found — building node "
+                    "WITHOUT album art. Install rustup to enable real covers.")
+    set(MC_WITH_ART OFF)
+  endif()
+endif()
+if(MC_WITH_ART AND NOT MC_MINI_NODE_ONLY)
+  set(SACAD_FFI_DIR        ${CMAKE_CURRENT_SOURCE_DIR}/deps/sacad-ffi)
+  set(SACAD_FFI_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/sacad-ffi-target)
+  set(SACAD_FFI_LIB        ${SACAD_FFI_TARGET_DIR}/release/libsacad_ffi.a)
+  # Rebuild the archive when the FFI or vendored sacad sources change.
+  file(GLOB_RECURSE SACAD_FFI_SRCS
+       ${SACAD_FFI_DIR}/src/*.rs ${SACAD_FFI_DIR}/Cargo.toml
+       ${CMAKE_CURRENT_SOURCE_DIR}/deps/sacad/src/*.rs)
+  add_custom_command(
+    OUTPUT ${SACAD_FFI_LIB}
+    COMMAND ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${SACAD_FFI_TARGET_DIR}
+            ${CARGO_EXECUTABLE} build --release --manifest-path ${SACAD_FFI_DIR}/Cargo.toml
+    DEPENDS ${SACAD_FFI_SRCS}
+    COMMENT "Building sacad cover-art static library (cargo --release, first build is slow)"
+    USES_TERMINAL VERBATIM)
+  add_custom_target(sacad_ffi_build DEPENDS ${SACAD_FFI_LIB})
+  message(STATUS "MC_WITH_ART: album art ON (sacad via ${CARGO_EXECUTABLE})")
+endif()
+
 if(NOT MC_MINI_NODE_ONLY)
 
 # Shared library (C API for Flutter FFI)
@@ -389,6 +434,16 @@ target_link_libraries(bopwire_static PUBLIC ${MC_LINK_LIBS})
 add_executable(bopwire-node tools/node_main.cpp tools/node_tui.cpp)
 target_include_directories(bopwire-node PRIVATE ${MC_INCLUDE_DIRS})
 target_link_libraries(bopwire-node PRIVATE bopwire_static)
+
+# Real album art (node-only): compile the scraper into the node and link the
+# vendored sacad Rust static lib. The archive bundles rustls/tokio/image/etc.,
+# so it only needs the base system libs below (from cargo's native-static-libs).
+if(MC_WITH_ART)
+  add_dependencies(bopwire-node sacad_ffi_build)
+  target_sources(bopwire-node PRIVATE src/art/art_scraper.cpp)
+  target_compile_definitions(bopwire-node PRIVATE MC_WITH_ART=1)
+  target_link_libraries(bopwire-node PRIVATE ${SACAD_FFI_LIB} pthread dl m rt)
+endif()
 
 # ncurses (Linux) / PDCurses (Windows, via vcpkg) for the home node's
 # interactive TUI. Both ship a Curses-compatible API so the same TUI

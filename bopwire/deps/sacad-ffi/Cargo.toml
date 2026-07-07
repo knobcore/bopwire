@@ -1,0 +1,21 @@
+[package]
+name = "sacad-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C-ABI static library wrapping sacad cover-art fetch for the bopwire node"
+
+# Static library linked into bopwire-node. Bundles sacad + its whole Rust dep
+# tree + std into a single archive; the C++ side links it with pthread/dl/m.
+[lib]
+name = "sacad_ffi"
+crate-type = ["staticlib"]
+
+[dependencies]
+# Vendored, unmodified sacad (github.com/desbma/sacad v3.0.1). reqwest is on
+# rustls (no OpenSSL) so the archive links cleanly into C++.
+sacad = { path = "../sacad" }
+# sacad calls tokio::spawn internally, so we drive it from a multi-thread runtime.
+# Version/features unify with sacad's own tokio pin.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+clap = { version = "4", default-features = false, features = ["std", "derive"] }

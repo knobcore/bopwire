@@ -25,7 +25,8 @@ export default function NowPlaying() {
         bg-elev/85 px-3 backdrop-blur-md sm:px-4"
       style={{ '--seek-fill': a1, boxShadow: `0 -1px 24px color-mix(in oklab, ${a1} 12%, transparent)` }}
     >
-      <CoverArt seed={songSeed(s)} className="size-11 shrink-0 overflow-hidden rounded-lg" />
+      <CoverArt seed={songSeed(s)} artist={s.artist} album={s.album}
+        className="size-11 shrink-0 overflow-hidden rounded-lg" />
       <div className="w-32 min-w-0 sm:w-52">
         <p className="truncate text-sm font-semibold">{s.title || '(untitled)'}</p>
         <p className="truncate text-xs text-dim">{s.artist}</p>

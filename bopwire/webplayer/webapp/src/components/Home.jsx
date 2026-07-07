@@ -74,7 +74,8 @@ function Hero({ collection, onPlay, onMore }) {
     <section className="animate-rise relative flex flex-col items-start gap-5 overflow-hidden
         rounded-2xl border border-line bg-elev p-5 sm:flex-row sm:items-center sm:p-7
         bg-[radial-gradient(900px_280px_at_8%_-40%,color-mix(in_oklab,var(--color-mint)_16%,transparent),transparent_60%),radial-gradient(760px_300px_at_92%_140%,color-mix(in_oklab,var(--color-sky)_14%,transparent),transparent_60%)]">
-      <CoverArt seed={songSeed(s)} className="size-28 shrink-0 overflow-hidden rounded-xl
+      <CoverArt seed={songSeed(s)} artist={s.artist} album={s.album}
+          className="size-28 shrink-0 overflow-hidden rounded-xl
           shadow-[0_14px_40px_rgba(0,0,0,.55)] sm:size-36" />
       <div className="min-w-0">
         <p className="mb-1.5 text-[11px] font-extrabold uppercase tracking-[.14em] text-mint">
@@ -163,7 +164,7 @@ function SongCard({ song: s, playing, onClick }) {
     >
       <div className="relative mb-2 aspect-square w-full overflow-hidden rounded-lg
           shadow-[0_8px_22px_rgba(0,0,0,.45)]">
-        <CoverArt seed={songSeed(s)} className="size-full" />
+        <CoverArt seed={songSeed(s)} artist={s.artist} album={s.album} className="size-full" />
         {off ? (
           <span className="absolute left-1.5 top-1.5 rounded-full border border-line bg-bg/75
               px-2 py-0.5 text-[10px] font-bold">offline</span>

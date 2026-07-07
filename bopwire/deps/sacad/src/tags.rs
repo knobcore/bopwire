@@ -1,0 +1,670 @@
+//! Audio metadata handling
+
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
+
+use anyhow::Context as _;
+use lofty::{
+    file::{AudioFile as _, TaggedFileExt as _},
+    picture, tag,
+};
+
+/// File tags
+#[derive(Debug)]
+pub struct Tags {
+    /// Artist tag, None if various artists detected
+    pub artist: Option<String>,
+    /// Album tag
+    pub album: String,
+    /// If requested, whether file has embedded cover or not
+    pub has_embedded_cover: Option<bool>,
+}
+
+static ARTIST_KEYS: LazyLock<Vec<tag::ItemKey>> =
+    LazyLock::new(|| vec![tag::ItemKey::AlbumArtist, tag::ItemKey::TrackArtist]);
+static ALBUM_KEYS: LazyLock<Vec<tag::ItemKey>> = LazyLock::new(|| {
+    vec![
+        tag::ItemKey::Unknown("_ALBUM".to_owned()),
+        tag::ItemKey::AlbumTitle,
+    ]
+});
+
+fn extract_tag<'a>(
+    tags: &'a tag::Tag,
+    keys: &'a [tag::ItemKey],
+) -> Option<(&'a str, &'a tag::ItemKey)> {
+    for key in keys {
+        if let Some(value) = tags.get_string(key) {
+            return Some((value, key));
+        }
+    }
+    None
+}
+
+// Return the first file tag type that already has artist and album set
+fn usable_tag_type(file: &lofty::file::TaggedFile) -> Option<tag::TagType> {
+    for tags in file.primary_tag().into_iter().chain(file.tags()) {
+        if extract_tag(tags, &ARTIST_KEYS).is_some() && extract_tag(tags, &ALBUM_KEYS).is_some() {
+            return Some(tags.tag_type());
+        }
+    }
+    None
+}
+
+/// Read artist/album tags from a bunch of audio files from the same album, and optionally if it has embedded cover.
+/// Return early as soon has a single file with both tags has been found
+#[must_use]
+pub fn read_metadata<P>(file_paths: &[P], probe_embedded_cover: bool) -> Option<Tags>
+where
+    P: AsRef<Path>,
+{
+    for file_path in file_paths {
+        let Ok(file) = lofty::read_from_path(file_path) else {
+            continue;
+        };
+        if let Some(tag_type) = usable_tag_type(&file) {
+            let tags = file.tag(tag_type)?;
+            let has_embedded_cover = probe_embedded_cover.then(|| {
+                tags.pictures()
+                    .iter()
+                    .any(|p| p.pic_type() == picture::PictureType::CoverFront)
+            });
+            let (tag_artist, artist_key) = extract_tag(tags, &ARTIST_KEYS)?;
+            return Some(Tags {
+                artist: ((artist_key != &tag::ItemKey::AlbumArtist)
+                    || !is_various_artist(tag_artist))
+                .then(|| tag_artist.to_owned()),
+                album: extract_tag(tags, &ALBUM_KEYS)?.0.to_owned(),
+                has_embedded_cover,
+            });
+        }
+    }
+    None
+}
+
+/// Default value for various artists
+pub const DEFAULT_VARIOUS_ARTISTS_VALUE: &str = "Various Artists";
+
+/// Values for the artist tag, which make sacad assume it is various artists
+static VARIOUS_ARTISTS: LazyLock<HashSet<&str>> =
+    LazyLock::new(|| ["various", "various artists"].into_iter().collect());
+
+/// Return true if artist string indicates "various artists" album
+fn is_various_artist(artist: &str) -> bool {
+    VARIOUS_ARTISTS.contains(artist.to_lowercase().as_str())
+}
+
+/// Embed front cover into all given files
+pub fn embed_cover(img_path: &Path, audio_filepaths: Vec<PathBuf>) -> anyhow::Result<()> {
+    let mut img_file = fs::File::open(img_path)
+        .with_context(|| format!("Failed to read image from {img_path:?}"))?;
+    let mut picture =
+        picture::Picture::from_reader(&mut img_file).context("Failed to load image")?;
+    picture.set_pic_type(picture::PictureType::CoverFront);
+
+    for audio_filepath in audio_filepaths {
+        let mut file = lofty::read_from_path(&audio_filepath)
+            .with_context(|| format!("Failed to load tags from {audio_filepath:?}"))?;
+        if let Some(tag_type) = usable_tag_type(&file) {
+            let tags = file
+                .tag_mut(tag_type)
+                .ok_or_else(|| anyhow::anyhow!("Tags have disappeared from {audio_filepath:?}"))?;
+            tags.remove_picture_type(picture::PictureType::CoverFront);
+            tags.push_picture(picture.clone());
+            file.save_to_path(&audio_filepath, lofty::config::WriteOptions::default())
+                .with_context(|| format!("Failed to write tags to {audio_filepath:?}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::Write as _,
+        path::PathBuf,
+        process::{Command, Stdio},
+        sync::LazyLock,
+    };
+
+    use super::*;
+
+    fn generate_test_png() -> Vec<u8> {
+        let output = Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=100x100:d=1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "png",
+                "-f",
+                "image2pipe",
+                "pipe:1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        output.stdout
+    }
+
+    static TEST_COVER_PNG: LazyLock<Vec<u8>> = LazyLock::new(generate_test_png);
+
+    fn generate_audio_file(
+        extension: &str,
+        artist: Option<&str>,
+        album_artist: Option<&str>,
+        album: Option<&str>,
+        png_cover: Option<&[u8]>,
+    ) -> tempfile::NamedTempFile {
+        generate_audio_file_with_album_key(
+            extension,
+            artist,
+            album_artist,
+            "album",
+            album,
+            png_cover,
+        )
+    }
+
+    fn generate_audio_file_with_album_key(
+        extension: &str,
+        artist: Option<&str>,
+        album_artist: Option<&str>,
+        album_key: &str,
+        album: Option<&str>,
+        png_cover: Option<&[u8]>,
+    ) -> tempfile::NamedTempFile {
+        let audio_file = tempfile::Builder::new()
+            .suffix(&format!(".{extension}"))
+            .tempfile()
+            .unwrap();
+
+        let cover_file = png_cover.map(|data| {
+            let mut f = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+            f.write_all(data).unwrap();
+            f
+        });
+
+        let mut cmd = Command::new("ffmpeg");
+
+        cmd.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+        ]);
+
+        if let Some(cover_file) = &cover_file {
+            cmd.arg("-i");
+            cmd.arg(cover_file.path());
+            cmd.args([
+                "-map",
+                "0:a",
+                "-map",
+                "1:v",
+                "-c:v",
+                "copy",
+                "-metadata:s:v",
+                "title=Album cover",
+                "-metadata:s:v",
+                "comment=Cover (front)",
+                "-disposition:v",
+                "attached_pic",
+            ]);
+        }
+
+        if let Some(artist) = artist {
+            cmd.arg("-metadata");
+            cmd.arg(format!("artist={artist}"));
+        }
+
+        if let Some(album_artist) = album_artist {
+            cmd.arg("-metadata");
+            cmd.arg(format!("album_artist={album_artist}"));
+        }
+
+        if let Some(album) = album {
+            cmd.arg("-metadata");
+            cmd.arg(format!("{album_key}={album}"));
+        }
+
+        cmd.arg("-y");
+        cmd.arg(audio_file.path());
+
+        let status = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        audio_file
+    }
+
+    macro_rules! ffmpeg_test {
+        ($item:item) => {
+            #[cfg_attr(
+                not(feature = "tests-ffmpeg"),
+                ignore = "tests-ffmpeg feature is not set"
+            )]
+            #[test]
+            $item
+        };
+    }
+
+    ffmpeg_test! {
+        fn ogg_vorbis_with_vorbis_comments() {
+            let file = generate_audio_file("ogg", Some("Test Artist"), None, Some("Test Album"), None);
+            let tags = read_metadata(&[file], false).unwrap();
+            assert_eq!(tags.artist.unwrap(), "Test Artist");
+            assert_eq!(tags.album, "Test Album");
+            assert!(tags.has_embedded_cover.is_none());
+        }
+    }
+
+    ffmpeg_test! {
+        fn mp3_with_id3v2() {
+            let file = generate_audio_file("mp3", Some("MP3 Artist"), None, Some("MP3 Album"), None);
+            let tags = read_metadata(&[file], false).unwrap();
+            assert_eq!(tags.artist.unwrap(), "MP3 Artist");
+            assert_eq!(tags.album, "MP3 Album");
+        }
+    }
+
+    ffmpeg_test! {
+        fn mp3_with_embedded_cover() {
+            let file = generate_audio_file(
+                "mp3",
+                Some("MP3 Cover Artist"),
+                None,
+                Some("MP3 Cover Album"),
+                Some(&TEST_COVER_PNG),
+            );
+            let tags = read_metadata(&[file], true).unwrap();
+            assert_eq!(tags.has_embedded_cover, Some(true));
+        }
+    }
+
+    ffmpeg_test! {
+        fn flac_with_vorbis_comments() {
+            let file = generate_audio_file("flac", Some("FLAC Artist"), None, Some("FLAC Album"), None);
+            let tags = read_metadata(&[file], false).unwrap();
+            assert_eq!(tags.artist.unwrap(), "FLAC Artist");
+            assert_eq!(tags.album, "FLAC Album");
+        }
+    }
+
+    ffmpeg_test! {
+        fn ogg_vorbis_with_underscore_album_tag() {
+            let file = generate_audio_file_with_album_key(
+                "ogg",
+                Some("Test Artist"),
+                None,
+                "_ALBUM",
+                Some("Test Album"),
+                None,
+            );
+            let tags = read_metadata(&[file], false).unwrap();
+            assert_eq!(tags.album, "Test Album");
+        }
+    }
+
+    ffmpeg_test! {
+        fn flac_with_embedded_cover() {
+            let file = generate_audio_file(
+                "flac",
+                Some("FLAC Cover Artist"),
+                None,
+                Some("FLAC Cover Album"),
+                Some(&TEST_COVER_PNG),
+            );
+            let tags = read_metadata(&[file], true).unwrap();
+            assert_eq!(tags.has_embedded_cover, Some(true));
+        }
+    }
+
+    ffmpeg_test! {
+        fn wav_with_riff_info() {
+            let file = generate_audio_file("wav", Some("WAV Artist"), None, Some("WAV Album"), None);
+            let tags = read_metadata(&[file], false).unwrap();
+            assert_eq!(tags.artist.unwrap(), "WAV Artist");
+            assert_eq!(tags.album, "WAV Album");
+        }
+    }
+
+    ffmpeg_test! {
+        fn file_without_tags() {
+            let file = generate_audio_file("ogg", None, None, None, None);
+            let result = read_metadata(&[file], false);
+            assert!(result.is_none());
+        }
+    }
+
+    ffmpeg_test! {
+        fn file_with_only_artist_tag() {
+            let file = generate_audio_file("ogg", Some("Only Artist"), None, None, None);
+            let result = read_metadata(&[file], false);
+            assert!(result.is_none());
+        }
+    }
+
+    ffmpeg_test! {
+        fn file_with_only_album_tag() {
+            let file = generate_audio_file("ogg", None, None, Some("Only Album"), None);
+            let result = read_metadata(&[file], false);
+            assert!(result.is_none());
+        }
+    }
+
+    ffmpeg_test! {
+        fn multiple_files_first_valid() {
+            let file1 =
+                generate_audio_file("ogg", Some("First Artist"), None, Some("First Album"), None);
+            let file2 = generate_audio_file(
+                "ogg",
+                Some("Second Artist"),
+                None,
+                Some("Second Album"),
+                None,
+            );
+            let tags = read_metadata(&[file1, file2], false).unwrap();
+            assert_eq!(tags.artist.unwrap(), "First Artist");
+            assert_eq!(tags.album, "First Album");
+        }
+    }
+
+    ffmpeg_test! {
+        fn multiple_files_first_invalid_second_valid() {
+            let file1 = generate_audio_file("ogg", None, None, None, None);
+            let file2 = generate_audio_file(
+                "ogg",
+                Some("Second Artist"),
+                None,
+                Some("Second Album"),
+                None,
+            );
+            let tags = read_metadata(&[file1, file2], false).unwrap();
+            assert_eq!(tags.artist.unwrap(), "Second Artist");
+            assert_eq!(tags.album, "Second Album");
+        }
+    }
+
+    ffmpeg_test! {
+        fn nonexistent_file() {
+            let result = read_metadata(&[PathBuf::from("/nonexistent/path/file.mp3")], false);
+            assert!(result.is_none());
+        }
+    }
+
+    ffmpeg_test! {
+        fn empty_file_list() {
+            let result = read_metadata::<PathBuf>(&[], false);
+            assert!(result.is_none());
+        }
+    }
+
+    ffmpeg_test! {
+        fn corrupt_file() {
+            let mut corrupt_file = tempfile::Builder::new().suffix(".mp3").tempfile().unwrap();
+            corrupt_file
+                .write_all(b"This is not a valid audio file")
+                .unwrap();
+            let result = read_metadata(&[corrupt_file.path().to_path_buf()], false);
+            assert!(result.is_none());
+        }
+    }
+
+    ffmpeg_test! {
+        fn no_embedded_cover_probe() {
+            let file = generate_audio_file(
+                "mp3",
+                Some("No Cover Artist"),
+                None,
+                Some("No Cover Album"),
+                None,
+            );
+            let tags = read_metadata(&[file], true).unwrap();
+            assert_eq!(tags.has_embedded_cover, Some(false));
+        }
+    }
+
+    ffmpeg_test! {
+        fn album_artist_fallback() {
+            let file = generate_audio_file("ogg", None, Some("Album Artist"), Some("Test Album"), None);
+            let tags = read_metadata(&[file], false).unwrap();
+            assert_eq!(tags.artist.unwrap(), "Album Artist");
+            assert_eq!(tags.album, "Test Album");
+        }
+    }
+
+    ffmpeg_test! {
+        fn track_album_artist_preferred_over_track_artist() {
+            let file = generate_audio_file(
+                "ogg",
+                Some("Track Artist"),
+                Some("Album Artist"),
+                Some("Test Album"),
+                None,
+            );
+            let tags = read_metadata(&[file], false).unwrap();
+            assert_eq!(tags.artist.unwrap(), "Album Artist");
+        }
+    }
+
+    ffmpeg_test! {
+        fn various_artists_album_artist_returns_none() {
+            let file = generate_audio_file(
+                "ogg",
+                Some("Track Artist"),
+                Some("Various Artists"),
+                Some("Compilation Album"),
+                None,
+            );
+            let tags = read_metadata(&[file], false).unwrap();
+            assert!(tags.artist.is_none());
+            assert_eq!(tags.album, "Compilation Album");
+        }
+    }
+
+    ffmpeg_test! {
+        fn various_artists_case_insensitive() {
+            let file = generate_audio_file(
+                "ogg",
+                Some("Track Artist"),
+                Some("VARIOUS ARTISTS"),
+                Some("Compilation"),
+                None,
+            );
+            let tags = read_metadata(&[file], false).unwrap();
+            assert!(tags.artist.is_none());
+        }
+    }
+
+    ffmpeg_test! {
+        fn various_album_artist_returns_none() {
+            let file = generate_audio_file(
+                "ogg",
+                Some("Track Artist"),
+                Some("Various"),
+                Some("Compilation"),
+                None,
+            );
+            let tags = read_metadata(&[file], false).unwrap();
+            assert!(tags.artist.is_none());
+        }
+    }
+
+    ffmpeg_test! {
+        fn various_artists_track_artist_only_kept() {
+            let file = generate_audio_file(
+                "ogg",
+                Some("Various Artists"),
+                None,
+                Some("Album"),
+                None,
+            );
+            let tags = read_metadata(&[file], false).unwrap();
+            assert_eq!(tags.artist.unwrap(), "Various Artists");
+        }
+    }
+
+    ffmpeg_test! {
+        fn non_various_album_artist_kept() {
+            let file = generate_audio_file(
+                "ogg",
+                Some("Track Artist"),
+                Some("Real Album Artist"),
+                Some("Album"),
+                None,
+            );
+            let tags = read_metadata(&[file], false).unwrap();
+            assert_eq!(tags.artist.unwrap(), "Real Album Artist");
+        }
+    }
+
+    #[test]
+    fn is_various_artist_matches() {
+        assert!(is_various_artist("Various Artists"));
+        assert!(is_various_artist("various artists"));
+        assert!(is_various_artist("VARIOUS ARTISTS"));
+        assert!(is_various_artist("Various"));
+        assert!(is_various_artist("various"));
+        assert!(is_various_artist("VARIOUS"));
+    }
+
+    #[test]
+    fn is_various_artist_rejects() {
+        assert!(!is_various_artist("Pink Floyd"));
+        assert!(!is_various_artist("The Various"));
+        assert!(!is_various_artist("Various Artists United"));
+        assert!(!is_various_artist(""));
+    }
+
+    fn write_test_cover_to_file() -> tempfile::NamedTempFile {
+        let mut cover_file = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        cover_file.write_all(&TEST_COVER_PNG).unwrap();
+        cover_file.flush().unwrap();
+        cover_file
+    }
+
+    ffmpeg_test! {
+        fn embed_cover_mp3() {
+            let audio_file = generate_audio_file("mp3", Some("Artist"), None, Some("Album"), None);
+            let audio_path = audio_file.path().to_path_buf();
+
+            let tags_before = read_metadata(&[&audio_path], true).unwrap();
+            assert_eq!(tags_before.has_embedded_cover, Some(false));
+
+            let cover_file = write_test_cover_to_file();
+            embed_cover(cover_file.path(), vec![audio_path.clone()]).unwrap();
+
+            let tags_after = read_metadata(&[&audio_path], true).unwrap();
+            assert_eq!(tags_after.has_embedded_cover, Some(true));
+        }
+    }
+
+    ffmpeg_test! {
+        fn embed_cover_flac() {
+            let audio_file = generate_audio_file("flac", Some("Artist"), None, Some("Album"), None);
+            let audio_path = audio_file.path().to_path_buf();
+
+            let tags_before = read_metadata(&[&audio_path], true).unwrap();
+            assert_eq!(tags_before.has_embedded_cover, Some(false));
+
+            let cover_file = write_test_cover_to_file();
+            embed_cover(cover_file.path(), vec![audio_path.clone()]).unwrap();
+
+            let tags_after = read_metadata(&[&audio_path], true).unwrap();
+            assert_eq!(tags_after.has_embedded_cover, Some(true));
+        }
+    }
+
+    ffmpeg_test! {
+        fn embed_cover_ogg() {
+            let audio_file = generate_audio_file("ogg", Some("Artist"), None, Some("Album"), None);
+            let audio_path = audio_file.path().to_path_buf();
+
+            let tags_before = read_metadata(&[&audio_path], true).unwrap();
+            assert_eq!(tags_before.has_embedded_cover, Some(false));
+
+            let cover_file = write_test_cover_to_file();
+            embed_cover(cover_file.path(), vec![audio_path.clone()]).unwrap();
+
+            let tags_after = read_metadata(&[&audio_path], true).unwrap();
+            assert_eq!(tags_after.has_embedded_cover, Some(true));
+        }
+    }
+
+    ffmpeg_test! {
+        fn embed_cover_multiple_files() {
+            let audio_file1 = generate_audio_file("mp3", Some("Artist"), None, Some("Album"), None);
+            let audio_file2 = generate_audio_file("flac", Some("Artist"), None, Some("Album"), None);
+            let audio_path1 = audio_file1.path().to_path_buf();
+            let audio_path2 = audio_file2.path().to_path_buf();
+
+            let cover_file = write_test_cover_to_file();
+            embed_cover(cover_file.path(), vec![audio_path1.clone(), audio_path2.clone()]).unwrap();
+
+            let tags1 = read_metadata(&[&audio_path1], true).unwrap();
+            let tags2 = read_metadata(&[&audio_path2], true).unwrap();
+            assert_eq!(tags1.has_embedded_cover, Some(true));
+            assert_eq!(tags2.has_embedded_cover, Some(true));
+        }
+    }
+
+    ffmpeg_test! {
+        fn embed_cover_replaces_existing() {
+            let audio_file = generate_audio_file(
+                "mp3",
+                Some("Artist"),
+                None,
+                Some("Album"),
+                Some(&TEST_COVER_PNG),
+            );
+            let audio_path = audio_file.path().to_path_buf();
+
+            let tags_before = read_metadata(&[&audio_path], true).unwrap();
+            assert_eq!(tags_before.has_embedded_cover, Some(true));
+
+            let cover_file = write_test_cover_to_file();
+            embed_cover(cover_file.path(), vec![audio_path.clone()]).unwrap();
+
+            let tags_after = read_metadata(&[&audio_path], true).unwrap();
+            assert_eq!(tags_after.has_embedded_cover, Some(true));
+        }
+    }
+
+    ffmpeg_test! {
+        fn embed_cover_nonexistent_image() {
+            let audio_file = generate_audio_file("mp3", Some("Artist"), None, Some("Album"), None);
+            let audio_path = audio_file.path().to_path_buf();
+
+            let result = embed_cover(Path::new("/nonexistent/cover.png"), vec![audio_path]);
+            assert!(result.is_err());
+        }
+    }
+
+    ffmpeg_test! {
+        fn embed_cover_empty_file_list() {
+            let cover_file = write_test_cover_to_file();
+            let result = embed_cover(cover_file.path(), vec![]);
+            assert!(result.is_ok());
+        }
+    }
+}

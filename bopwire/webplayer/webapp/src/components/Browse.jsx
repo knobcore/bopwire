@@ -202,6 +202,9 @@ function FacetGrid({ kind, buckets, loading, hasAny, selectedKey, onTap, onPlayG
         const seed = kind === 'album' && b.items?.length
           ? seedFromHash(b.items[0].contentHash)
           : seedFromName(b.label)
+        // Real cover only for album cards (needs an artist+album key); artist
+        // cards stay generated.
+        const artArtist = kind === 'album' ? (b.items?.[0]?.artist || '') : ''
         const selected = selectedKey && selectedKey === b.key
         const sub = kind === 'album'
           ? `${b.year ? b.year + ' · ' : ''}${b.count} track${b.count === 1 ? '' : 's'}`
@@ -216,7 +219,7 @@ function FacetGrid({ kind, buckets, loading, hasAny, selectedKey, onTap, onPlayG
               ${selected ? 'border-mint bg-elev' : 'border-transparent bg-elev hover:border-line'}`}>
             <div className="relative mb-2 aspect-square w-full overflow-hidden rounded-lg
                 shadow-[0_8px_22px_rgba(0,0,0,.45)]">
-              <CoverArt seed={seed} className="size-full" />
+              <CoverArt seed={seed} artist={artArtist} album={b.label} className="size-full" />
               {b.items?.length > 0 && (
                 <button
                   aria-label={`Play ${b.label}`}
@@ -271,7 +274,8 @@ function AlbumPane({ album, tracks, playingHash, artistHint, onClose, onPlayTrac
         <button onClick={onClose} aria-label="Back"
           className="grid size-8 flex-none place-items-center rounded-full border border-line
             text-dim transition-colors hover:border-dim hover:text-ink sm:hidden">←</button>
-        <CoverArt seed={seed} className="size-14 flex-none overflow-hidden rounded-lg
+        <CoverArt seed={seed} artist={artist} album={album.label}
+            className="size-14 flex-none overflow-hidden rounded-lg
             shadow-[0_8px_22px_rgba(0,0,0,.45)] sm:size-16" />
         <div className="min-w-0 flex-1">
           <p className="truncate text-[15px] font-extrabold sm:text-base">{album.label}</p>

@@ -27,6 +27,9 @@
 #include "../src/net/load_monitor.h"
 #include "../src/net/relay_credit_tracker.h"
 #include "../src/curation/collection_curator.h"
+#ifdef MC_WITH_ART
+#include "../src/art/art_scraper.h"
+#endif
 #include "../src/crypto/bip39.h"
 #include "../src/core/transaction.h"
 #include "../src/crypto/keys.h"
@@ -498,6 +501,9 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // Set when the curation job starts below; joined explicitly at shutdown
     // so its worker never outlives chain/db (both cmd_start locals).
     mc::curation::CollectionCurator* curator_ptr = nullptr;
+#ifdef MC_WITH_ART
+    mc::art::ArtScraper* art_ptr = nullptr;
+#endif
     if (rats.client()) {
         // BlockPropagator — bitcoin-style block distribution over
         // librats with BitTorrent-style DHT multi-source fetch.
@@ -619,6 +625,17 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         rats_api.set_curator(&curator);
         curator.start();
         curator_ptr = &curator;
+
+#ifdef MC_WITH_ART
+        // Real album-art scraper: fills art:<key> JPEG blobs in DB2 by calling
+        // the vendored sacad static lib in-process (no subprocess). Reads chain
+        // song meta, writes only its own art:/arts: keyspace. Static so its
+        // worker joins before chain/db (cmd_start locals) are torn down.
+        static mc::art::ArtScraper art_scraper(db);
+        art_scraper.start();
+        art_ptr = &art_scraper;
+        std::cout << "[art] scraper started (sacad in-process)\n";
+#endif
     }
 
     // UPnP removed. NAT traversal is now librats's job (frozen v0.2.0):
@@ -654,6 +671,9 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
 
     std::cout << "[node] shutting down...\n";
     if (curator_ptr) curator_ptr->stop();
+#ifdef MC_WITH_ART
+    if (art_ptr) art_ptr->stop();
+#endif
     rats_api.stop();
     rats.stop();
     api.stop();

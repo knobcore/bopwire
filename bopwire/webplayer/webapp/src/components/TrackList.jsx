@@ -23,7 +23,8 @@ export default function TrackList({ tracks, numbered, playingHash, onPlay, onBlo
             <span className="text-right text-xs tabular-nums text-dim">
               {numbered ? (s.trackNumber || i + 1) : i + 1}
             </span>
-            <CoverArt seed={songSeed(s)} className="size-9 overflow-hidden rounded-md" />
+            <CoverArt seed={songSeed(s)} artist={s.artist} album={s.album}
+              className="size-9 overflow-hidden rounded-md" />
             <span className="min-w-0">
               <span className={`block truncate text-sm ${playing ? 'font-semibold text-mint' : ''}`}>
                 {s.title || '(untitled)'}
