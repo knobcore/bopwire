@@ -12,9 +12,24 @@
  * first. Each load owns its OWN decoder (never a shared field a stale pump could
  * decode through, nor one another call could free mid-decode); the owning pump
  * frees it when it stops. This is what stops two tracks overlapping.
+ *
+ * Resilience (playback must not stop or go silent mid-song):
+ *   - keeps AHEAD_SEC of decoded audio scheduled so seeder/network hiccups don't
+ *     underrun;
+ *   - if the browser suspends the AudioContext on its own (backgrounded tab,
+ *     battery saver, post-stall), _tick auto-resumes it;
+ *   - an underrun re-anchors the clock so the position tracks real sound instead
+ *     of racing ahead into silence;
+ *   - a premature stream close (seeder/gateway dropped mid-song) is re-requested
+ *     from the next byte into the SAME decoder, so the track resumes seamlessly.
  */
 (() => {
   'use strict';
+
+  // Seconds of decoded audio to keep scheduled ahead of the playhead. A generous
+  // lead rides out seeder/network hiccups without an audible gap; the reader is
+  // paused past this (backpressuring the fetch so the gateway stops over-pulling).
+  const AHEAD_SEC = 30;
 
   function decoderFactory(ct) {
     ct = (ct || '').toLowerCase();
@@ -33,6 +48,7 @@
       this._sources = []; this._abort = null;
       this._endTimer = null; this._tickTimer = null;
       this._gen = 0; this.playing = false; this._eof = false; this.volume = 1;
+      this._userPaused = false;   // true only when the USER paused (blocks auto-resume)
       this.onended = null; this.ontimeupdate = null; this.onplaying = null;
     }
 
@@ -69,7 +85,7 @@
       this._silence();
       this.url = url; this._ct = ''; this.durationSec = durationSec || 0; this.totalBytes = 0;
       this.unlock();
-      this.playing = true; this._eof = false;
+      this.playing = true; this._eof = false; this._userPaused = false;
       this._basePos = 0; this._baseCtx = 0; this._next = 0;
       this._abort = new AbortController();
 
@@ -88,7 +104,7 @@
       if (gen !== this._gen) { try { decoder.free(); } catch (_) {} return; }
 
       this._readTotal(resp, 0);
-      this._pump(resp.body.getReader(), gen, decoder);
+      this._pump(resp.body.getReader(), gen, decoder, 0);
       this._tick();
     }
 
@@ -102,20 +118,55 @@
       }
     }
 
-    async _pump(reader, gen, decoder) {
+    // Re-request the stream from absolute served-byte `absOffset` and return a
+    // fresh reader (or null). Used when the swarm/gateway drops the stream mid
+    // song — we feed the resumed bytes into the SAME decoder, so the bitstream is
+    // contiguous and needs no resync.
+    async _reopen(absOffset, gen) {
+      for (let attempt = 0; attempt < 2 && this.playing && gen === this._gen; attempt++) {
+        try {
+          const resp = await fetch(this.url, {
+            signal: this._abort.signal, headers: { Range: `bytes=${absOffset}-` } });
+          if (gen !== this._gen) { try { resp.body.cancel(); } catch (_) {} return null; }
+          if (resp.ok || resp.status === 206) { this._readTotal(resp, absOffset); return resp.body.getReader(); }
+          try { resp.body.cancel(); } catch (_) {}
+        } catch (_) { if (gen !== this._gen) return null; }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      return null;
+    }
+
+    async _pump(reader, gen, decoder, baseOffset) {
+      let bytesRead = 0;      // served bytes consumed in this pump (relative to baseOffset)
+      let continues = 0;      // bounded premature-close re-requests
       try {
         while (this.playing && gen === this._gen) {
-          // Pace: stay within ~12 s of playback instead of scheduling the whole
-          // song at once (the gateway streams faster than realtime). Bounds the
-          // live source count so stop() can actually stop everything. Pausing the
-          // reader also backpressures the fetch, so the gateway stops over-pulling.
+          // Pace: stay within ~AHEAD_SEC of playback instead of scheduling the
+          // whole song at once (the gateway streams faster than realtime). Bounds
+          // the live source count so stop() can stop everything, and pausing the
+          // reader backpressures the fetch so the gateway stops over-pulling.
           while (this.playing && gen === this._gen && this.ctx && this._next > 0 &&
-                 (this._next - this.ctx.currentTime) > 12) {
+                 (this._next - this.ctx.currentTime) > AHEAD_SEC) {
             await new Promise((r) => setTimeout(r, 150));
           }
           if (!this.playing || gen !== this._gen) break;
-          const { done, value } = await reader.read();
-          if (done || gen !== this._gen) break;
+          let done, value;
+          try { ({ done, value } = await reader.read()); }
+          catch (_) { done = true; }
+          if (gen !== this._gen) break;
+          if (done) {
+            // Stream ended. If the decoded audio is still well short of the song
+            // duration, a seeder/gateway dropped mid-song rather than a real EOF —
+            // resume from the next byte into the SAME decoder. Bounded so a truly
+            // dead swarm still ends the track.
+            if (this.durationSec && this.currentTime < this.durationSec - 3 &&
+                continues < 10 && this.playing && gen === this._gen) {
+              const r2 = await this._reopen(baseOffset + bytesRead, gen);
+              if (r2) { continues++; try { reader.cancel(); } catch (_) {} reader = r2; continue; }
+            }
+            break;
+          }
+          bytesRead += (value && (value.byteLength || value.length)) || 0;
           let out;
           try { out = await decoder.decode(value); } catch (_) { continue; }
           if (out && out.samplesDecoded > 0 && gen === this._gen) this._schedule(out);
@@ -142,6 +193,14 @@
         this._baseCtx = this.ctx.currentTime + 0.06;     // tiny lead so we never schedule in the past
         this._next = this._baseCtx;
         if (this.onplaying) this.onplaying();
+      } else if (this.ctx.currentTime > this._next) {
+        // Underrun: the buffer fully drained before this chunk arrived (a network
+        // stall). Bank the audio actually played and re-anchor the clock to NOW,
+        // so the reported position tracks real sound (it freezes through the gap
+        // instead of racing ahead into silence) and we resume cleanly at 'now'.
+        this._basePos += (this._next - this._baseCtx);
+        this._baseCtx = this.ctx.currentTime;
+        this._next = this.ctx.currentTime;
       }
       const t = Math.max(this._next, this.ctx.currentTime);
       try { src.start(t); } catch (_) { return; }
@@ -162,6 +221,13 @@
     _tick() {
       if (this._tickTimer) clearTimeout(this._tickTimer);
       this._tickTimer = setTimeout(() => {
+        // Browsers suspend an AudioContext on their own (backgrounded tab, battery
+        // saver, or after a stall) — that freezes the clock and silences output
+        // with no error, which looks like "playback stopped" or "plays without
+        // sound". If we're meant to be playing and the user didn't pause, resume
+        // it. resume() needs a gesture only for the FIRST start, so this is safe.
+        if (this.playing && !this._userPaused && this.ctx && this.ctx.state === 'suspended')
+          this.ctx.resume();
         if (this.ontimeupdate) this.ontimeupdate();
         if (this.playing) this._tick();
       }, 200);
@@ -169,13 +235,16 @@
 
     get currentTime() {
       if (!this.ctx || this._baseCtx === 0) return this._basePos;
-      return Math.max(0, this._basePos + (this.ctx.currentTime - this._baseCtx));
+      // Clamp to the end of scheduled audio so an underrun (ctx clock past _next)
+      // freezes the reported position instead of counting silence as elapsed.
+      const upto = Math.min(this.ctx.currentTime, this._next);
+      return Math.max(0, this._basePos + (upto - this._baseCtx));
     }
     get duration() { return this.durationSec; }
     get paused() { return !this.ctx || this.ctx.state !== 'running'; }
 
-    pause()  { if (this.ctx && this.ctx.state === 'running')   this.ctx.suspend(); }
-    resume() { if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); }
+    pause()  { this._userPaused = true;  if (this.ctx && this.ctx.state === 'running')   this.ctx.suspend(); }
+    resume() { this._userPaused = false; if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); }
     setVolume(v) { this.volume = v; if (this.gain) this.gain.gain.value = v; }
 
     async seek(posSec) {
@@ -186,7 +255,7 @@
 
       const gen = ++this._gen;            // supersede the running pump (it frees its own decoder)
       this._silence();
-      this.playing = true; this._eof = false;
+      this.playing = true; this._eof = false; this._userPaused = false;
       this._basePos = posSec; this._baseCtx = 0; this._next = 0;
       this._abort = new AbortController();
 
@@ -201,13 +270,14 @@
       if (gen !== this._gen) { try { decoder.free(); } catch (_) {} return; }
 
       this._readTotal(resp, offset);
-      this._pump(resp.body.getReader(), gen, decoder);
+      this._pump(resp.body.getReader(), gen, decoder, offset);
       this._tick();
     }
 
     async stop() {
       this._gen++;                        // supersede the running pump → it frees its own decoder
       this._silence();
+      this._userPaused = false;
       this._basePos = 0; this.totalBytes = 0;
       // keep this.ctx / this.gain alive for reuse (recreating needs a gesture)
     }

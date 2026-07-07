@@ -266,13 +266,36 @@ std::string PieceStore::get_range(int64_t offset, int64_t len) {
                                       [&] { return stop_.load() || pieces_.count(p) > 0; });
         if (stop_.load()) return {};
         if (!got || !pieces_.count(p)) {              // prefetcher behind → fetch now
-            lk.unlock();
-            FetchOut r = swarm_fetch(p, kBatchPieces);
-            lk.lock();
-            if (!r.ok) return {};
-            store_locked(p, r.bytes);
-            if (r.total >= 0) total_size_.store(r.total);
-            if (!pieces_.count(p)) return {};
+            // A TRANSIENT seeder failure here must NOT tear down the stream mid
+            // song: httplib turns an empty return into "response complete", which
+            // the player sees as end-of-track ("playback stops after a while").
+            // Real EOF is already handled above (offset >= total), so here we are
+            // still inside the file — retry the piece a few times, rotating the
+            // starting seeder and backing off so a briefly-saturated upload has
+            // time to recover, before giving up.
+            bool have = false;
+            for (int attempt = 0; attempt < 5 && !stop_.load(); ++attempt) {
+                lk.unlock();
+                FetchOut r = swarm_fetch(p, kBatchPieces, attempt);
+                const bool ok = r.ok;
+                std::string rb = std::move(r.bytes);
+                const int64_t rtot = r.total;
+                lk.lock();
+                if (ok) {
+                    store_locked(p, rb);
+                    if (rtot >= 0) total_size_.store(rtot);
+                }
+                if (pieces_.count(p)) { have = true; break; }
+                lk.unlock();
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(std::min(250 * (attempt + 1), 1000)));
+                lk.lock();
+                if (pieces_.count(p)) { have = true; break; }
+                if (stop_.load()) return {};
+                const int64_t tot = total_size_.load();   // re-check EOF after backoff
+                if (tot >= 0 && offset >= tot) return {};
+            }
+            if (!have) return {};   // swarm truly unavailable → give up (client re-requests)
         }
     }
     std::string out;
