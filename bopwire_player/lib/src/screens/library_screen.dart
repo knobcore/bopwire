@@ -623,6 +623,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
               onTap:    () => _onCardTapped(k, _DrillLevel.artist),
               onMenu:   (pos) => _menuForBucket(pos, k, buckets[k]!),
               onPlay:   () => _playAll(buckets[k]!),
+              artArtist: k,
+              artAlbums: {
+                for (final s in buckets[k]!)
+                  if (s.album.trim().isNotEmpty) s.album.trim(),
+              }.toList(),
             ),
         ];
       case _DrillLevel.album:
@@ -891,6 +896,7 @@ class _FacetCard extends StatelessWidget {
     required this.onPlay,
     this.artArtist,
     this.artAlbum,
+    this.artAlbums,
   });
   final List<int>            seed;
   final String               label;
@@ -901,6 +907,7 @@ class _FacetCard extends StatelessWidget {
   final VoidCallback         onPlay;
   final String?              artArtist;   // album cards: real cover key
   final String?              artAlbum;
+  final List<String>?        artAlbums;   // artist cards: cycle these covers
 
   @override
   Widget build(BuildContext context) {
@@ -929,8 +936,12 @@ class _FacetCard extends StatelessWidget {
                     children: [
                       ClipRRect(
                         borderRadius: BorderRadius.circular(9),
-                        child: AlbumArt(seed: seed, size: c.maxWidth,
-                            artist: artArtist, album: artAlbum),
+                        child: (artAlbums != null && artAlbums!.isNotEmpty &&
+                                artArtist != null)
+                            ? ArtistArt(seed: seed, size: c.maxWidth,
+                                artist: artArtist!, albums: artAlbums!)
+                            : AlbumArt(seed: seed, size: c.maxWidth,
+                                artist: artArtist, album: artAlbum),
                       ),
                       Positioned(
                         right: 6, bottom: 6,

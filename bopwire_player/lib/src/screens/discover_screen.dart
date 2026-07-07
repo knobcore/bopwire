@@ -373,7 +373,7 @@ class _HeroCard extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  '✦ RISING — EVERY LISTEN PAYS THE ARTIST IN FULL',
+                  '✦ RISING',
                   style: theme.textTheme.labelSmall?.copyWith(
                     color: theme.colorScheme.primary,
                     fontWeight: FontWeight.w800,
