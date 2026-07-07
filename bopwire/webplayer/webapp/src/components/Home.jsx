@@ -79,7 +79,7 @@ function Hero({ collection, onPlay, onMore }) {
           shadow-[0_14px_40px_rgba(0,0,0,.55)] sm:size-36" />
       <div className="min-w-0">
         <p className="mb-1.5 text-[11px] font-extrabold uppercase tracking-[.14em] text-mint">
-          ✦ Rising — every listen pays the artist in full
+          ✦ Rising
         </p>
         <h1 className="truncate text-xl font-extrabold leading-tight sm:text-[26px]">
           {s.title || '(untitled)'}

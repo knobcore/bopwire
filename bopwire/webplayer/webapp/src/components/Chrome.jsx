@@ -61,7 +61,7 @@ export function CtaFooter() {
         border-line bg-gradient-to-r from-mint/10 to-sky/10 text-[13px] max-sm:px-2
         max-sm:text-xs">
       <span className="text-center">
-        Want to earn crypto listening to artists with less than 10,000 plays?
+        Want to earn crypto listening to artists with less than 10,000 plays or sharing your library?
       </span>
       <span className="relative" ref={ref}>
         <button onClick={() => setOpen(!open)} aria-haspopup="true" aria-expanded={open}
