@@ -26,16 +26,7 @@ namespace mc {
 // Heartbeat blocks (no fingerprint submissions in 5 minutes) ship with
 // has_song == 0; the SongSection is empty and only the tx pool is
 // carried.
-//
-// v4 vs v3 — SINGLE-SEQUENCER authority (fork-free, final on inclusion).
-// Every non-genesis block carries a `sequencer_sig`: an ECDSA signature over
-// block.hash() by the ONE sequencer key whose pubkey is published in chain
-// state (`seq:`) at genesis. Only that key can produce a block the network
-// accepts, so competing height-N blocks are impossible → no forks, no chain
-// splits, no reorg (hence no double-spend window). The signature is NOT part
-// of the header hash preimage (it signs the hash), so it lives on Block, not
-// BlockHeader. Genesis (height 1) is the trusted origin and is sig-exempt.
-static constexpr uint32_t BLOCK_VERSION      = 4;
+static constexpr uint32_t BLOCK_VERSION      = 3;
 static constexpr uint8_t  SEPARATOR_BYTE     = 0xFF;
 static constexpr size_t   SEPARATOR_LENGTH   = 8;
 
@@ -178,15 +169,6 @@ struct BlockHeader {
     Hash256                    fingerprint_hash{}; // zero on heartbeat
     Hash256                    content_hash{};     // zero on heartbeat
     uint64_t                   timestamp_ms     = 0;
-    // Single-sequencer authority (v4): the GENESIS block (height 1) commits
-    // the sequencer's compressed pubkey here; every other block leaves it
-    // zero. Committing it in the genesis header makes it tamper-evident (it
-    // is part of the chain identity) and lets any node that SYNCS the chain
-    // learn the sequencer from block 1 — connect_block copies it into chain
-    // state (`seq:`), against which all later blocks' sequencer_sig is
-    // verified. This is the same "trust the shared genesis" anchor as the
-    // founder GRANT.
-    PubKey33                   sequencer_pubkey{}; // zero except in genesis
     // Model 1 (vote-free deterministic consensus): the header carries NO
     // validator confirmations. Canonicality is re-derived by every node
     // from content + history (fingerprint_hash, merkle_root, prev_hash,
@@ -211,14 +193,6 @@ struct Block {
     bool                     has_song = false;
     SongSection              song; // valid only when has_song == true
     std::vector<std::vector<uint8_t>> transactions; // raw transaction bytes
-
-    // Single-sequencer authority signature (block format v4): ECDSA over
-    // header.hash() by the sequencer key (pubkey in chain state `seq:`).
-    // Zero on the genesis block (height 1), which is sig-exempt as the
-    // trusted origin. Verified by Chain::validate_block, NOT Block::validate
-    // (the latter has no access to the seq pubkey). Excluded from the header
-    // hash preimage — it signs the hash, so it cannot be inside it.
-    Sig64                    sequencer_sig{};
 
     // Serialize entire block to bytes
     std::vector<uint8_t> serialize() const;

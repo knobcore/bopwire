@@ -49,22 +49,14 @@ else()
   find_package(Threads REQUIRED)
 endif()
 
-# Static-link the C++/gcc runtimes into every executable + shared lib so a
-# deploy target needs no matching libstdc++.so.6 / libgcc_s.so.1 — the classic
-# "GLIBCXX_3.4.xx not found" dependency hell when a binary moves to an older
-# box. glibc itself stays DYNAMIC on purpose: a fully -static glibc breaks
-# NSS / DNS resolution, which the node needs (peers, STUN, UPnP). All other
-# third-party libs are vendored + built static (deps/vendored.cmake).
-if(NOT MSVC AND NOT APPLE)
-  add_link_options(-static-libstdc++ -static-libgcc)
-  # Make every static archive's symbols LOCAL in our EXECUTABLES so the vendored
-  # opus/chromaprint (which mark their API visibility("default") explicitly,
-  # overriding the hidden preset) cannot interpose the system ffmpeg's own
-  # dynamic opus/chromaprint/etc. via ELF global-symbol interposition. Scoped to
-  # executables — libbopwire.so must keep exporting its mc_* FFI symbols, so it
-  # is handled separately (and PE has no such interposition anyway).
-  add_link_options("$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:LINKER:--exclude-libs,ALL>")
-endif()
+# NB: we deliberately do NOT -static-libstdc++/-static-libgcc or
+# --exclude-libs,ALL here. The node/mini/player load librats as a SHARED lib
+# (libmc_rats.so), and that library needs the C++ runtime; folding a private
+# static libstdc++ into the executable and hiding its symbols leaves
+# libmc_rats.so unable to resolve __cxxabiv1::__terminate at load time. The
+# whole process therefore shares one dynamic libstdc++.so.6 (present on the
+# build+run box; the Linux AppImage bundles it). Interposition of the vendored
+# codecs is handled by the hidden-visibility preset in deps/vendored.cmake.
 
 # ---- Find dependencies ----
 
@@ -413,13 +405,6 @@ else()
     target_include_directories(bopwire-node PRIVATE ${CURSES_INCLUDE_DIRS})
     target_link_libraries(bopwire-node PRIVATE ${CURSES_LIBRARIES})
 endif()
-
-# test_sequencer — focused single-sequencer consensus regression test (block
-# v4): proves genesis is signature-exempt and that ONLY sequencer-signed
-# blocks connect (rogue/unsigned are rejected → the chain cannot fork).
-add_executable(test_sequencer tools/test_sequencer.cpp)
-target_include_directories(test_sequencer PRIVATE ${MC_INCLUDE_DIRS})
-target_link_libraries(test_sequencer PRIVATE bopwire_static)
 
 # --------------------------------------------------------------------
 # bopwire-admin (PRIVATE, optional). The founder/moderator program: a full

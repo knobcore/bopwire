@@ -74,8 +74,6 @@ std::vector<uint8_t> BlockHeader::serialize() const {
     write_bytes(buf, fingerprint_hash.data(), 32);
     write_bytes(buf, content_hash.data(),     32);
     write_u64le(buf, timestamp_ms);
-    // Single-sequencer authority (v4): sequencer pubkey (zero except genesis).
-    write_bytes(buf, sequencer_pubkey.data(), 33);
     // Model 1 / format v3: no confirmations vector in the header.
     return buf;
 }
@@ -93,10 +91,6 @@ std::vector<uint8_t> Block::serialize() const {
     // Header
     auto hdr = header.serialize();
     buf.insert(buf.end(), hdr.begin(), hdr.end());
-
-    // Sequencer authority signature (block v4): 64 bytes over header.hash().
-    // Follows the header so it stays outside the header-hash preimage.
-    write_bytes(buf, sequencer_sig.data(), 64);
 
     // Optional song record
     buf.push_back(has_song ? 0x01 : 0x00);
@@ -144,10 +138,6 @@ bool Block::deserialize(const uint8_t* data, size_t len, Block& out) {
     if (!read_bytes(p, end, out.header.fingerprint_hash.data(), 32)) return false;
     if (!read_bytes(p, end, out.header.content_hash.data(),     32)) return false;
     if (!read_u64le(p, end, out.header.timestamp_ms))               return false;
-    // Single-sequencer authority (v4): sequencer pubkey (33 bytes) in header.
-    if (!read_bytes(p, end, out.header.sequencer_pubkey.data(), 33)) return false;
-    // Sequencer authority signature (block v4): 64 bytes after the header.
-    if (!read_bytes(p, end, out.sequencer_sig.data(), 64))          return false;
     // Model 1 / format v3: no confirmations vector to read.
 
     // --- Optional song record ---

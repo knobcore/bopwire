@@ -7,7 +7,6 @@
 #include "../audio/ogg_validator.h"
 #include "../crypto/hash.h"
 #include "../crypto/keys.h"
-#include "../crypto/signature.h"   // sign_ecdsa for the sequencer signature
 #include <chrono>
 #include <algorithm>
 #include <cstring>
@@ -161,17 +160,6 @@ bool CandidateManager::commit_block(
     (void)keypair;
     (void)consumed_txs;
 
-    // Single-sequencer authority (v4): sign the finalized block over
-    // block.hash() (the header hash) with the sequencer key. Only the
-    // sequencer reaches commit_block (heartbeat_loop early-returns for a
-    // replica), so the key is present; the guard keeps us safe regardless.
-    if (!sequencer_key_) {
-        err = "no sequencer key — this node is not the block producer";
-        return false;
-    }
-    block.sequencer_sig =
-        crypto::sign_ecdsa(block.hash(), sequencer_key_->private_key);
-
     if (!chain.connect_block(block)) {
         err = "Chain connect_block rejected";
         return false;
@@ -214,17 +202,6 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                                        net::NetworkManager& network,
                                        const net::NodeConfig& cfg,
                                        const crypto::KeyPair& keypair) {
-    // Single-sequencer authority (v4): ONLY the node holding the sequencer
-    // key produces blocks. Without it this node is a validating replica — it
-    // never mints, so it can never create a competing height-N block and the
-    // chain cannot fork/split (and with no reorg, confirmed txs are final).
-    // (Registrations/txs a replica receives are minted by the sequencer;
-    // cross-node relay to the sequencer is a separate, later concern.)
-    if (!sequencer_key_) {
-        std::cout << "[producer] no sequencer key — this node is a validating "
-                     "replica; block production disabled\n";
-        return;
-    }
     // Wakes on three signals:
     //   * a player just queued a song registration (enqueue_registration
     //     pokes us so the song lands in the next block — and we keep
