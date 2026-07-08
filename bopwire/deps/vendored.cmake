@@ -20,8 +20,22 @@
 
 set(_BW_DEPS ${CMAKE_CURRENT_LIST_DIR})   # absolute path of <src>/deps
 
+# Some vendored libs (opus, leveldb) declare a very old cmake_minimum_required,
+# which CMake >= 4.0 (newer Windows installs) rejects as a hard error rather
+# than a deprecation warning. Treat their floor as 3.5 so they still configure.
+# (Unknown/ignored on the older CMake shipped on the VPS — safe everywhere.)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
 # Force every sub-build below to produce a static archive.
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+# chromaprint.h declares its API as __declspec(dllimport) on Windows unless
+# CHROMAPRINT_NODLL is set. We build it STATIC, so define this globally (before
+# add_subdirectory below AND for every consumer like fingerprint.cpp) — else
+# the linker looks for __imp_chromaprint_* import stubs that don't exist.
+if(WIN32)
+  add_compile_definitions(CHROMAPRINT_NODLL)
+endif()
 
 # Hide the vendored libs' symbols from the final binary's dynamic symbol table
 # so they do NOT interpose the SYSTEM ffmpeg's own dynamic ogg/vorbis/opus/
