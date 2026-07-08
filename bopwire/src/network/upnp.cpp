@@ -7,9 +7,11 @@
 #include <chrono>
 #include <cstring>
 
-#include <miniupnpc/miniupnpc.h>
-#include <miniupnpc/upnpcommands.h>
-#include <miniupnpc/upnperrors.h>
+// Vendored miniupnpc (deps/miniupnpc) ships its headers flat in include/,
+// so no "miniupnpc/" prefix (the prefix is only the installed layout).
+#include <miniupnpc.h>
+#include <upnpcommands.h>
+#include <upnperrors.h>
 
 namespace mc::net {
 

@@ -49,6 +49,23 @@ else()
   find_package(Threads REQUIRED)
 endif()
 
+# Static-link the C++/gcc runtimes into every executable + shared lib so a
+# deploy target needs no matching libstdc++.so.6 / libgcc_s.so.1 — the classic
+# "GLIBCXX_3.4.xx not found" dependency hell when a binary moves to an older
+# box. glibc itself stays DYNAMIC on purpose: a fully -static glibc breaks
+# NSS / DNS resolution, which the node needs (peers, STUN, UPnP). All other
+# third-party libs are vendored + built static (deps/vendored.cmake).
+if(NOT MSVC AND NOT APPLE)
+  add_link_options(-static-libstdc++ -static-libgcc)
+  # Make every static archive's symbols LOCAL in our EXECUTABLES so the vendored
+  # opus/chromaprint (which mark their API visibility("default") explicitly,
+  # overriding the hidden preset) cannot interpose the system ffmpeg's own
+  # dynamic opus/chromaprint/etc. via ELF global-symbol interposition. Scoped to
+  # executables — libbopwire.so must keep exporting its mc_* FFI symbols, so it
+  # is handled separately (and PE has no such interposition anyway).
+  add_link_options("$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:LINKER:--exclude-libs,ALL>")
+endif()
+
 # ---- Find dependencies ----
 
 find_package(OpenSSL REQUIRED)
@@ -58,81 +75,21 @@ find_package(PkgConfig QUIET)
 
 if(NOT MC_MINI_NODE_ONLY)
 
-# Chromaprint
+# FFmpeg — kept on the SYSTEM libs (decode-only + an enormous external codec
+# tree to vendor; the node/player build and run on controlled boxes). Every
+# OTHER third-party lib is vendored + built static — see deps/vendored.cmake.
 if(PKG_CONFIG_FOUND)
-  pkg_check_modules(CHROMAPRINT libchromaprint)
-endif()
-if(NOT CHROMAPRINT_FOUND)
-  find_path(CHROMAPRINT_INCLUDE_DIRS chromaprint.h)
-  find_library(CHROMAPRINT_LIBRARIES NAMES chromaprint)
-  if(CHROMAPRINT_INCLUDE_DIRS AND CHROMAPRINT_LIBRARIES)
-    set(CHROMAPRINT_FOUND TRUE)
-  endif()
-endif()
-if(NOT CHROMAPRINT_FOUND)
-  message(FATAL_ERROR "Chromaprint not found. Install libchromaprint-dev or build from source.")
-endif()
-
-# FFmpeg
-if(PKG_CONFIG_FOUND)
-  pkg_check_modules(AVCODEC  REQUIRED libavcodec)
-  pkg_check_modules(AVFORMAT REQUIRED libavformat)
-  pkg_check_modules(AVUTIL   REQUIRED libavutil)
+  pkg_check_modules(AVCODEC    REQUIRED libavcodec)
+  pkg_check_modules(AVFORMAT   REQUIRED libavformat)
+  pkg_check_modules(AVUTIL     REQUIRED libavutil)
   pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
 endif()
 
-# Ogg / Vorbis / Opus
-if(PKG_CONFIG_FOUND)
-  pkg_check_modules(OGG      REQUIRED ogg)
-  pkg_check_modules(VORBIS   REQUIRED vorbis)
-  pkg_check_modules(VORBISFILE REQUIRED vorbisfile)
-  pkg_check_modules(OPUS     REQUIRED opus)
-  pkg_check_modules(OPUSFILE REQUIRED opusfile)
-endif()
-
-# LevelDB
-find_package(leveldb QUIET)
-if(NOT leveldb_FOUND AND PKG_CONFIG_FOUND)
-  pkg_check_modules(LEVELDB leveldb)
-endif()
-if(NOT LEVELDB_FOUND AND NOT leveldb_FOUND)
-  find_path(LEVELDB_INCLUDE_DIRS leveldb/db.h)
-  find_library(LEVELDB_LIBRARIES NAMES leveldb)
-  if(LEVELDB_INCLUDE_DIRS AND LEVELDB_LIBRARIES)
-    set(LEVELDB_FOUND TRUE)
-  else()
-    message(FATAL_ERROR "LevelDB not found. Install libleveldb-dev.")
-  endif()
-endif()
-
-# libuv removed — its only consumer was the legacy libuv TCP mesh
-# (network/peer.cpp), deleted in the Model 1 cleanup. The live transport
-# is librats (QUIC), which has no libuv dependency.
-
-# libmicrohttpd was removed — HTTP/3 now goes through msh3 (see
-# src/transport/h3_server.cpp) tunneled inside the librats QUIC mesh on
-# UDP/443, so there is no second TCP listener to find here.
-
-# miniupnpc (for UPnP NAT port mapping)
-if(PKG_CONFIG_FOUND)
-  pkg_check_modules(MINIUPNPC miniupnpc)
-endif()
-if(NOT MINIUPNPC_FOUND)
-  find_path(MINIUPNPC_INCLUDE_DIRS miniupnpc/miniupnpc.h
-    HINTS "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include"
-          "${CMAKE_SOURCE_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include"
-          "C:/vcpkg/installed/x64-windows/include")
-  find_library(MINIUPNPC_LIBRARY NAMES miniupnpc
-    HINTS "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib"
-          "${CMAKE_SOURCE_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib"
-          "C:/vcpkg/installed/x64-windows/lib")
-  if(MINIUPNPC_INCLUDE_DIRS AND MINIUPNPC_LIBRARY)
-    set(MINIUPNPC_FOUND TRUE)
-    set(MINIUPNPC_LIBRARIES ${MINIUPNPC_LIBRARY})
-  else()
-    message(WARNING "miniupnpc not found — UPnP port mapping disabled")
-  endif()
-endif()
+# Vendored, statically built from deps/: chromaprint, leveldb, miniupnpc,
+# ogg, vorbis (+vorbisfile), opus, opusfile. Replaces the old pkg-config /
+# system lookups so a clean `git clone` compiles a hermetic binary with no
+# system shared-library version to break it.
+include(${CMAKE_SOURCE_DIR}/deps/vendored.cmake)
 
 endif() # NOT MC_MINI_NODE_ONLY
 
@@ -148,22 +105,10 @@ set(MC_OPENSSL_CRYPTO OpenSSL::Crypto)
 # announcer (network/registry_announcer.cpp), deleted in the Model 1
 # cleanup. Block sync now runs over librats (BlockPropagator).
 
-# nlohmann/json
-find_package(nlohmann_json QUIET)
-if(NOT nlohmann_json_FOUND)
-  if(PKG_CONFIG_FOUND)
-    pkg_check_modules(NLOHMANN_JSON nlohmann_json)
-  endif()
-  if(NOT NLOHMANN_JSON_FOUND)
-    find_path(NLOHMANN_JSON_INCLUDE_DIRS nlohmann/json.hpp
-      HINTS /usr/include /usr/local/include)
-    if(NLOHMANN_JSON_INCLUDE_DIRS)
-      set(NLOHMANN_JSON_FOUND TRUE)
-    else()
-      message(FATAL_ERROR "nlohmann/json not found. Install nlohmann-json3-dev.")
-    endif()
-  endif()
-endif()
+# nlohmann/json — vendored single header (deps/nlohmann/nlohmann/json.hpp), so
+# a clean checkout needs no system nlohmann-json3-dev.
+set(NLOHMANN_JSON_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/deps/nlohmann)
+set(NLOHMANN_JSON_FOUND TRUE)
 
 # ---- Linker search path for vcpkg (required for bare lib names from pkg-config) ----
 # pkg-config returns bare names like "chromaprint" via ${CHROMAPRINT_LIBRARIES},

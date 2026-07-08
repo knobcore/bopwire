@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
 # Build bopwire-node + mini-node + libbopwire.so on Linux using
-# system packages (NO vcpkg).
+# VENDORED deps built static (NO vcpkg).
 #
-# Run install-deps-debian.sh or install-deps-arch.sh first to apt/pacman
-# the needed -dev packages. After that all this script does is invoke
-# cmake — which picks up libssl, ffmpeg, chromaprint, leveldb, etc. via
-# pkg-config / find_package. librats + libwally stay vendored.
+# Run install-deps-debian.sh or install-deps-arch.sh first — but that now
+# installs ONLY the deliberately-system deps (OpenSSL, ffmpeg, ncurses +
+# toolchain). Everything else (leveldb, miniupnpc, ogg, vorbis, opus,
+# opusfile, chromaprint, nlohmann, librats, libwally, croaring, cpp-httplib,
+# sacad) is compiled from deps/ and linked static — see deps/vendored.cmake —
+# so the resulting binary is hermetic.
 #
 # Optional env vars (defaults shown):
 #   CMAKE=cmake

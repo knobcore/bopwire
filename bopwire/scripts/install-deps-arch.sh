@@ -4,8 +4,10 @@
 # distro (Arch Linux, Manjaro, EndeavourOS, …).
 #
 # Same dep set as install-deps-debian.sh; only the package names differ.
-# librats + libwally stay vendored — pacman doesn't need to know about
-# either.
+# Almost everything is VENDORED + built static from deps/ (leveldb, miniupnpc,
+# ogg, vorbis, opus, opusfile, chromaprint, nlohmann, librats, libwally,
+# croaring, cpp-httplib, sacad). pacman only needs the deliberately-system
+# deps: openssl, ffmpeg, ncurses + the toolchain.
 #
 # Usage (run as root or with sudo):
 #   sudo bash scripts/install-deps-arch.sh
@@ -25,27 +27,16 @@ PACMAN_OPTS="${PACMAN_OPTS:---noconfirm --needed}"
 PKGS=(
     # Build toolchain
     base-devel cmake git pkgconf
-    # Cryptography + TLS (openssl)
+    # Cryptography + TLS — kept on the system (trusted; OS security updates)
     openssl
-    # FFmpeg suite — Arch ships a single ffmpeg package that contains
-    # libav{codec,format,util,filter,device} + libsw{resample,scale}.
+    # FFmpeg suite — kept on the system (decode-only; huge to vendor). Arch
+    # ships a single ffmpeg package with libav{codec,format,util} + libswresample.
     ffmpeg
-    # Audio fingerprinting
-    chromaprint
-    # Ogg / Vorbis / Opus containers
-    libogg libvorbis opus opusfile
-    # Storage
-    leveldb
-    snappy
-    # Network + JSON
-    libuv
-    nlohmann-json
-    curl
-    miniupnpc
-    # TUI
+    # TUI — kept on the system (present on every Linux)
     ncurses
-    # cpp-httplib is vendored at deps/cpp-httplib — no system package
-    # needed.
+    # NB: leveldb, miniupnpc, ogg, vorbis, opus, opusfile, chromaprint and
+    #     nlohmann-json are VENDORED + built static (deps/vendored.cmake) —
+    #     no system packages for them are needed any more.
 )
 
 echo "[install] pacman -S ${PKGS[*]}"

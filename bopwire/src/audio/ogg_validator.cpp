@@ -1,7 +1,7 @@
 #include "ogg_validator.h"
 #include <ogg/ogg.h>
 #include <vorbis/codec.h>
-#include <opus/opusfile.h>
+#include <opusfile.h>  // vendored opusfile: header is flat in include/
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>

@@ -3,13 +3,15 @@
 # Install bopwire full-node build dependencies on a Debian-flavoured
 # distro (Debian, Ubuntu, Mint, Pop!_OS, Raspberry Pi OS, …).
 #
-# Why not vcpkg on Linux: the deps below are mature, packaged in every
-# distro, and faster to apt-install than to compile from source. vcpkg
-# is kept for Windows where there's no system package manager.
-#
-# What stays vendored:
-#   - deps/librats          (our patched fork)
-#   - deps/libwally-core    (vendored static link, see CMakeLists)
+# Almost everything is VENDORED + built static from deps/ (see
+# deps/vendored.cmake) so a clone compiles a hermetic binary: leveldb,
+# miniupnpc, ogg, vorbis(+file), opus, opusfile, chromaprint, nlohmann,
+# librats, libwally-core, croaring, cpp-httplib, sacad. This script therefore
+# installs ONLY the deliberately-system deps:
+#   - OpenSSL   (trusted crypto; OS security updates land without a rebuild)
+#   - ffmpeg    (decode-only; enormous external codec tree to vendor)
+#   - ncurses   (node-only interactive TUI; on every Linux)
+#   + the build toolchain.
 #
 # Usage (run as root or with sudo):
 #   sudo bash scripts/install-deps-debian.sh
@@ -32,30 +34,16 @@ apt-get update -qq
 PKGS=(
     # Build toolchain
     build-essential cmake git pkg-config
-    # Cryptography + TLS
+    # Cryptography + TLS — kept on the system (trusted; OS security updates)
     libssl-dev
-    # FFmpeg suite (covers FLAC / MP3 / Opus / AAC / WAV decode)
-    libavcodec-dev libavformat-dev libavutil-dev
-    libswresample-dev libswscale-dev
-    # Audio fingerprinting
-    libchromaprint-dev
-    # Ogg / Vorbis / Opus containers
-    libogg-dev libvorbis-dev libopus-dev libopusfile-dev
-    # Storage
-    libleveldb-dev
-    # leveldb's link-time dependency on snappy. The runtime libsnappy.so.1
-    # comes for free when libleveldb-dev is installed, but the bare
-    # libsnappy.so symlink the linker resolves -lsnappy through only
-    # arrives via libsnappy-dev.
-    libsnappy-dev
-    # Network + JSON (cpp-httplib is vendored at deps/cpp-httplib —
-    # no apt package needed)
-    libuv1-dev
-    nlohmann-json3-dev
-    libcurl4-openssl-dev
-    libminiupnpc-dev
-    # TUI
+    # FFmpeg suite (covers FLAC / MP3 / Opus / AAC / WAV decode) — kept on the
+    # system (decode-only + huge external codec tree to vendor)
+    libavcodec-dev libavformat-dev libavutil-dev libswresample-dev
+    # TUI — kept on the system (present on every Linux)
     libncurses-dev
+    # NB: leveldb, miniupnpc, ogg, vorbis, opus, opusfile, chromaprint and
+    #     nlohmann-json are VENDORED + built static (deps/vendored.cmake) —
+    #     no -dev packages for them are needed any more.
 )
 
 echo "[install] installing: ${PKGS[*]}"
