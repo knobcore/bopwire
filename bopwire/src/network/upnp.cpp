@@ -45,9 +45,17 @@ bool UpnpMapper::map_all() {
     char      lanaddr[64]{};
     char      wanaddr[64]{};
 
+    // The wanaddr out-param was added to UPNP_GetValidIGD in miniupnpc API v18
+    // (2.2.24). Older libs (e.g. Debian/Ubuntu's 2.2.6 = API 17) take the 5-arg
+    // form and we fetch the external IP separately below.
+#if defined(MINIUPNPC_API_VERSION) && MINIUPNPC_API_VERSION >= 18
     int igd = UPNP_GetValidIGD(devlist, &urls, &data,
                                 lanaddr, sizeof(lanaddr),
                                 wanaddr, sizeof(wanaddr));
+#else
+    int igd = UPNP_GetValidIGD(devlist, &urls, &data,
+                                lanaddr, sizeof(lanaddr));
+#endif
     freeUPNPDevlist(devlist);
 
     if (igd != 1) {
@@ -56,7 +64,12 @@ bool UpnpMapper::map_all() {
         return false;
     }
 
-    // wanaddr is already populated by UPNP_GetValidIGD in v2.2+.
+    // On API < 18 wanaddr is not filled by GetValidIGD — query it directly.
+#if !defined(MINIUPNPC_API_VERSION) || MINIUPNPC_API_VERSION < 18
+    UPNP_GetExternalIPAddress(urls.controlURL, data.first.servicetype, wanaddr);
+#endif
+
+    // wanaddr is now populated (by GetValidIGD on v2.2.24+, else the call above).
     if (wanaddr[0] != '\0') {
         external_ip_ = wanaddr;
         std::cout << "[upnp] external IP: " << wanaddr << "\n";
