@@ -1,11 +1,11 @@
 import 'dart:ffi';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../ffi/native_library.dart';
 import '../ffi/wallet_mnemonic_bindings.dart';
 import '../models/wallet.dart';
+import 'secure_store.dart';
 
 class WalletService {
   WalletService._();
@@ -22,13 +22,13 @@ class WalletService {
   /// into a singleton makes a just-created wallet sign immediately.
   factory WalletService() => _instance;
 
-  static const _secureStorage = FlutterSecureStorage();
-  // The 12-word BIP39 mnemonic. The recovery secret lives ONLY here —
-  // platform secure storage (Keychain / KeyStore / DPAPI). The legacy
-  // disk-save path that wrote the 32 priv-key bytes to a plain file
-  // was removed because the file sat right next to the mnemonic-
-  // protected entry and could be read by any process with data-dir
-  // access. On launch we rederive via mc_wallet_from_mnemonic.
+  // Password-locked encrypted vault (SecureStore) — replaces the platform
+  // keychains. The 12-word BIP39 mnemonic lives ONLY here, AES-256-GCM encrypted
+  // under the user's password (no plaintext, no gnome-keyring). The vault must be
+  // unlocked (createVault on first launch, unlock on relaunch) before any
+  // read/write; the boot gate handles that. On launch we rederive the handle via
+  // mc_wallet_from_mnemonic.
+  static final _secureStorage = SecureStore();
   static const _walletMnemonicKey = 'mc_wallet_mnemonic';
   // Username the user picked at wallet creation. Cached locally so the
   // login screen can pre-fill it; the canonical record is on chain.
@@ -40,11 +40,29 @@ class WalletService {
   bool get hasWallet => _walletHandle != null;
   WalletInfo? get info => _cachedInfo;
 
-  /// True when a mnemonic exists in platform secure storage. Used by
-  /// the boot path to decide whether to show first-launch UI.
+  // ---- Vault lifecycle (password lock) --------------------------------
+  /// True when an encrypted vault file exists (a wallet is set up but locked).
+  Future<bool> hasVault() => _secureStorage.hasVault();
+
+  /// Whether the vault is currently decrypted in memory.
+  bool get isUnlocked => _secureStorage.isUnlocked;
+
+  /// Decrypt the vault with [password]. Returns false on wrong password.
+  Future<bool> unlock(String password) => _secureStorage.unlock(password);
+
+  /// Start a fresh vault under [password] (call before createWalletFromMnemonic
+  /// on first launch / import).
+  Future<void> createVault(String password) => _secureStorage.createVault(password);
+
+  /// Re-encrypt the vault under a new password.
+  Future<bool> changePassword(String oldPw, String newPw) =>
+      _secureStorage.changePassword(oldPw, newPw);
+
+  /// True when a wallet exists on disk. Used by the boot gate to choose
+  /// first-launch vs unlock.
   Future<bool> hasSavedWallet() async {
     try {
-      return (await _secureStorage.read(key: _walletMnemonicKey)) != null;
+      return await _secureStorage.hasVault();
     } catch (e) {
       // The encrypted entry exists but can't be decrypted — typically the
       // Android Keystore key was destroyed (app uninstalled, or data restored
@@ -157,8 +175,7 @@ class WalletService {
   /// (username, level, etc.) are untouched because they're on-chain.
   Future<void> clearLocalWallet() async {
     freeWallet();
-    await _secureStorage.delete(key: _walletMnemonicKey);
-    await _secureStorage.delete(key: _walletUsernameKey);
+    await _secureStorage.destroy();
   }
 
   // Sign data, returns hex signature
@@ -193,8 +210,7 @@ class WalletService {
   /// can't wedge the boot path on every launch. Each delete is independently
   /// guarded — on a fully-wedged keystore even delete can throw.
   Future<void> _safeDeleteWalletKeys() async {
-    try { await _secureStorage.delete(key: _walletMnemonicKey); } catch (_) {}
-    try { await _secureStorage.delete(key: _walletUsernameKey); } catch (_) {}
+    try { await _secureStorage.destroy(); } catch (_) {}
   }
 
   void _updateCache() {

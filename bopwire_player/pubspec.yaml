@@ -25,8 +25,9 @@ dependencies:
   # Settings storage
   shared_preferences: ^2.2.2
 
-  # Secure wallet storage
-  flutter_secure_storage: ^9.0.0
+  # Wallet secret is stored in our own password-encrypted vault (SecureStore →
+  # native scrypt+AES-256-GCM keystore), so no flutter_secure_storage / OS
+  # keychain / gnome-keyring dependency.
 
   # File picker for uploads
   file_picker: ^8.0.0

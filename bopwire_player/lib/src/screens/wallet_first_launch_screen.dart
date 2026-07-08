@@ -28,6 +28,8 @@ import '../providers/wallet_provider.dart';
 import '../services/librats_discovery.dart';
 import '../services/rats_client.dart';
 import '../services/wallet_service.dart';
+import '../widgets/password_dialogs.dart';
+import '../widgets/wallet_export_import.dart';
 
 class WalletFirstLaunchScreen extends StatefulWidget {
   final WalletService walletService;
@@ -79,6 +81,19 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
       _error             = null;
       _step              = _Step.restoreSeed;
     });
+  }
+
+  Future<void> _importFromFile() async {
+    final info = await importWalletFromFile(context, widget.walletService);
+    if (info == null) return; // cancelled / failed (helper surfaced the reason)
+    if (!mounted) return;
+    try {
+      context.read<WalletProvider>().setWallet(info);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[wallet-setup] import setWallet failed: $e');
+    }
+    widget.onComplete();
   }
 
   void _proceedToIdentityFromCreate() {
@@ -147,6 +162,17 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
       setState(() => _error = 'No mnemonic available. Restart the wallet setup.');
       return;
     }
+    // Require a wallet password — it encrypts the recovery phrase at rest.
+    final pw = await showSetPasswordDialog(
+      context,
+      title: 'Create a wallet password',
+      subtitle: 'This encrypts your recovery phrase on this device and is '
+          "required each time you open the app. There's no password reset — keep "
+          'your 12 words (or an export file) as the only recovery.',
+      confirmLabel: 'Create',
+    );
+    if (pw == null) return; // cancelled
+    if (!mounted) return;
     setState(() {
       _busy = true;
       _error = null;
@@ -154,9 +180,9 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
     // ignore: avoid_print
     print('[wallet-setup] _finish: deriving keypair + persisting');
     try {
-      // The mnemonic is the only credential — derived in memory and
-      // persisted as-is in platform secure storage. No unencrypted
-      // file on disk; rederivation happens fresh on every launch.
+      await widget.walletService.createVault(pw);
+      // The mnemonic is the only credential — persisted AES-256-GCM-encrypted
+      // under the password above; rederivation happens fresh on every launch.
       final info = await widget.walletService.createWalletFromMnemonic(
         mnemonic: mnemonic,
         username: username,
@@ -399,6 +425,12 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
           onPressed: _startRestore,
           icon: const Icon(Icons.restore),
           label: const Text('Restore from a recovery phrase'),
+        ),
+        const SizedBox(height: 12),
+        OutlinedButton.icon(
+          onPressed: _importFromFile,
+          icon: const Icon(Icons.file_open),
+          label: const Text('Import from a wallet file'),
         ),
         if (_error != null) ...[
           const SizedBox(height: 16),

@@ -312,6 +312,7 @@ set(MC_SOURCES
   src/core/chain.cpp
   src/crypto/hash.cpp
   src/crypto/keys.cpp
+  src/crypto/keystore.cpp
   src/crypto/signature.cpp
   src/crypto/ecies.cpp
   # Hand-rolled BIP39 stays in the tree as a reference but is no longer

@@ -104,6 +104,21 @@ BOPWIRE_API char* mc_wallet_get_public_key(mc_wallet_t wallet);
  *  Caller must free with mc_free(). */
 BOPWIRE_API char* mc_wallet_sign(mc_wallet_t wallet, const uint8_t* data, size_t len);
 
+// ---- Wallet keystore (scrypt + AES-256-GCM, JSON) -------------------
+
+/** Encrypt `plaintext` (e.g. the wallet mnemonic) under `password`, returning a
+ *  self-contained keystore JSON string (scrypt N=16384,r=8,p=1 + AES-256-GCM).
+ *  The SAME format backs both device-bound local storage (password = device
+ *  fingerprint [+ a user password]) and passphrase-protected export/import, so a
+ *  file written by the player decrypts in the node and vice-versa. Returns NULL
+ *  on failure. Caller must free with mc_free(). */
+BOPWIRE_API char* mc_keystore_encrypt(const char* plaintext, const char* password);
+
+/** Decrypt a keystore produced by mc_keystore_encrypt. Returns the plaintext, or
+ *  NULL on malformed input, wrong password, or GCM auth failure (see
+ *  mc_last_error). Caller must free with mc_free(). */
+BOPWIRE_API char* mc_keystore_decrypt(const char* keystore_json, const char* password);
+
 // ---- Device fingerprint (#5 structural attestation) -----------------
 
 /** Hardware-derived device fingerprint for the desktop platforms

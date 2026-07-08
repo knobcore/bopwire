@@ -14,8 +14,9 @@ import 'package:flutter/material.dart';
 import '../services/wallet_service.dart';
 import 'wallet_first_launch_screen.dart';
 import 'wallet_login_screen.dart';
+import 'wallet_unlock_screen.dart';
 
-enum _GateState { loading, firstLaunch, login, home }
+enum _GateState { loading, firstLaunch, locked, login, home }
 
 class WalletGate extends StatefulWidget {
   /// The host app's primary surface — shown once the wallet is unlocked.
@@ -38,31 +39,21 @@ class _WalletGateState extends State<WalletGate> {
   }
 
   Future<void> _decide() async {
-    // Three-state decision tree:
-    //   1. Has a wallet file? If not → first-launch.
-    //   2. Does auto-unlock (keychain-stashed password) succeed? If yes
-    //      → home.
-    //   3. Otherwise → login (user types password or re-enters
-    //      mnemonic).
+    // Two outcomes now that the vault is password-locked:
+    //   1. No vault file on disk → first-launch (create / restore, sets a
+    //      password).
+    //   2. A vault exists → locked → show the unlock screen (the user enters
+    //      the password; there is no auto-unlock). Unlocking there loads the
+    //      wallet and transitions to home.
     //
-    // Everything is wrapped so a storage/init failure can NEVER leave the gate
-    // stuck on the loading spinner. Historically an undecryptable secure-storage
-    // blob (Keystore key destroyed by uninstall, blob restored by Auto-Backup)
-    // threw BadPaddingException out of hasSavedWallet(), this future rejected,
-    // and the gate spun forever ("wheel of doom"). WalletService now swallows +
-    // purges that, but we defend here too: any error → first-launch.
+    // Wrapped so any storage/init failure degrades to first-launch rather than
+    // wedging the gate on the loading spinner.
     try {
-      final hasSaved = await _walletService.hasSavedWallet();
-      if (!hasSaved) {
-        if (mounted) setState(() => _state = _GateState.firstLaunch);
-        return;
+      final hasVault = await _walletService.hasSavedWallet();
+      if (mounted) {
+        setState(() =>
+            _state = hasVault ? _GateState.locked : _GateState.firstLaunch);
       }
-      final auto = await _walletService.tryAutoLoad();
-      if (auto != null) {
-        if (mounted) setState(() => _state = _GateState.home);
-        return;
-      }
-      if (mounted) setState(() => _state = _GateState.login);
     } catch (e) {
       // ignore: avoid_print
       print('[wallet-gate] _decide failed ($e) — falling back to first-launch');
@@ -92,6 +83,20 @@ class _WalletGateState extends State<WalletGate> {
       _GateState.firstLaunch => WalletFirstLaunchScreen(
           walletService: _walletService,
           onComplete: _onLoggedIn,
+        ),
+      _GateState.locked => WalletUnlockScreen(
+          walletService: _walletService,
+          onUnlocked: _onLoggedIn,
+          onUseRecoveryPhrase: () {
+            if (mounted) setState(() => _state = _GateState.login);
+          },
+          onReset: () async {
+            await _walletService.clearLocalWallet();
+            if (mounted) {
+              setState(() => _state = _GateState.loading);
+              _decide();
+            }
+          },
         ),
       _GateState.login => WalletLoginScreen(
           walletService: _walletService,

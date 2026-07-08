@@ -17,6 +17,7 @@ import 'package:provider/provider.dart';
 
 import '../providers/wallet_provider.dart';
 import '../services/wallet_service.dart';
+import '../widgets/password_dialogs.dart';
 
 class WalletLoginScreen extends StatefulWidget {
   final WalletService walletService;
@@ -68,15 +69,25 @@ class _WalletLoginScreenState extends State<WalletLoginScreen> {
       setState(() => _error = 'That\'s not a valid 12-word recovery phrase.');
       return;
     }
+    // Set a wallet password on THIS device — it encrypts the restored phrase.
+    final pw = await showSetPasswordDialog(
+      context,
+      title: 'Set a wallet password',
+      subtitle: 'Encrypts your recovery phrase on this device and is required '
+          'each launch.',
+      confirmLabel: 'Restore',
+    );
+    if (pw == null) return; // cancelled
+    if (!mounted) return;
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
-      // The mnemonic is the only credential. createWalletFromMnemonic
-      // derives the keypair via libwally BIP39+BIP32, caches it in
-      // memory, and stores the mnemonic in platform secure storage
-      // (Keychain / KeyStore / DPAPI) for the next launch to rederive.
+      await widget.walletService.createVault(pw);
+      // The mnemonic is the only credential. createWalletFromMnemonic derives
+      // the keypair via libwally BIP39+BIP32, caches it, and stores the mnemonic
+      // AES-256-GCM-encrypted in the vault under the password above.
       final info = await widget.walletService.createWalletFromMnemonic(
         mnemonic: mnemonic,
       );

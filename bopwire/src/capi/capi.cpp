@@ -5,6 +5,7 @@
 #include "../../include/bopwire.h"
 #include "../crypto/hash.h"
 #include "../crypto/keys.h"
+#include "../crypto/keystore.h"
 #include "../crypto/signature.h"
 #include "../crypto/bip39.h"
 #include "../audio/ogg_validator.h"
@@ -116,6 +117,29 @@ char* mc_wallet_sign(mc_wallet_t wallet, const uint8_t* data, size_t len) {
         set_error(e.what());
         return nullptr;
     }
+}
+
+// ---- Keystore (password-encrypted wallet: local storage + export) ---
+
+char* mc_keystore_encrypt(const char* plaintext, const char* password) {
+    if (!plaintext || !password) { set_error("keystore: null argument"); return nullptr; }
+    try {
+        std::string js = mc::crypto::keystore_encrypt(plaintext, password);
+        if (js.empty()) { set_error("keystore encrypt failed"); return nullptr; }
+        return make_cstring(js);
+    } catch (const std::exception& e) { set_error(e.what()); return nullptr; }
+}
+
+char* mc_keystore_decrypt(const char* keystore_json, const char* password) {
+    if (!keystore_json || !password) { set_error("keystore: null argument"); return nullptr; }
+    try {
+        std::string out;
+        if (!mc::crypto::keystore_decrypt(keystore_json, password, out)) {
+            set_error("keystore decrypt failed (wrong password or corrupt)");
+            return nullptr;
+        }
+        return make_cstring(out);
+    } catch (const std::exception& e) { set_error(e.what()); return nullptr; }
 }
 
 // ---- Device fingerprint (#5 structural attestation) -----------------

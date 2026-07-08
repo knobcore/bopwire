@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../providers/wallet_provider.dart';
 import '../services/wallet_service.dart';
 import '../widgets/balance_display.dart';
+import '../widgets/wallet_export_import.dart';
 
 class WalletScreen extends StatelessWidget {
   const WalletScreen({super.key});
@@ -81,6 +82,19 @@ class _WalletView extends StatelessWidget {
           subtitle: const Text(
               'Your 12-word BIP39 mnemonic — never share it'),
           onTap: () => _showMnemonicDialog(context),
+        ),
+        ListTile(
+          leading: const Icon(Icons.download),
+          title: const Text('Export wallet to a file'),
+          subtitle: const Text(
+              'Password-protected backup — move it to another device or the cloud'),
+          onTap: () => exportWalletToFile(context, WalletService()),
+        ),
+        ListTile(
+          leading: const Icon(Icons.password),
+          title: const Text('Change wallet password'),
+          subtitle: const Text('The password that unlocks this device'),
+          onTap: () => changeWalletPassword(context, WalletService()),
         ),
         ListTile(
           leading: const Icon(Icons.logout, color: Colors.redAccent),
