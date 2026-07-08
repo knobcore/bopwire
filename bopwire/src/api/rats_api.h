@@ -220,6 +220,43 @@ private:
     bool ingest_playlist(const std::string& payload_json,
                          bool broadcast_if_new);
 
+    /// Shared song mempool flood (MC_FPSUBMIT_TYPE). A player's
+    /// fingerprint.submit registration is stamped with a submit_ms ONCE at
+    /// flood origin, then epidemic-flooded so EVERY node holds the same
+    /// pending-song set with the same submit_ms — the input the deterministic
+    /// block build depends on. ingest_fpsubmit recomputes fingerprint_hash from
+    /// the bytes (never trusts the wire), drops the song if it is already on
+    /// chain (the shared song_on_chain verdict), min-merges into the persisted
+    /// sp: mempool by (submit_ms, sha256(payload)), and on a genuinely-new /
+    /// lowered entry updates the producer's buffer + re-broadcasts (the flood).
+    /// The min-merge + re-flood is a semilattice, so arrival order can't diverge
+    /// nodes (invariant I1). Returns true iff it newly stored / lowered.
+    static void on_fpsubmit_cb(void* user_data, const char* peer_id,
+                               const char* message_data);
+    bool ingest_fpsubmit(const std::string& payload_json, bool broadcast_if_new);
+
+    /// Rebuild the producer's in-memory song buffer from the persisted sp:
+    /// mempool on startup, so a restarted node re-derives the IDENTICAL build
+    /// set (and the propagation buffer survives restarts). Prunes rows whose
+    /// song has since landed on chain. Called once from start().
+    void load_pending_songs_from_db_();
+
+    /// Shared tx mempool flood (MC_TX_TYPE). A signed governance/username tx is
+    /// stamped with a submit_ms ONCE at origin and flooded so every node's
+    /// mempool converges on the same set — the tx-set determinism the block
+    /// build relies on. ingest_tx runs the same pre-flight verify the producer
+    /// does, dedups + min-merges on tx_hash (the content-addressed p: row is
+    /// free loop-safe dedup), records the pt: submit_ms side-index, wakes the
+    /// producer, and re-broadcasts on a new / lowered entry (invariant I1).
+    static void on_tx_cb(void* user_data, const char* peer_id,
+                         const char* message_data);
+public:
+    // Public: node_main's relay-reward sweep flows RelayRewardTx through the
+    // same replicated mempool path (stamp pt: + flood) as wallet.transfer, so
+    // the reward tx is consensus-eligible + identical across all full nodes.
+    bool ingest_tx(const std::string& payload_json, bool broadcast_if_new);
+private:
+
     /// Receive a moderation envelope from a peer (broadcast or sync push)
     /// — verify the signature against the moderator set, dedupe by sig,
     /// apply the hide / unhide to db, and persist to the mod log so

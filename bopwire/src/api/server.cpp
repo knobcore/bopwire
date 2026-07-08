@@ -1268,19 +1268,24 @@ std::pair<int, std::string> HttpServer::post_transfer(const std::string& body) {
         std::copy(pub_bytes.begin(), pub_bytes.end(), tx.from_pubkey.begin());
         std::copy(sig_bytes.begin(), sig_bytes.end(), tx.signature.begin());
 
-        leveldb::WriteBatch batch;
-        if (!chain_.apply_transfer(tx, batch))
+        // Consensus safety (tx-set determinism): do NOT apply the transfer to
+        // the ledger here, and do NOT drop an un-flooded tx into the mempool.
+        // Applying a transfer OUTSIDE a block mutates consensus-derived state on
+        // THIS node alone (divergence), and a p: row that is stored but never
+        // flooded gets included by this node's producer (submit_ms 0 <= block_ts)
+        // yet is absent on every peer — two nodes then mint different bodies at
+        // the same height (tx-set fork). Wallet transfers now reach the chain
+        // ONLY through the flooded, pt:-stamped path — the rats `wallet.transfer`
+        // handler reconstructs this same signed tx and submits it via ingest_tx,
+        // exactly like username.register / proposal.submit. This legacy HTTP
+        // route has no rats client to flood with, so it just verifies the
+        // signature and returns the tx_hash; the actual submission happens over
+        // the mesh. (verify_signature also cross-checks from_pubkey ->
+        // from_address; nonce/balance are enforced at block-apply.)
+        if (!tx.verify_signature())
             return {400, R"({"error":"transfer rejected"})"};
-        db_.write(batch);
 
-        auto raw = tx.serialize();
-        auto tx_hash = tx.tx_hash();
-        db_.put_pending_tx(tx_hash, raw);
-        // TX broadcast over the legacy TCP mesh removed in Phase 2c. When
-        // we have more than one full node, the broadcast will be done over
-        // mc_rats_quic via rats_broadcast_message.
-
-        json resp = {{"status", "ok"}, {"tx_hash", crypto::to_hex(tx_hash)}};
+        json resp = {{"status", "ok"}, {"tx_hash", crypto::to_hex(tx.tx_hash())}};
         return {200, resp.dump()};
     } catch (...) {
         return {400, R"({"error":"invalid request"})"};

@@ -92,6 +92,35 @@ public:
     bool put_pending_tx(const Hash256& tx_hash, const std::vector<uint8_t>& tx_data);
     bool del_pending_tx(const Hash256& tx_hash);
     std::vector<std::pair<Hash256, std::vector<uint8_t>>> get_all_pending_txs() const;
+    bool has_pending_tx(const Hash256& tx_hash) const;
+
+    // ---- Mempool tx submit_ms side-index (pt:) -----------------------
+    //
+    // Origin-stamped wall-clock ms for each pending tx, carried in the MC_TX
+    // flood envelope and min-merged on arrival. The block producer reads it to
+    // gate tx inclusion by the propagation window + the block's timestamp
+    // boundary. It is NOT written into the block (validators re-check only
+    // per-tx signature/nonce/balance), so block format v3 is unchanged. Paired
+    // with the p: row: del_pending_tx drops both, and connect_block's drain
+    // batch removes both when the tx lands on chain.
+    bool                    put_pending_tx_submit_ms(const Hash256& tx_hash, uint64_t submit_ms);
+    std::optional<uint64_t> get_pending_tx_submit_ms(const Hash256& tx_hash) const;
+
+    // ---- Song mempool (sp:) ------------------------------------------
+    //
+    // Persisted pending-song registrations flooded over MC_FPSUBMIT. The value
+    // is the canonical fpsubmit envelope JSON, so a node can re-flood it
+    // verbatim and reconstruct the identical PendingRegistration on restart.
+    // Keyed by content_hash; min-merged by (submit_ms, sha256(payload)) in
+    // RatsApi::ingest_fpsubmit. Dropped when the song lands on chain
+    // (connect_block) or is discovered to be already on chain. This is the
+    // "deep mempool / propagation buffer" that survives restarts so a rejoining
+    // node rebuilds the identical build set.
+    bool                       put_pending_song(const Hash256& content_hash,
+                                                const std::string& payload);
+    std::optional<std::string> get_pending_song(const Hash256& content_hash) const;
+    bool                       del_pending_song(const Hash256& content_hash);
+    std::vector<std::pair<Hash256, std::string>> get_all_pending_songs() const;
 
     // ---- Song metadata index (sm:, ia:, ig:) -------------------------
     struct SongMeta {

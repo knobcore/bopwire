@@ -10,6 +10,7 @@
 #include "../net/relay_credit_tracker.h"
 #include "../curation/collection_curator.h"
 #include "../core/transaction.h"
+#include "../tokens/ledger.h"   // Ledger::parse_balance for wallet.transfer flood
 
 // mc_rats_quic.h was the old stub. We now link the real librats and
 // consume its C bindings header so functions like rats_get_peer_info_json
@@ -54,6 +55,8 @@ constexpr const char* MC_REPLY_TYPE   = "bopwire.reply";
 constexpr const char* MC_MOD_TYPE     = "bopwire.mod";
 constexpr const char* MC_LIBRARY_TYPE = "bopwire.library";  // DB2 delta gossip
 constexpr const char* MC_PLAYLIST_TYPE = "bopwire.playlist"; // DB2 playlist gossip
+constexpr const char* MC_FPSUBMIT_TYPE = "bopwire.fpsubmit"; // shared song mempool flood
+constexpr const char* MC_TX_TYPE       = "bopwire.tx";       // shared tx mempool flood
 
 namespace {
 // Load the Shared Moderation Key recipient — (address, pubkey) — from
@@ -126,6 +129,17 @@ void RatsApi::start(rats_client_t client) {
                     &RatsApi::on_library_cb, this);
     rats_on_message(client_, MC_PLAYLIST_TYPE,
                     &RatsApi::on_playlist_cb, this);
+    // Consensus mempools flood over their own broadcast types so every node
+    // holds the same pending-song + pending-tx set (each item carrying a
+    // submit_ms frozen at flood origin) — the replicated inputs the
+    // deterministic, fork-free block build depends on.
+    rats_on_message(client_, MC_FPSUBMIT_TYPE,
+                    &RatsApi::on_fpsubmit_cb, this);
+    rats_on_message(client_, MC_TX_TYPE,
+                    &RatsApi::on_tx_cb, this);
+    // Rebuild the producer's song buffer from the persisted sp: mempool so a
+    // restart re-derives the identical build set.
+    load_pending_songs_from_db_();
     // Connection-state authoritative swarm: track who's online so
     // entries from offline peers vanish from members() without needing
     // the per-track TTL renewal that the old per-file fingerprint.submit
@@ -942,10 +956,59 @@ void RatsApi::handle_request(const std::string& peer_id,
             reply = wrap_handler_result(req_id,
                 http_.verb_wallet_escrow_balance(in.value("address", "")));
         } else if (type == "wallet.transfer") {
-            // Sender-signed TransferTx submission. Delegates to the same secure
-            // path as the HTTP route (verify_signature + nonce + balance ->
-            // mempool); the node never moves funds without the sender's sig.
-            reply = wrap_handler_result(req_id, http_.verb_wallet_transfer(in.dump()));
+            // Sender-signed TransferTx submission. FLOOD it through the SAME
+            // canonical path as username.register / proposal.submit —
+            // reconstruct + verify the signed tx, then ingest_tx (mempool put +
+            // pt: submit_ms stamp + wake + gossip). This used to delegate to
+            // post_transfer, which applied the transfer to the LOCAL ledger and
+            // stored an un-flooded, un-stamped p: row; THIS node's producer then
+            // included it (submit_ms 0 <= block_ts) while peers that never
+            // received it minted a DIFFERENT body at the same height — a tx-set
+            // fork. Flooding makes the included tx set a pure function of
+            // replicated data. The node still never moves funds without the
+            // sender's signature (verified here and again in apply_transactions).
+            std::pair<int, std::string> res;
+            try {
+                TransferTx tx{};
+                bool malformed = false;
+                if (!crypto::parse_address_checksummed(
+                        in.value("from_address", std::string()), tx.from_address))
+                    malformed = true;
+                if (!crypto::parse_address_checksummed(
+                        in.value("to_address", std::string()), tx.to_address))
+                    malformed = true;
+                if (!Ledger::parse_balance(in.value("amount", std::string()),
+                                           tx.amount))
+                    malformed = true;
+                tx.nonce = in.value("nonce", uint64_t{0});
+                auto pk  = crypto::from_hex(in.value("from_pubkey", std::string()));
+                auto sig = crypto::from_hex(in.value("signature",   std::string()));
+                if (pk.size() != 33 || sig.size() != 64) malformed = true;
+                if (malformed) {
+                    res = {400, R"({"error":"invalid transfer request"})"};
+                } else {
+                    std::copy(pk.begin(),  pk.end(),  tx.from_pubkey.begin());
+                    std::copy(sig.begin(), sig.end(), tx.signature.begin());
+                    if (!tx.verify_signature()) {
+                        res = {400, R"({"error":"transfer rejected"})"};
+                    } else {
+                        // Stamp submit_ms once + flood; ingest_tx re-verifies via
+                        // tx_preflight_ok and is idempotent on resubmit.
+                        json txe = {{"tx", crypto::to_hex(tx.serialize())},
+                                    {"submit_ms", presence_now_ms()}};
+                        ingest_tx(txe.dump(), /*broadcast_if_new=*/true);
+                        json ok = {{"status",  "ok"},
+                                   {"tx_hash", crypto::to_hex(tx.tx_hash())}};
+                        res = {200, ok.dump()};
+                        std::cout << "[rats-api] wallet.transfer: queued "
+                                  << crypto::to_hex(tx.tx_hash()).substr(0, 12)
+                                  << "…\n";
+                    }
+                }
+            } catch (...) {
+                res = {400, R"({"error":"invalid request"})"};
+            }
+            reply = wrap_handler_result(req_id, res);
         }
         // ---- account registration ---------------------------------------
         //
@@ -992,18 +1055,21 @@ void RatsApi::handle_request(const std::string& peer_id,
                         } else {
                             const auto h   = tx.tx_hash();
                             const auto raw = tx.serialize();
-                            if (!db_.put_pending_tx(h, raw)) {
-                                reply = {{"req_id", req_id}, {"status", "rejected"},
-                                         {"error",  "could not queue tx"}};
-                            } else {
-                                candidates_.wake();
-                                reply = {{"req_id", req_id}, {"status", "ok"},
-                                         {"body",   {{"tx_hash",
-                                                      crypto::to_hex(h)}}}};
-                                std::cout << "[rats-api] username.register: "
-                                          << name << " queued for "
-                                          << addr_hex.substr(0, 10) << "…\n";
-                            }
+                            // Flood the signed tx (submit_ms stamped once here)
+                            // so every node's mempool converges — the tx-set
+                            // determinism the block build relies on. ingest_tx
+                            // does the mempool put + pt: submit_ms index + wake +
+                            // gossip. The sig was already verified above, so it
+                            // is now queued (idempotent on resubmit).
+                            json txe = {{"tx", crypto::to_hex(raw)},
+                                        {"submit_ms", presence_now_ms()}};
+                            ingest_tx(txe.dump(), /*broadcast_if_new=*/true);
+                            reply = {{"req_id", req_id}, {"status", "ok"},
+                                     {"body",   {{"tx_hash",
+                                                  crypto::to_hex(h)}}}};
+                            std::cout << "[rats-api] username.register: "
+                                      << name << " queued for "
+                                      << addr_hex.substr(0, 10) << "…\n";
                         }
                     }
                 }
@@ -1055,16 +1121,15 @@ void RatsApi::handle_request(const std::string& peer_id,
                              {"error", "signature did not verify"}};
                 } else {
                     const auto h = tx.tx_hash();
-                    if (!db_.put_pending_tx(h, tx.serialize())) {
-                        reply = {{"req_id", req_id}, {"status", "rejected"},
-                                 {"error", "could not queue proposal"}};
-                    } else {
-                        candidates_.wake();
-                        reply = {{"req_id", req_id}, {"status", "ok"},
-                                 {"body", {{"tx_hash", crypto::to_hex(h)}}}};
-                        std::cout << "[rats-api] proposal.submit: kind="
-                                  << static_cast<int>(tx.kind) << " queued\n";
-                    }
+                    // Flood the signed proposal (submit_ms stamped once) so every
+                    // node's mempool converges — see ingest_tx.
+                    json txe = {{"tx", crypto::to_hex(tx.serialize())},
+                                {"submit_ms", presence_now_ms()}};
+                    ingest_tx(txe.dump(), /*broadcast_if_new=*/true);
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {{"tx_hash", crypto::to_hex(h)}}}};
+                    std::cout << "[rats-api] proposal.submit: kind="
+                              << static_cast<int>(tx.kind) << " queued\n";
                 }
             } catch (const std::exception& e) {
                 reply = {{"req_id", req_id}, {"status", "server_error"},
@@ -1249,14 +1314,13 @@ void RatsApi::handle_request(const std::string& peer_id,
                              {"error", "signature did not verify"}};
                 } else {
                     const auto h = tx.tx_hash();
-                    if (!db_.put_pending_tx(h, tx.serialize())) {
-                        reply = {{"req_id", req_id}, {"status", "rejected"},
-                                 {"error", "could not queue moderator op"}};
-                    } else {
-                        candidates_.wake();
-                        reply = {{"req_id", req_id}, {"status", "ok"},
-                                 {"body", {{"tx_hash", crypto::to_hex(h)}}}};
-                    }
+                    // Flood the signed moderator op (submit_ms stamped once) so
+                    // every node's mempool converges — see ingest_tx.
+                    json txe = {{"tx", crypto::to_hex(tx.serialize())},
+                                {"submit_ms", presence_now_ms()}};
+                    ingest_tx(txe.dump(), /*broadcast_if_new=*/true);
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {{"tx_hash", crypto::to_hex(h)}}}};
                 }
             } catch (const std::exception& e) {
                 reply = {{"req_id", req_id}, {"status", "server_error"},
@@ -1942,57 +2006,46 @@ void RatsApi::handle_request(const std::string& peer_id,
                                      {"fingerprint_hash", crypto::to_hex(fph)},
                                  }}};
                     } else {
-                        PendingRegistration reg;
-                        reg.content_hash             = ch;
-                        reg.fingerprint_hash         = fph;
-                        reg.compressed_fingerprint   = fp;
-                        reg.audio_format = audio_format_from_string(
-                            in.value("audio_format", std::string("ogg")));
-                        reg.duration_ms              = in.value("duration_ms", 0);
-                        reg.title                    = in.value("title",  std::string());
-                        reg.artist                   = in.value("artist", std::string());
-                        reg.genre                    = in.value("genre",  std::string());
-                        reg.album                    = in.value("album",  std::string());
-                        // Optional ID3 numerics. Submitters that don't
-                        // have them just send 0, which we treat as "not
-                        // present" everywhere downstream.
-                        reg.year                     = static_cast<uint16_t>(
-                            in.value("year",         0));
-                        reg.track_number             = static_cast<uint16_t>(
-                            in.value("track_number", 0));
-                        // artist_address optional — leave zero if absent.
-                        // Accept any form parse_address() handles: bare
-                        // 40-hex, 0x-prefixed, EIP-55 mixed-case. Older
-                        // clients that omit the field land at zero and
-                        // the artist share routes through the unclaimed
-                        // escrow (see compute_mint_outputs).
-                        const std::string aa_hex = in.value("artist_address",
-                                                            std::string());
-                        if (!aa_hex.empty()) {
-                            Address parsed{};
-                            if (crypto::parse_address_checksummed(aa_hex, parsed)) {
-                                reg.artist_address = parsed;
-                            }
-                        }
-                        reg.announcing_peer_id       = announcing_pid;
-                        // Capture display fields BEFORE std::move(reg) — the
-                        // moved-from object's strings are unspecified.
-                        const std::string log_title  = reg.title;
-                        const std::string log_artist = reg.artist;
-                        // Take bitrate before we move reg so it makes it
-                        // into the SwarmMember below too.
-                        const uint32_t reg_bitrate = static_cast<uint32_t>(
-                            in.value("bitrate", 0));
-                        const AudioFormat reg_format = reg.audio_format;
-                        const bool queued = candidates_.enqueue_registration(
-                            std::move(reg));
+                        // NEW song. Stamp submit_ms ONCE here — this node is the
+                        // flood origin — build the canonical fpsubmit envelope,
+                        // and ingest it: min-merge into the shared song mempool
+                        // + epidemic-flood so EVERY node enqueues the identical
+                        // registration with the identical submit_ms. The song
+                        // block's header timestamp becomes exactly this value,
+                        // so block bytes are a pure function of a replicated
+                        // input, never a per-node clock read. (artist_address /
+                        // ID3 numerics are carried verbatim in the envelope and
+                        // re-parsed identically on every node inside
+                        // ingest_fpsubmit -> pending_reg_from_fpsubmit.)
+                        const uint64_t submit_ms = presence_now_ms();
+                        json fps = {
+                            {"content_hash",           crypto::to_hex(ch)},
+                            {"compressed_fingerprint", fp},
+                            {"audio_format",           in.value("audio_format", std::string("ogg"))},
+                            {"duration_ms",            in.value("duration_ms", 0)},
+                            {"title",                  in.value("title",  std::string())},
+                            {"artist",                 in.value("artist", std::string())},
+                            {"artist_address",         in.value("artist_address", std::string())},
+                            {"genre",                  in.value("genre",  std::string())},
+                            {"album",                  in.value("album",  std::string())},
+                            {"year",                   static_cast<uint16_t>(in.value("year", 0))},
+                            {"track_number",           static_cast<uint16_t>(in.value("track_number", 0))},
+                            {"royalty_splits",
+                                 (in.contains("royalty_splits") && in["royalty_splits"].is_array())
+                                     ? in["royalty_splits"] : json::array()},
+                            {"submit_ms",              submit_ms},
+                        };
+                        const bool queued =
+                            ingest_fpsubmit(fps.dump(), /*broadcast_if_new=*/true);
                         // Pre-emptively announce so swarm.locate already
                         // returns the announcing peer before block lands.
                         store::SwarmMember self_member;
                         self_member.peer_id      = announcing_pid;
                         self_member.content_hash = ch; // local == canonical for the first submitter
-                        self_member.bitrate      = reg_bitrate;
-                        self_member.audio_format = reg_format;
+                        self_member.bitrate      = static_cast<uint32_t>(
+                            in.value("bitrate", 0));
+                        self_member.audio_format = audio_format_from_string(
+                            in.value("audio_format", std::string("ogg")));
                         swarm_.announce(ch, self_member);
                         // (DHT un-nerf P1) full node no longer self-announces
                         // as a DHT seeder — see the matched-branch note above.
@@ -2007,7 +2060,8 @@ void RatsApi::handle_request(const std::string& peer_id,
                                      {"swarm_size",       swarm_.members(ch).size()},
                                  }}};
                         std::cout << "[rats-api] register: \""
-                                  << log_title << "\" by " << log_artist
+                                  << in.value("title", std::string()) << "\" by "
+                                  << in.value("artist", std::string())
                                   << " from " << announcing_pid.substr(0, 12)
                                   << " (queued=" << queued << ")\n";
                     }
@@ -3072,6 +3126,262 @@ void RatsApi::on_library_cb(void* user_data, const char* /*peer_id*/,
     auto* self = static_cast<RatsApi*>(user_data);
     if (!self || !message_data) return;
     self->ingest_library_delta(message_data, /*broadcast_if_new=*/true);
+}
+
+// ======================================================================
+// Shared song mempool (MC_FPSUBMIT) — flood, min-merge, restart-rebuild
+// ======================================================================
+namespace {
+
+// Build a PendingRegistration from a parsed fpsubmit envelope. fingerprint_hash
+// is ALWAYS recomputed from the compressed bytes (never trusted from the wire),
+// exactly like Block::validate and the producer do, so the value that lands in
+// the header is a pure function of the bytes. Because every node parses the
+// SAME canonical envelope (forwarded verbatim across the flood), every node
+// reconstructs the byte-identical registration. Returns false if the envelope
+// is missing a consensus-critical field (content_hash / compressed_fingerprint).
+bool pending_reg_from_fpsubmit(const json& env, PendingRegistration& reg) {
+    Hash256 ch{};
+    if (!crypto::parse_hash256(env.value("content_hash", std::string()), ch))
+        return false;
+    const std::string fp = env.value("compressed_fingerprint", std::string());
+    if (fp.empty()) return false;
+    reg.content_hash           = ch;
+    reg.compressed_fingerprint = fp;
+    reg.fingerprint_hash       = crypto::sha256(
+        reinterpret_cast<const uint8_t*>(fp.data()), fp.size());
+    reg.audio_format = audio_format_from_string(
+        env.value("audio_format", std::string("ogg")));
+    reg.duration_ms  = env.value("duration_ms", 0);
+    reg.title        = env.value("title",  std::string());
+    reg.artist       = env.value("artist", std::string());
+    reg.genre        = env.value("genre",  std::string());
+    reg.album        = env.value("album",  std::string());
+    reg.year         = static_cast<uint16_t>(env.value("year", 0));
+    reg.track_number = static_cast<uint16_t>(env.value("track_number", 0));
+    reg.submit_ms    = env.value("submit_ms", static_cast<uint64_t>(0));
+    const std::string aa_hex = env.value("artist_address", std::string());
+    if (!aa_hex.empty()) {
+        Address parsed{};
+        if (crypto::parse_address_checksummed(aa_hex, parsed))
+            reg.artist_address = parsed;
+    }
+    if (env.contains("royalty_splits") && env["royalty_splits"].is_array()) {
+        for (const auto& rs : env["royalty_splits"]) {
+            if (!rs.is_object()) continue;
+            Address ra{};
+            if (rs.contains("address") && rs["address"].is_string() &&
+                crypto::parse_address_checksummed(rs["address"].get<std::string>(), ra)) {
+                RoyaltySplit split{};
+                split.address      = ra;
+                split.basis_points = static_cast<uint16_t>(rs.value("basis_points", 0));
+                reg.royalty_splits.push_back(split);
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool RatsApi::ingest_fpsubmit(const std::string& payload_json,
+                              bool broadcast_if_new) {
+    json env;
+    try { env = json::parse(payload_json); } catch (...) { return false; }
+    if (!env.is_object()) return false;
+
+    PendingRegistration reg;
+    if (!pending_reg_from_fpsubmit(env, reg)) return false;
+
+    // Housekeeping: if the song is already on chain (the ONE shared exact+fuzzy
+    // verdict), it can never be minted again — drop it (and prune any stale sp:
+    // row) instead of buffering / re-flooding it forever.
+    if (song_on_chain(db_, reg.content_hash, reg.compressed_fingerprint)) {
+        db_.del_pending_song(reg.content_hash);
+        return false;
+    }
+
+    // Min-merge into the persisted song mempool keyed by content_hash: keep the
+    // entry with the smaller (submit_ms, sha256(canonical_payload)). Min-merge +
+    // re-flood-on-change is a semilattice, so every node converges on the SAME
+    // winning registration regardless of arrival order (invariant I1). Because
+    // the payload is forwarded verbatim, sha256(payload) is a deterministic
+    // cross-node tiebreak for the (astronomically rare) equal-submit_ms case.
+    const Hash256 pay_hash = crypto::sha256(
+        reinterpret_cast<const uint8_t*>(payload_json.data()), payload_json.size());
+    bool is_new_or_lower = true;
+    if (auto existing = db_.get_pending_song(reg.content_hash)) {
+        try {
+            json exj = json::parse(*existing);
+            const uint64_t ex_submit =
+                exj.value("submit_ms", static_cast<uint64_t>(0));
+            const Hash256 ex_hash = crypto::sha256(
+                reinterpret_cast<const uint8_t*>(existing->data()), existing->size());
+            if (ex_submit < reg.submit_ms) is_new_or_lower = false;
+            else if (ex_submit == reg.submit_ms && ex_hash <= pay_hash)
+                is_new_or_lower = false;
+        } catch (...) { /* corrupt existing row -> replace it */ }
+    }
+    if (!is_new_or_lower) return false;   // we already hold the canonical (smaller) one
+
+    db_.put_pending_song(reg.content_hash, payload_json);
+    candidates_.enqueue_registration(reg);   // update the in-memory producer view
+
+    if (broadcast_if_new && client_)
+        rats_broadcast_message(client_, MC_FPSUBMIT_TYPE, payload_json.c_str());
+    return true;
+}
+
+void RatsApi::on_fpsubmit_cb(void* user_data, const char* peer_id,
+                             const char* message_data) {
+    auto* self = static_cast<RatsApi*>(user_data);
+    if (!self || !peer_id || !message_data) {
+        // librats_c.cpp strdup's both args; free them on every path or leak.
+        if (peer_id)      rats_string_free(peer_id);
+        if (message_data) rats_string_free(message_data);
+        return;
+    }
+    try {
+        self->ingest_fpsubmit(message_data, /*broadcast_if_new=*/true);
+    } catch (const std::exception& e) {
+        std::cerr << "[rats-api] fpsubmit handler threw: " << e.what() << "\n";
+    }
+    rats_string_free(peer_id);
+    rats_string_free(message_data);
+}
+
+void RatsApi::load_pending_songs_from_db_() {
+    // Rebuild the producer's in-memory song buffer from the persisted sp:
+    // mempool so a restarted node re-derives the IDENTICAL build set (and the
+    // propagation buffer survives restarts). Prune rows whose song has since
+    // landed on chain, or that no longer parse. No re-broadcast: startup is not
+    // a new submission.
+    size_t loaded = 0;
+    for (auto& [ch, payload] : db_.get_all_pending_songs()) {
+        json env;
+        try { env = json::parse(payload); }
+        catch (...) { db_.del_pending_song(ch); continue; }
+        PendingRegistration reg;
+        if (!pending_reg_from_fpsubmit(env, reg)) { db_.del_pending_song(ch); continue; }
+        if (song_on_chain(db_, reg.content_hash, reg.compressed_fingerprint)) {
+            db_.del_pending_song(ch);
+            continue;
+        }
+        candidates_.enqueue_registration(reg);
+        ++loaded;
+    }
+    if (loaded)
+        std::cout << "[rats-api] restored " << loaded
+                  << " pending song(s) from the sp: mempool\n";
+}
+
+// ======================================================================
+// Shared tx mempool (MC_TX) — flood, pre-flight, min-merge on tx_hash
+// ======================================================================
+namespace {
+
+// Cheap structural + signature pre-flight — the SAME floor the producer applies
+// in candidate.cpp before a tx can enter a block, so a malformed / unsigned tx
+// never floods the mesh. This is only the floor; the authoritative rules
+// (nonce, balance, authority) run in Chain::apply_transactions at block-connect.
+bool tx_preflight_ok(const std::vector<uint8_t>& raw) {
+    if (raw.empty()) return false;
+    switch (static_cast<TxType>(raw[0])) {
+        case TxType::TRANSFER: {
+            TransferTx tx;
+            return TransferTx::deserialize(raw.data(), raw.size(), tx)
+                && tx.verify_signature();
+        }
+        case TxType::MODERATOR_OP: {
+            ModeratorOpTx tx;
+            if (!ModeratorOpTx::deserialize(raw.data(), raw.size(), tx)) return false;
+            if (!tx.verify_signature()) return false;
+            // Mirror candidate.cpp: never even stage a founder-bootstrap
+            // self-grant for a non-pinned address.
+            if (static_cast<ModOpCode>(tx.op_code) == ModOpCode::GRANT
+                && static_cast<ModLevel>(tx.level) == ModLevel::FOUNDER
+                && std::memcmp(tx.proposer.data(), tx.subject.data(), 20) == 0
+                && founder_is_pinned()
+                && std::memcmp(tx.subject.data(),
+                               PINNED_FOUNDER_ADDRESS.data(), 20) != 0)
+                return false;
+            return true;
+        }
+        case TxType::MODERATOR_PROPOSAL: {
+            ProposalTx tx;
+            return ProposalTx::deserialize(raw.data(), raw.size(), tx)
+                && tx.verify_signature();
+        }
+        case TxType::USERNAME_REGISTER: {
+            UsernameTx tx;
+            return UsernameTx::deserialize(raw.data(), raw.size(), tx)
+                && tx.verify_signature();
+        }
+        case TxType::MINT: {
+            MintTx tx;
+            return MintTx::deserialize(raw.data(), raw.size(), tx);
+        }
+        case TxType::RELAY_REWARD: {
+            RelayRewardTx tx;
+            return RelayRewardTx::deserialize(raw.data(), raw.size(), tx)
+                && tx.verify_signature();
+        }
+        default:
+            return false;
+    }
+}
+
+} // namespace
+
+bool RatsApi::ingest_tx(const std::string& payload_json, bool broadcast_if_new) {
+    json env;
+    try { env = json::parse(payload_json); } catch (...) { return false; }
+    if (!env.is_object()) return false;
+    const auto raw = crypto::from_hex(env.value("tx", std::string()));
+    if (raw.empty()) return false;
+    const uint64_t submit_ms = env.value("submit_ms", static_cast<uint64_t>(0));
+    const Hash256  tx_hash   = crypto::sha256(raw.data(), raw.size());
+
+    // Same pre-flight the producer applies, so a bad tx never floods.
+    if (!tx_preflight_ok(raw)) return false;
+
+    // Dedup + min-merge on tx_hash (the content-addressed p: row is free
+    // loop-safe dedup, exactly like mod_log_has_sig). Keep the smaller
+    // submit_ms; re-flood only when newly stored OR submit_ms lowered
+    // (semilattice — invariant I1), so a re-broadcast storm dies after the
+    // first hop and every node converges on the same pt: value (which the
+    // build's inclusion boundary reads).
+    bool is_new_or_lower = true;
+    if (db_.has_pending_tx(tx_hash)) {
+        const uint64_t ex = db_.get_pending_tx_submit_ms(tx_hash).value_or(0);
+        if (ex <= submit_ms) is_new_or_lower = false;
+    }
+    if (!is_new_or_lower) return false;
+
+    db_.put_pending_tx(tx_hash, raw);
+    db_.put_pending_tx_submit_ms(tx_hash, submit_ms);
+    candidates_.wake();
+
+    if (broadcast_if_new && client_)
+        rats_broadcast_message(client_, MC_TX_TYPE, payload_json.c_str());
+    return true;
+}
+
+void RatsApi::on_tx_cb(void* user_data, const char* peer_id,
+                       const char* message_data) {
+    auto* self = static_cast<RatsApi*>(user_data);
+    if (!self || !peer_id || !message_data) {
+        if (peer_id)      rats_string_free(peer_id);
+        if (message_data) rats_string_free(message_data);
+        return;
+    }
+    try {
+        self->ingest_tx(message_data, /*broadcast_if_new=*/true);
+    } catch (const std::exception& e) {
+        std::cerr << "[rats-api] tx handler threw: " << e.what() << "\n";
+    }
+    rats_string_free(peer_id);
+    rats_string_free(message_data);
 }
 
 // ---- DB2 playlists: signed record, verify, ingest, flood ----------------

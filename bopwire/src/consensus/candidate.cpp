@@ -85,25 +85,22 @@ void CandidateManager::stop() {
 bool CandidateManager::enqueue_registration(PendingRegistration reg) {
     {
         std::lock_guard<std::mutex> lk(regs_mutex_);
-        // De-dup against in-flight queue by BOTH content_hash and
-        // fingerprint_hash. Without the fingerprint check, two players
-        // submitting the same song in slightly different encodings could
-        // race past the content-hash gate and both mint blocks before
-        // either one made it into the index.
-        std::queue<PendingRegistration> tmp = pending_regs_;
-        while (!tmp.empty()) {
-            const auto& q = tmp.front();
-            if (q.content_hash == reg.content_hash) return false;
-            if (q.fingerprint_hash == reg.fingerprint_hash) return false;
-            tmp.pop();
-        }
-        pending_regs_.push(std::move(reg));
+        // Insert-or-replace keyed by content_hash. The authoritative min-merge
+        // (which registration variant + submit_ms wins for a content_hash)
+        // already happened in RatsApi::ingest_fpsubmit against the persisted
+        // sp: mempool before we get here, so we just adopt the DB-canonical
+        // winner into the producer's in-memory view. Every node converges its
+        // sp: mempool to the same winner and thus builds the identical entry
+        // here (invariant I1).
+        pending_songs_[reg.content_hash] = std::move(reg);
     }
-    // Nudge the heartbeat loop to flush the next block immediately rather
-    // than waiting up to HEARTBEAT_INTERVAL_MS.
+    // Nudge the heartbeat loop. wake_requested_ is what the wait predicate
+    // actually checks (a bare non-empty buffer must NOT wake it — an immature
+    // song has to wait out the propagation window without spinning).
     {
         std::lock_guard<std::mutex> lk(producer_mu_);
         last_block_at_ms_ = 0; // force the timer check to fire
+        wake_requested_   = true;
     }
     heartbeat_cv_.notify_all();
     return true;
@@ -111,14 +108,15 @@ bool CandidateManager::enqueue_registration(PendingRegistration reg) {
 
 size_t CandidateManager::pending_registration_count() const {
     std::lock_guard<std::mutex> lk(regs_mutex_);
-    return pending_regs_.size();
+    return pending_songs_.size();
 }
 
 void CandidateManager::wake() {
     // Reset the heartbeat clock so the producer's first check after
     // waking sees the threshold as exceeded and mints immediately,
     // AND raise the wake_requested_ flag so the wait_for predicate
-    // breaks out of sleep even when nothing is in pending_regs_.
+    // breaks out of sleep even when nothing is in pending_songs_ (e.g. a
+    // freshly-flooded tx that needs a tx-only block).
     {
         std::lock_guard<std::mutex> lk(producer_mu_);
         last_block_at_ms_ = 0;
@@ -214,41 +212,60 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
     // until the queue drains, with no sleep between them. Otherwise we
     // mint an empty heartbeat block iff HEARTBEAT_INTERVAL_MS has
     // elapsed since the last block.
+    bool minted_last = false;
     while (true) {
-        // If the queue has work, skip the wait entirely — we want
-        // back-to-back mints so a 14-track album scan doesn't take
-        // 7 minutes to show up on chain (one every wake-up tick).
-        bool queue_has_pending = false;
+        // Wait for work unless the previous pass just minted a block — then loop
+        // straight back to drain the next mature item with zero delay, so a
+        // matured album lands back-to-back. The predicate wakes ONLY on stop or
+        // an explicit wake/enqueue; the periodic timeout re-checks the maturity
+        // gate (a buffered item becomes eligible purely by the passage of time,
+        // with no new signal). We deliberately do NOT wake merely because the
+        // buffer is non-empty — an immature item (still inside the propagation
+        // window) must never spin the loop.
         {
-            std::lock_guard<std::mutex> lk(regs_mutex_);
-            queue_has_pending = !pending_regs_.empty();
-        }
-        if (!queue_has_pending) {
             std::unique_lock<std::mutex> lk(producer_mu_);
-            heartbeat_cv_.wait_for(lk, std::chrono::seconds(30), [this] {
-                if (!running_) return true;
-                if (wake_requested_) return true;
-                std::lock_guard<std::mutex> rlk(regs_mutex_);
-                return !pending_regs_.empty();
-            });
-            // Reset the wake flag now that we're awake; the producer
-            // body decides if there's actual work and will mint as
-            // appropriate.
+            if (!minted_last) {
+                heartbeat_cv_.wait_for(lk, std::chrono::seconds(30), [this] {
+                    return !running_ || wake_requested_;
+                });
+            }
             wake_requested_ = false;
             if (!running_) return;
         }
+        minted_last = false;
 
-        // Drain one registration if available.
-        std::optional<PendingRegistration> reg;
+        const uint64_t now = now_ms_c();   // ONLY used for the maturity gate
+
+        // ---- Deterministic song selection (invariants I3 + I6) -----------
+        //
+        // Next song = the LOWEST content_hash among songs that are (a) mature —
+        // past the propagation window, so every node already holds them — and
+        // (b) not already on chain (the ONE shared song_on_chain verdict).
+        // pending_songs_ is a std::map, so it iterates content_hash ascending
+        // and the first qualifying entry is that minimum on every node.
+        // content_hash is a unique 32-byte key ⇒ total order ⇒ every node
+        // selects the SAME song for a given tip. `now` only decides WHEN this
+        // node mints, never WHAT bytes it mints.
+        std::optional<PendingRegistration> reg;   // the selected song (a copy)
         {
             std::lock_guard<std::mutex> lk(regs_mutex_);
-            if (!pending_regs_.empty()) {
-                reg = std::move(pending_regs_.front());
-                pending_regs_.pop();
+            for (auto it = pending_songs_.begin(); it != pending_songs_.end(); ) {
+                PendingRegistration& r = it->second;
+                if (r.retries >= 3) { ++it; continue; }   // gave up (bug-fix #8)
+                const uint64_t age = now >= r.submit_ms ? now - r.submit_ms : 0;
+                if (age < PROPAGATION_WINDOW_MS) { ++it; continue; }   // buffer
+                if (song_on_chain(db, r.content_hash, r.compressed_fingerprint)) {
+                    // Already landed (ours or a peer's) — lazily prune the
+                    // in-memory buffer + any stale sp: row and move on.
+                    db.del_pending_song(it->first);
+                    it = pending_songs_.erase(it);
+                    continue;
+                }
+                reg = r;   // copy the selected registration for the build
+                break;
             }
         }
 
-        const uint64_t now = now_ms_c();
         auto all_pending = db.get_all_pending_txs();
 
         if (!all_pending.empty() || reg) {
@@ -287,6 +304,10 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
             std::vector<uint8_t> raw;
             Address              sender{};   // zero for MINT (no per-sender nonce)
             uint64_t             nonce = 0;
+            // Origin-stamped ms from the pt: side-index (the MC_TX flood value),
+            // or 0 for an un-flooded / locally-injected tx. Drives the inclusion
+            // boundary + maturity gate below; never written into the block.
+            uint64_t             submit_ms = 0;
         };
         std::vector<TxSlot> slots;
         slots.reserve(all_pending.size());
@@ -298,7 +319,8 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
             bool ok = false;
             const char* why = "ok";
             TxSlot slot;
-            slot.hash = tx_hash;
+            slot.hash      = tx_hash;
+            slot.submit_ms = db.get_pending_tx_submit_ms(tx_hash).value_or(0);
             TxType type = static_cast<TxType>(raw[0]);
             switch (type) {
                 case TxType::TRANSFER: {
@@ -403,19 +425,94 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
             slot.raw = std::move(raw);
             slots.push_back(std::move(slot));
         }
-        // Stable sort by (sender, nonce). Same-address txs end up in
-        // monotonic nonce order; addresses are grouped lexicographically
-        // but the grouping is purely cosmetic — apply_transactions only
-        // cares about per-sender monotonicity.
+        // TOTAL-order sort by (sender, nonce, tx_hash). Same-address txs stay in
+        // monotonic nonce order (apply_transactions requires per-sender
+        // monotonicity); the tx_hash tiebreak makes the order total, which kills
+        // the old MINT tie — every MINT carries sender=0/nonce=0, so (sender,
+        // nonce) alone left ≥2 MINTs in unspecified std::sort order and two
+        // nodes could emit different merkle roots. tx_hash is unique ⇒ one
+        // canonical body on every node (invariant I5).
         std::sort(slots.begin(), slots.end(), [](const TxSlot& a, const TxSlot& b) {
             if (a.sender != b.sender) return a.sender < b.sender;
-            return a.nonce < b.nonce;
+            if (a.nonce  != b.nonce ) return a.nonce  < b.nonce;
+            return a.hash < b.hash;
         });
-        std::vector<std::pair<Hash256, std::vector<uint8_t>>> pending_txs;
-        pending_txs.reserve(slots.size());
-        for (auto& s : slots) {
-            pending_txs.emplace_back(s.hash, std::move(s.raw));
+
+        // ---- Deterministic tx inclusion + block timestamp (I4 + I5 + I6) ----
+        //
+        // Both the tx set and the header timestamp must be a pure function of
+        // replicated values, never a per-node clock read:
+        //   * SONG block: timestamp = the selected song's (replicated)
+        //     submit_ms; include every valid tx with submit_ms ≤ that boundary.
+        //     Because the song is mature (past the window), any such tx is at
+        //     least as old ⇒ also mature ⇒ already on every node ⇒ the set is
+        //     identical everywhere, with no clock-skew edge.
+        //   * TX-ONLY (heartbeat) block: no song ⇒ no replicated boundary, so
+        //     include only MATURE txs and set the timestamp to the MAX included
+        //     submit_ms (still a replicated value). A tx within ~(skew+jitter)
+        //     of a node's maturity edge is the lone residual — resolved by
+        //     fork-choice, never a double-spend (every tx keeps its sig/nonce/
+        //     balance check in apply_transactions).
+        uint64_t block_ts = 0;
+        std::vector<TxSlot> included;
+        included.reserve(slots.size());
+        if (reg) {
+            block_ts = reg->submit_ms;
+            for (auto& s : slots)
+                if (s.submit_ms <= block_ts) included.push_back(std::move(s));
+        } else {
+            for (auto& s : slots) {
+                const uint64_t age = now >= s.submit_ms ? now - s.submit_ms : 0;
+                if (age < PROPAGATION_WINDOW_MS) continue;   // not yet propagated
+                included.push_back(std::move(s));
+            }
         }
+
+        // ---- Applicability gate (LIVENESS bug-fix) -----------------------
+        //
+        // The pre-flight above only checks structure + signature, so a well-
+        // signed but UNAPPLIABLE tx still slips through — e.g. an attacker floods
+        // a fresh zero-balance keypair's TransferTx{nonce=0}. With submit_ms 0 it
+        // matures instantly and, being <= every boundary, sorts into EVERY
+        // candidate. apply_transactions is all-or-nothing, so that one tx fails
+        // the WHOLE block; the block never connects, the identical poisoned
+        // candidate rebuilds next tick and fails again — a one-packet, network-
+        // wide chain wedge (and innocent songs in the same block burn retries).
+        // Gate inclusion on APPLICABILITY: trial-apply the assembled body against
+        // the current tip and drop the first tx that won't apply (nonce / balance
+        // / authority), re-checking until the body is clean, del_pending_tx'ing
+        // each culprit so it can't be re-selected. Every included tx is mature
+        // (past the propagation window), so a sequential-nonce sibling is already
+        // present and applies alongside it — only genuine poison is dropped. Same
+        // trial-apply as the commit-failure backstop below, so they never
+        // disagree.
+        for (;;) {
+            std::vector<std::vector<uint8_t>> raws;
+            raws.reserve(included.size());
+            for (auto& s : included) raws.push_back(s.raw);
+            const int bad = chain.first_unappliable_tx(raws);
+            if (bad < 0) break;
+            std::cerr << "[chain] dropping unappliable mempool tx "
+                      << crypto::to_hex(included[bad].hash).substr(0, 12)
+                      << "… (nonce/balance/authority)\n";
+            db.del_pending_tx(included[bad].hash);
+            included.erase(included.begin() + bad);
+        }
+
+        // Header timestamp is a pure function of replicated values (I4). SONG
+        // block: the selected song's submit_ms (already set). TX-ONLY block: the
+        // MAX included submit_ms — recomputed HERE from the PRUNED set so a tx
+        // dropped by the gate can never set the boundary.
+        if (!reg) {
+            block_ts = 0;
+            for (auto& s : included)
+                if (s.submit_ms > block_ts) block_ts = s.submit_ms;
+        }
+
+        std::vector<std::pair<Hash256, std::vector<uint8_t>>> pending_txs;
+        pending_txs.reserve(included.size());
+        for (auto& s : included)
+            pending_txs.emplace_back(s.hash, std::move(s.raw));
 
         // Model 1 — two block kinds, both validated by EVERY node:
         //   * song block:      carries a unique-song registration (has a
@@ -438,7 +535,10 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
         Block block;
         block.header.version          = BLOCK_VERSION;
         block.header.prev_hash        = chain.tip().hash;
-        block.header.timestamp_ms     = now;
+        // Replicated timestamp — the song's submit_ms (song block) or the max
+        // included tx submit_ms (tx-only). NEVER `now`: the wall clock only
+        // gated maturity above, it never reaches the block bytes (invariant I4).
+        block.header.timestamp_ms     = block_ts;
         for (auto& [_, tx_data] : pending_txs)
             block.transactions.push_back(tx_data);
         block.header.merkle_root      = Block::compute_merkle_root(block.transactions);
@@ -481,48 +581,74 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                 std::lock_guard<std::mutex> lk(producer_mu_);
                 last_block_at_ms_ = now; // back off so we don't spin
             }
+            // ---- Liveness backstop: isolate + evict a poison tx ---------
+            //
+            // The build-time applicability gate already dropped txs that won't
+            // apply, so a failure here is normally a raced tip (prev_hash) or a
+            // duplicate song — neither a tx fault. But if the tip advanced under
+            // us and a now-included tx became unappliable, isolate exactly that
+            // one and evict it (mirroring the song retry/drop) so it can't wedge
+            // the chain across the race. If no tx is at fault (idx < 0) fall
+            // through to the song handling. Never penalizes the song for a bad
+            // tx — the song stays selectable.
+            if (!pending_txs.empty()) {
+                std::vector<std::vector<uint8_t>> raws;
+                raws.reserve(pending_txs.size());
+                for (auto& p : pending_txs) raws.push_back(p.second);
+                const int bad = chain.first_unappliable_tx(raws);
+                if (bad >= 0) {
+                    std::cerr << "[chain] evicting unappliable tx after commit "
+                                 "failure "
+                              << crypto::to_hex(pending_txs[bad].first).substr(0, 12)
+                              << "…\n";
+                    db.del_pending_tx(pending_txs[bad].first);
+                    continue;   // retry without it; the song (if any) is untouched
+                }
+            }
             // ---- Bug fix #8 / #26 ---------------------------------
             //
-            // Don't blindly re-queue. Failures usually fall into one of
-            // three buckets:
-            //
-            //   * "Chain connect_block rejected" with a duplicate-song
-            //     reason — the song's content hash is already on chain.
-            //     Re-queueing would just trigger the same rejection on
-            //     the next iteration; drop it.
-            //   * Confirmation timeout in multi-node mode — transient,
-            //     retry up to 3 times then give up.
-            //   * All other failures — drop after one retry to avoid an
-            //     infinite loop poisoning chain progression for
-            //     genuinely broken submissions.
-            //
-            // We use the PendingRegistration's `retries` field (added
-            // in this turn) as the retry counter; the chain-side
-            // duplicate check at validate_block already rejects songs
-            // whose fingerprint is on chain so we don't have to
-            // re-query here.
+            // A song block that fails to connect is usually a duplicate
+            // (another node registered the same song first, so song_on_chain
+            // is now true) or carries a bad tx. Bump the selected song's retry
+            // counter IN the buffer (map lookup by content_hash) and drop it
+            // once it is on chain or has burned 3 attempts, so one bad
+            // submission can't wedge the chain forever. It stays selectable
+            // (lowest content_hash first) until then; the selection scan skips
+            // retries >= 3. The `reg` we hold is a copy, so the counter must
+            // live on the map entry, not on it.
             if (reg) {
-                reg->retries++;
-                bool give_up = reg->retries >= 3;
-                // If validate_block rejected it as duplicate, bail
-                // immediately — there is no benefit to retrying.
-                if (chain.validate_block_quick_duplicate(reg->content_hash)) {
-                    give_up = true;
-                    std::cerr << "[chain] dropping duplicate song reg "
-                              << crypto::to_hex(reg->content_hash).substr(0, 12)
-                              << "…\n";
-                }
-                if (!give_up) {
-                    std::lock_guard<std::mutex> rlk(regs_mutex_);
-                    pending_regs_.push(std::move(*reg));
-                } else {
-                    std::cerr << "[chain] dropping reg after "
-                              << static_cast<unsigned>(reg->retries)
-                              << " retries\n";
+                const bool dup = song_on_chain(db, reg->content_hash,
+                                               reg->compressed_fingerprint);
+                std::lock_guard<std::mutex> rlk(regs_mutex_);
+                auto it = pending_songs_.find(reg->content_hash);
+                if (it != pending_songs_.end()) {
+                    it->second.retries++;
+                    if (dup || it->second.retries >= 3) {
+                        if (dup)
+                            std::cerr << "[chain] dropping duplicate song reg "
+                                      << crypto::to_hex(reg->content_hash).substr(0, 12)
+                                      << "…\n";
+                        else
+                            std::cerr << "[chain] dropping reg after "
+                                      << static_cast<unsigned>(it->second.retries)
+                                      << " retries\n";
+                        db.del_pending_song(it->first);
+                        pending_songs_.erase(it);
+                    }
                 }
             }
             continue;
         }
+
+        // Success — the block connected. Drop the minted song from the buffer
+        // (its sp: row already fell inside connect_block's batch) and set
+        // minted_last so the loop goes straight back to drain the next mature
+        // item with no wait (back-to-back album mints).
+        if (reg) {
+            std::lock_guard<std::mutex> rlk(regs_mutex_);
+            pending_songs_.erase(reg->content_hash);
+        }
+        minted_last = true;
 
         if (reg) {
             std::cout << "[chain] block " << chain.tip().height

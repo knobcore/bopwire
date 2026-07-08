@@ -158,16 +158,26 @@ std::string Fingerprint::compressed() const {
     return result;
 }
 
-float Fingerprint::similarity(const Fingerprint& other) const {
-    const auto& a = raw_;
-    const auto& b = other.raw_;
-    if (a.empty() || b.empty()) return 0.0f;
+namespace {
+// Offset-aligned best-overlap core, shared by similarity() (float, display /
+// non-consensus) and same_song() (integer CONSENSUS verdict) so the two can
+// never drift. Fills best_matching / best_len with the densest <=2-bit-error
+// overlap found across the searched offset range, then applies the minimum-
+// overlap guard (zeroing the result when the overlap is too short to trust).
+// EVERY step is integer arithmetic — the offset cross-multiply AND the 30 %
+// overlap floor — so the (best_matching, best_len) pair is bit-identical on
+// every compiler/arch. No float touches the computation; only similarity()'s
+// final display ratio does, and that value never gates consensus.
+void compute_best_overlap(const std::vector<uint32_t>& a,
+                          const std::vector<uint32_t>& b,
+                          int& best_matching, int& best_len) {
+    best_matching = 0;
+    best_len      = 0;
+    if (a.empty() || b.empty()) return;
 
     // Find best offset alignment (search over [-offset_range, +offset_range])
-    int   best_matching = 0;
-    int   best_len      = 0;
-    int   offset_range  = std::min(static_cast<int>(a.size()),
-                                   static_cast<int>(b.size())) / 4;
+    int offset_range = std::min(static_cast<int>(a.size()),
+                                static_cast<int>(b.size())) / 4;
     if (offset_range < 1) offset_range = 1;
 
     for (int off = -offset_range; off <= offset_range; ++off) {
@@ -212,11 +222,37 @@ float Fingerprint::similarity(const Fingerprint& other) const {
     // silence = 0x00000000, sustained tones, identical fades) trivially pass
     // the <=2-bit test, so a small overlap concentrated on those frames can
     // score deceptively high. Require a meaningful overlap before trusting the
-    // ratio; otherwise treat as no-match.
-    const int min_overlap = std::max(
-        256, static_cast<int>(0.30 * std::min(a.size(), b.size())));
-    if (best_len == 0 || best_len < min_overlap) return 0.0f;
+    // ratio; otherwise treat as no-match. 0.30·N is computed as (3·N)/10 in
+    // integers — no `0.30 * size` double whose truncation could differ by a
+    // frame between platforms and flip the consensus verdict.
+    const uint64_t shorter = std::min(a.size(), b.size());
+    const int min_overlap  = std::max<int>(
+        256, static_cast<int>((shorter * 3) / 10));
+    if (best_len < min_overlap) { best_matching = 0; best_len = 0; }
+}
+} // namespace
+
+float Fingerprint::similarity(const Fingerprint& other) const {
+    int best_matching = 0, best_len = 0;
+    compute_best_overlap(raw_, other.raw_, best_matching, best_len);
+    if (best_len == 0) return 0.0f;
     return static_cast<float>(best_matching) / static_cast<float>(best_len);
+}
+
+bool Fingerprint::same_song(const Fingerprint& other) const {
+    // CONSENSUS duplicate verdict — MUST be bit-identical across compilers/arch,
+    // so the threshold test is pure integer/fixed-point (NOT similarity() >=
+    // 0.70f, whose float rounding forks a Windows-x64 node against a Linux one
+    // on a near-threshold re-encode). With match ratio best_matching/best_len
+    // and the shared threshold kChromaprintSimThreshold = 0.70 = 70/100, the
+    // verdict  best_matching/best_len >= 0.70  is EXACTLY the integer
+    // cross-multiply below (both denominators positive). Same effective 0.70,
+    // zero float in the decision.
+    int best_matching = 0, best_len = 0;
+    compute_best_overlap(raw_, other.raw_, best_matching, best_len);
+    if (best_len == 0) return false;
+    return static_cast<int64_t>(best_matching) * 100 >=
+           static_cast<int64_t>(best_len) * 70;
 }
 
 std::vector<uint16_t> Fingerprint::bucket_ids() const {

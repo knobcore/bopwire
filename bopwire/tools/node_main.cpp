@@ -680,7 +680,7 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         // stream.open. peer→wallet identity arrives via mini.hello.
         rats_api.set_relay_tracker(&relay_tracker);
         relay_tracker.start(
-            [&chain, &db, &candidates, &cfg](const mc::Address& mini_addr, uint64_t count) {
+            [&chain, &db, &candidates, &cfg, &rats_api](const mc::Address& mini_addr, uint64_t count) {
                 // Read the founder seed off disk on every sweep so the
                 // operator can hot-swap it without restarting the node.
                 const std::string seed_path = cfg.data_dir + "/founder.seed";
@@ -730,11 +730,23 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
                     return;
                 }
                 auto h = tx.tx_hash();
-                if (!db.put_pending_tx(h, tx.serialize())) {
-                    std::cerr << "[relay] put_pending_tx failed\n";
+                // Route through ingest_tx (NOT a raw put_pending_tx): this
+                // stamps the replicated pt: submit_ms AND floods the tx to
+                // every node, so the RelayRewardTx is consensus-eligible and
+                // included by the SAME deterministic rule on every full node.
+                // A raw put_pending_tx (unstamped, un-flooded) would land only
+                // in this node's mempool and diverge multi-node blocks.
+                json txe = {
+                    {"tx", mc::crypto::to_hex(tx.serialize())},
+                    {"submit_ms", static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count())},
+                };
+                if (!rats_api.ingest_tx(txe.dump(), /*broadcast_if_new=*/true)) {
+                    std::cerr << "[relay] ingest_tx rejected RelayRewardTx\n";
                     return;
                 }
-                candidates.wake();
                 std::cerr << "[relay] minted RelayRewardTx target="
                           << db.hex(mini_addr) << " count=" << count
                           << " tx_hash=" << mc::crypto::to_hex(h) << "\n";

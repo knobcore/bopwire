@@ -303,6 +303,10 @@ bool Database::put_pending_tx(const Hash256& tx_hash, const std::vector<uint8_t>
 }
 
 bool Database::del_pending_tx(const Hash256& tx_hash) {
+    // Drop the paired submit_ms side-index (pt:) too so it never outlives its
+    // p: row. Best-effort — a missing pt: (e.g. an un-flooded tx) is not an
+    // error and returns false harmlessly.
+    del("pt:" + hex(tx_hash));
     return del("p:" + hex(tx_hash));
 }
 
@@ -312,11 +316,62 @@ std::vector<std::pair<Hash256, std::vector<uint8_t>>> Database::get_all_pending_
     auto* it = db_->NewIterator(opts);
     for (it->Seek("p:"); it->Valid() && it->key().starts_with("p:"); it->Next()) {
         auto key_str = it->key().ToString();
+        // The "p:" prefix scan never reaches the "pt:" submit_ms side-index:
+        // lexicographically "p:<hex>" (second byte 0x3a) sorts entirely before
+        // "pt:<hex>" (second byte 0x74), and the loop stops at the first key
+        // that doesn't start with "p:". So no length guard is needed here.
         auto hash_hex = key_str.substr(2);
         Hash256 h;
         if (crypto::parse_hash256(hash_hex, h)) {
             std::string val_str = it->value().ToString();
             result.emplace_back(h, std::vector<uint8_t>(val_str.begin(), val_str.end()));
+        }
+    }
+    delete it;
+    return result;
+}
+
+bool Database::has_pending_tx(const Hash256& tx_hash) const {
+    return get("p:" + hex(tx_hash)).has_value();
+}
+
+bool Database::put_pending_tx_submit_ms(const Hash256& tx_hash, uint64_t submit_ms) {
+    std::vector<uint8_t> buf(8);
+    for (int i = 0; i < 8; ++i) buf[i] = static_cast<uint8_t>((submit_ms >> (8*i)) & 0xFF);
+    return put("pt:" + hex(tx_hash), buf);
+}
+
+std::optional<uint64_t> Database::get_pending_tx_submit_ms(const Hash256& tx_hash) const {
+    return get_u64("pt:" + hex(tx_hash));
+}
+
+// ---- Song mempool (sp:) --------------------------------------------
+
+bool Database::put_pending_song(const Hash256& content_hash, const std::string& payload) {
+    return put("sp:" + hex(content_hash),
+               std::vector<uint8_t>(payload.begin(), payload.end()));
+}
+
+std::optional<std::string> Database::get_pending_song(const Hash256& content_hash) const {
+    auto v = get("sp:" + hex(content_hash));
+    if (!v) return std::nullopt;
+    return std::string(v->begin(), v->end());
+}
+
+bool Database::del_pending_song(const Hash256& content_hash) {
+    return del("sp:" + hex(content_hash));
+}
+
+std::vector<std::pair<Hash256, std::string>> Database::get_all_pending_songs() const {
+    std::vector<std::pair<Hash256, std::string>> result;
+    leveldb::ReadOptions opts;
+    auto* it = db_->NewIterator(opts);
+    for (it->Seek("sp:"); it->Valid() && it->key().starts_with("sp:"); it->Next()) {
+        auto key_str = it->key().ToString();
+        Hash256 h;
+        if (crypto::parse_hash256(key_str.substr(3), h)) {
+            std::string val_str = it->value().ToString();
+            result.emplace_back(h, std::move(val_str));
         }
     }
     delete it;
@@ -933,9 +988,15 @@ std::string Database::hex(const Address& a) const {
 }
 
 void Database::clear_derived_state() {
-    // Delete all keys with prefixes: a:, s:, f:, i:, u:
+    // Delete all keys with prefixes: a:, s:, f:, i:, u:, bh:
+    // bh: (content-height marker) is derived state too — song_on_chain's exact
+    // duplicate check now consults it, and rebuild_derived_state repopulates it
+    // for every song block. Clearing it here so a replay rebuilds it from
+    // scratch is what makes the exact verdict replay-consistent (a block's own
+    // bh: row is absent until its own replay step writes it, so replay never
+    // false-positives on the block it is currently validating).
     leveldb::WriteBatch batch;
-    const std::vector<std::string> prefixes{"a:", "s:", "f:", "i:", "u:"};
+    const std::vector<std::string> prefixes{"a:", "s:", "f:", "i:", "u:", "bh:"};
     for (const auto& prefix : prefixes) {
         auto* it = db_->NewIterator(leveldb::ReadOptions());
         for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next())

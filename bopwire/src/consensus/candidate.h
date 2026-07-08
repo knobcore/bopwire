@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <queue>
+#include <map>
 #include <thread>
 #include <unordered_map>
 #include <mutex>
@@ -32,6 +33,16 @@ namespace mc {
 // fingerprint case. 5 min matches the spec.
 static constexpr uint32_t HEARTBEAT_INTERVAL_MS   = 5 * 60 * 1000;
 
+// Propagation buffer ("deep mempool") knob. A flooded song / tx is only
+// eligible to be minted once (now_local − submit_ms) ≥ this, which guarantees
+// it reached every node before ANY node mints it. For a song block this also
+// makes the tx boundary (submit_ms ≤ block.timestamp_ms) safe: the selected
+// song being mature ⇒ every included tx is at least as old ⇒ already
+// everywhere. It bounds only WHEN a node mints, never WHAT bytes it mints, so
+// it never enters the block. Deliberately well above realistic gossip latency
+// + clock skew.
+static constexpr uint64_t PROPAGATION_WINDOW_MS   = 30'000;
+
 // PendingUpload + the upload pipeline were removed when the full node
 // stopped ingesting audio bytes. Songs now reach the chain only through
 // `PendingRegistration` (queued by fingerprint.submit).
@@ -55,6 +66,13 @@ struct PendingRegistration {
     uint16_t                  track_number = 0;
     std::vector<RoyaltySplit> royalty_splits;
     std::string               announcing_peer_id; // who fingerprinted it
+    // Origin-stamped wall-clock ms, frozen once at flood origin
+    // (RatsApi::fingerprint.submit) and replicated verbatim in the MC_FPSUBMIT
+    // envelope. This is the ONLY time a clock touches a song's consensus data:
+    // the song block's header.timestamp_ms is set to exactly this value, and
+    // the propagation-window maturity gate compares it against now_local. Every
+    // node therefore mints byte-identical song blocks (invariant I4).
+    uint64_t                  submit_ms        = 0;
     // How many block-mint attempts this reg has burned. The producer
     // gives up after 3 so a single bad submission can't wedge the
     // chain forever (bug-fix #8).
@@ -73,10 +91,12 @@ public:
                const crypto::KeyPair& keypair);
     void stop();
 
-    /// Player fingerprinted a song the chain doesn't know yet. Queue it
-    /// for inclusion in the next block the heartbeat producer mints.
-    /// Returns true if the registration was accepted (i.e. the
-    /// content_hash isn't already known and isn't already queued).
+    /// Adopt a (flooded) song registration into the producer's in-memory build
+    /// buffer, keyed by content_hash. The authoritative min-merge — which
+    /// variant + submit_ms wins for a given content_hash — is done by
+    /// RatsApi::ingest_fpsubmit against the persisted sp: mempool BEFORE this is
+    /// called, so here we simply insert-or-replace with the DB-canonical winner.
+    /// Always returns true (kept for call-site compatibility).
     bool enqueue_registration(PendingRegistration reg);
 
     /// Number of pending registrations waiting to land in the next block.
@@ -105,17 +125,21 @@ private:
     std::thread                                      heartbeat_thread_;
     bool                                             running_ = false;
     uint64_t                                         last_block_at_ms_ = 0;
-    // wake() sets this to true under producer_mu_ + notify_all(); the
-    // wait_for predicate checks it so a notify accompanying a mempool
-    // tx (rather than a pending_regs_ push) actually breaks out of the
-    // sleep. Producer body resets it once the work is consumed.
+    // wake() AND enqueue_registration set this to true under producer_mu_ +
+    // notify_all(); the wait_for predicate checks it so a notify (a new song or
+    // a mempool tx) actually breaks out of the sleep. The predicate wakes ONLY
+    // on stop / wake_requested / timeout — never merely because the buffer is
+    // non-empty — so an immature (buffered, not-yet-eligible) item can't spin
+    // the loop. Producer body resets it once awake.
     bool                                             wake_requested_ = false;
 
-    // Pending player-submitted registrations. The heartbeat loop drains
-    // these into freshly-minted blocks — one song record per block,
-    // newest first.
+    // Pending flooded song registrations, keyed by content_hash. std::map gives
+    // ascending-content_hash iteration for free, which IS the deterministic
+    // selection order (invariant I3: next song = lowest content_hash among
+    // mature, not-on-chain). Rebuilt from the persisted sp: mempool on startup
+    // so a restart re-derives the identical build set.
     mutable std::mutex                               regs_mutex_;
-    std::queue<PendingRegistration>                  pending_regs_;
+    std::map<Hash256, PendingRegistration>           pending_songs_;
 
     /// Finalize `block` (Model 1, vote-free): validate + connect to the
     /// chain, announce it to the mesh, write the .blk file. No

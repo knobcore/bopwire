@@ -99,6 +99,21 @@ inline bool tip_is_better(const ChainTip& candidate, const ChainTip& current) {
     return candidate.hash > current.hash;
 }
 
+// Shared on-chain uniqueness verdict — the SINGLE duplicate-song test used on
+// every path (enqueue, build-selection, connect-validate, replay, swarm-join),
+// so "is this song already on chain?" is byte-for-byte identical on every node.
+// Returns true iff `content_hash` is already registered (exact, via the
+// fingerprint index) OR a chromaprint re-encode of it is (fuzzy bucket scan vs
+// audio::kChromaprintSimThreshold). Reads only the Database, so the "chain so
+// far" is whatever index is committed: the full chain on the connect path, the
+// partially-rebuilt index on the replay path — identical semantics to the four
+// hand-inlined checks it replaces. Making duplicate-ness one function (not a
+// shared constant across copies) is what keeps the fork-hinge verdict from
+// drifting between paths or binaries.
+bool song_on_chain(const Database& db,
+                   const Hash256& content_hash,
+                   const std::string& compressed_fingerprint);
+
 // Manages the canonical blockchain: connect/disconnect blocks, tip tracking,
 // state derivation (balances, fingerprint index, song state).
 class Chain {
@@ -185,8 +200,22 @@ public:
     // Rebuild all derived state by replaying all blocks.
     bool rebuild_derived_state();
 
+    // Producer liveness helper. Trial-applies the given transaction list against
+    // the CURRENT tip state — in a throwaway batch that is NEVER written — and
+    // returns the index of the FIRST tx that fails to apply (nonce / balance /
+    // authority), or -1 if every tx applies. Uses the exact same all-or-nothing
+    // apply_transactions the real connect path runs, so its verdict matches
+    // connect_block precisely. The producer uses it to isolate and evict a
+    // single unappliable (e.g. flooded zero-balance) tx instead of letting it
+    // re-enter every candidate and wedge the chain forever. Takes the chain
+    // mutex; call OFF the connect path (no re-entrancy).
+    int first_unappliable_tx(const std::vector<std::vector<uint8_t>>& txs);
+
     // Apply a transfer transaction (verifies signature + nonce, updates balances + nonce).
-    // Called from post_transfer API handler and apply_transactions().
+    // Called from apply_transactions() only. (The post_transfer API handler no
+    // longer applies transfers directly — that mutated the ledger outside a
+    // block and diverged nodes; transfers now flow through the flooded mempool
+    // and land via block-apply like every other tx.)
     bool apply_transfer(const TransferTx& tx, leveldb::WriteBatch& batch);
 
     // Apply a mint transaction directly (credits outputs, updates song state).

@@ -128,6 +128,12 @@ bool Chain::connect_block(const Block& block) {
         db_.add_to_artist_index(batch, block.song.artist, block.song.content_hash);
         db_.add_to_genre_index(batch, block.song.genre, block.song.content_hash);
         db_.set_content_height(batch, block.song.content_hash, new_height);
+        // The song has landed — drop its pending-song mempool row (sp:) in the
+        // SAME batch as the block writes, so a restart / rejoin never
+        // re-enqueues or re-floods a song that is already on chain. Runs for
+        // both self-minted and peer-adopted blocks (every node calls
+        // connect_block), so sp: converges to "not yet on chain" network-wide.
+        db_.del_batch(batch, "sp:" + db_.hex(block.song.content_hash));
     }
 
     // Apply transactions
@@ -149,6 +155,7 @@ bool Chain::connect_block(const Block& block) {
         if (raw_tx.empty()) continue;
         auto th = crypto::sha256(raw_tx.data(), raw_tx.size());
         db_.del_batch(batch, "p:" + db_.hex(th));
+        db_.del_batch(batch, "pt:" + db_.hex(th));   // paired submit_ms side-index
     }
 
     if (!db_.write(batch)) return false;
@@ -973,6 +980,53 @@ std::optional<uint32_t> Chain::get_block_height(const Hash256& hash) const {
     return db_.get_u32("h:" + db_.hex(hash));
 }
 
+bool song_on_chain(const Database& db,
+                   const Hash256& content_hash,
+                   const std::string& compressed_fingerprint) {
+    // Exact: this content_hash is already registered. The authoritative exact
+    // marker is the content-height index (bh:), NOT get_fingerprint: put_
+    // fingerprint writes the f: / bucket rows ONLY when audio::Fingerprint::
+    // from_compressed can decode the blob, so a song whose compressed_
+    // fingerprint does not decode leaves NO f: row — it would stay invisible to
+    // the exact check forever and every node would re-mint the same content_
+    // hash. set_content_height runs UNCONDITIONALLY for every song block in both
+    // connect_block and rebuild_derived_state (and bh: is cleared in clear_
+    // derived_state, so replay rebuilds it from scratch and a block's own row is
+    // absent until its own step-4 write — no self-false-positive / replay
+    // stall). We still also accept an f: hit for defence in depth.
+    if (db.get_content_height(content_hash).has_value()) return true;
+    if (db.get_fingerprint(content_hash).has_value())    return true;
+
+    // Fuzzy: a different encoding of the same song hashes to a different
+    // content_hash, so the exact index misses it. Probe the chromaprint bucket
+    // index; anything scoring >= the shared threshold is the SAME song. Skips
+    // its own content_hash and early-exits on the first hit — identical to the
+    // replay + swarm-join scans this consolidates (same constant, same
+    // algorithm, same de-dup-by-seen-set).
+    if (compressed_fingerprint.empty()) return false;
+    auto fp = audio::Fingerprint::from_compressed(compressed_fingerprint);
+    if (!fp) return false;
+    std::unordered_set<std::string> seen;
+    for (auto bucket : fp->bucket_ids()) {
+        for (const auto& cand_ch : db.get_bucket(bucket)) {
+            if (cand_ch == content_hash) continue;
+            const std::string key = crypto::to_hex(cand_ch);
+            if (!seen.insert(key).second) continue;
+            auto entry = db.get_fingerprint(cand_ch);
+            if (!entry) continue;
+            auto other = audio::Fingerprint::from_compressed(
+                entry->compressed_fingerprint);
+            if (!other) continue;
+            // Integer/fixed-point same-song verdict (NOT similarity() >= 0.70f):
+            // the fuzzy branch is on the consensus path (validate/replay), so a
+            // float compare near the threshold would fork heterogeneous builds.
+            if (fp->same_song(*other))
+                return true;
+        }
+    }
+    return false;
+}
+
 bool Chain::validate_block(const Block& block, std::string& error) const {
     // Caller (connect_block) holds the chain mutex. We're a const
     // function so any external direct call is fine; the lock above is
@@ -982,10 +1036,16 @@ bool Chain::validate_block(const Block& block, std::string& error) const {
         error = "prev_hash mismatch";
         return false;
     }
-    // Reject duplicate songs (same content hash already in chain). Only
-    // meaningful for song-bearing blocks; heartbeats carry zero hashes
-    // by construction.
-    if (block.has_song && db_.get_fingerprint(block.song.content_hash)) {
+    // Reject duplicate songs. Only meaningful for song-bearing blocks;
+    // heartbeats carry zero hashes by construction. Uses the SHARED
+    // song_on_chain verdict — exact AND fuzzy — so the live accept path catches
+    // the same near-duplicate the replay path does. Previously connect was
+    // exact-only while replay was fuzzy, so a fuzzy near-dup slipped onto the
+    // live chain and was only caught on a later replay (which truncated),
+    // letting two nodes replaying at different times diverge. One verdict on
+    // both paths removes that accept-vs-replay asymmetry.
+    if (block.has_song && song_on_chain(db_, block.song.content_hash,
+                                        block.song.compressed_fingerprint)) {
         error = "duplicate song";
         return false;
     }
@@ -1007,8 +1067,10 @@ bool Chain::validate_candidate(const Block& block, std::string& error) const {
     // the song, the producer's block can't be canonical for it. (Race
     // window: another producer might've registered the same song
     // milliseconds before us; in that case the slower producer's block
-    // legitimately can't connect anyway.)
-    if (block.has_song && db_.get_fingerprint(block.song.content_hash)) {
+    // legitimately can't connect anyway.) Same shared exact+fuzzy verdict
+    // as validate_block / replay so all paths agree on duplicate-ness.
+    if (block.has_song && song_on_chain(db_, block.song.content_hash,
+                                        block.song.compressed_fingerprint)) {
         error = "duplicate song";
         return false;
     }
@@ -1142,13 +1204,17 @@ bool Chain::reorg_to_branch(const Hash256& fork_hash, uint32_t fork_height,
                           std::vector<uint8_t>(fh.begin(), fh.end()));
             w += count_plays(b);
             db_.put_batch_u64(batch, "cw:" + db_.hex(hh), w);
-            // Drain adopted txs from the mempool, same as connect_block, so
-            // they aren't re-proposed and rejected on nonce after the reorg.
+            // Drain adopted txs + their submit_ms side-index from the mempool,
+            // same as connect_block, so they aren't re-proposed and rejected on
+            // nonce after the reorg. Song blocks also drop their sp: pending row.
             for (const auto& raw_tx : b.transactions) {
                 if (raw_tx.empty()) continue;
                 auto th = crypto::sha256(raw_tx.data(), raw_tx.size());
                 db_.del_batch(batch, "p:" + db_.hex(th));
+                db_.del_batch(batch, "pt:" + db_.hex(th));
             }
+            if (b.has_song)
+                db_.del_batch(batch, "sp:" + db_.hex(b.song.content_hash));
         }
         std::vector<uint8_t> tv(36);
         std::memcpy(tv.data(), tip_hash.data(), 32);
@@ -1287,41 +1353,20 @@ bool Chain::rebuild_derived_state() {
         //    content + history check (steps 1, 2, 4, 5). Transaction
         //    signatures are still verified in apply_transactions (step 5).
 
-        // 3. chromaprint fuzzy uniqueness against the partial index
-        //    we've built so far. Skipped for heartbeat / non-song blocks.
-        if (block->has_song && !block->song.compressed_fingerprint.empty()) {
-            auto fp = audio::Fingerprint::from_compressed(
-                block->song.compressed_fingerprint);
-            if (fp) {
-                // Shared with rats_api.cpp's swarm-join probe — MUST match or
-                // nodes disagree on duplicate-ness and fork (see fingerprint.h).
-                const float kSimThreshold = audio::kChromaprintSimThreshold;
-                std::unordered_set<std::string> seen;
-                float best_sim = 0.0f;
-                bool dup = false;
-                for (auto bucket : fp->bucket_ids()) {
-                    for (const auto& cand_ch : db_.get_bucket(bucket)) {
-                        if (cand_ch == block->song.content_hash) continue;
-                        const std::string key = crypto::to_hex(cand_ch);
-                        if (!seen.insert(key).second) continue;
-                        auto entry = db_.get_fingerprint(cand_ch);
-                        if (!entry) continue;
-                        auto other = audio::Fingerprint::from_compressed(
-                            entry->compressed_fingerprint);
-                        if (!other) continue;
-                        const float sim = fp->similarity(*other);
-                        if (sim > best_sim) best_sim = sim;
-                        if (sim >= kSimThreshold) { dup = true; break; }
-                    }
-                    if (dup) break;
-                }
-                if (dup) {
-                    std::cerr << "[chain] replay: block " << h
-                              << " carries a chromaprint duplicate (sim="
-                              << best_sim << ") — stopping\n";
-                    break;
-                }
-            }
+        // 3. Uniqueness against the partial index we've built so far, via the
+        //    SAME shared verdict every other path uses. Exact (get_fingerprint)
+        //    OR fuzzy chromaprint (bucket scan vs kChromaprintSimThreshold).
+        //    Skipped for heartbeat / non-song blocks. block h's own fingerprint
+        //    isn't written until step 4 below, so a fresh song falls through to
+        //    the fuzzy scan exactly as before; only a genuine re-registration
+        //    of an already-replayed content_hash trips the exact half.
+        if (block->has_song &&
+            song_on_chain(db_, block->song.content_hash,
+                          block->song.compressed_fingerprint)) {
+            std::cerr << "[chain] replay: block " << h
+                      << " carries a duplicate song (content/fingerprint already "
+                         "on chain) — stopping\n";
+            break;
         }
 
         // 4. Apply.
@@ -1333,6 +1378,13 @@ bool Chain::rebuild_derived_state() {
                                      block->song.content_hash);
             db_.add_to_genre_index(batch, block->song.genre,
                                     block->song.content_hash);
+            // Rebuild the content-height marker (bh:) that song_on_chain's exact
+            // check consults. It is cleared in clear_derived_state, so replay
+            // MUST repopulate it here or the exact duplicate check goes blind on
+            // a restart / reorg. Written AFTER step 3's song_on_chain call above,
+            // so block h's own row is absent when h is checked (no self-hit),
+            // exactly like put_fingerprint. Mirrors connect_block.
+            db_.set_content_height(batch, block->song.content_hash, h);
         }
         applied_nonce_in_block_.clear();
         proposal_votes_in_block_.clear();
@@ -1370,6 +1422,28 @@ bool Chain::rebuild_derived_state() {
         db_.put("t:tip", v);
     }
     return true;
+}
+
+int Chain::first_unappliable_tx(const std::vector<std::vector<uint8_t>>& txs) {
+    std::lock_guard<std::mutex> lk(mu_);
+    // Trial-apply growing prefixes [0..i] into a throwaway batch (never
+    // written). The first i whose inclusion makes apply_transactions fail is the
+    // culprit — [0..i-1] applied cleanly, so adding txs[i] is what broke it.
+    // apply_transactions is reused verbatim (same nonce/balance/authority rules,
+    // same per-sender nonce staging), so this agrees bit-for-bit with what
+    // connect_block would do at tip_.height + 1. The prefix walk keeps sequential
+    // same-sender nonces intact: txs[i] is only flagged if it fails GIVEN every
+    // earlier tx already applied. O(n^2) apply work, but n is mempool-bounded and
+    // this runs only on the rare wedge/commit-failure path.
+    Block probe;
+    probe.transactions.reserve(txs.size());
+    for (size_t i = 0; i < txs.size(); ++i) {
+        probe.transactions.push_back(txs[i]);
+        leveldb::WriteBatch batch;                 // discarded — no db mutation
+        if (!apply_transactions(probe, tip_.height + 1, batch))
+            return static_cast<int>(i);
+    }
+    return -1;
 }
 
 } // namespace mc
