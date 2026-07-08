@@ -48,6 +48,31 @@ inline std::vector<Checkpoint> hardcoded_checkpoints() {
     return {};
 }
 
+// Founder lock. There is no genesis block: the chain starts empty and the
+// founder is claimed by the first valid self-GRANT that any node mines. To
+// stop anyone from re-bootstrapping the network (e.g. in the empty-chain
+// window right after a wipe), we pin the one address permitted to bootstrap
+// the founder into the binary here. Every validating node checks this on
+// block-apply (Chain::apply_moderator_op), so a block carrying a founder
+// GRANT for any other address fails to apply and is rejected network-wide.
+//
+// All-zero = UNPINNED (dev/test): behavior falls back to "first valid
+// self-grant wins", so local dev and the unit tests are unaffected. The
+// real 20-byte address is baked in during the bootstrap ceremony (after the
+// bopwire-admin wizard generates the founder wallet) and the release nodes
+// are rebuilt. This is deliberately a compile-time constant, like the
+// checkpoints above — an attacker can't change it without recompiling, and
+// honest nodes running the real binary reject their fork.
+inline constexpr Address PINNED_FOUNDER_ADDRESS = {{
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+}};
+
+inline bool founder_is_pinned() {
+    for (uint8_t b : PINNED_FOUNDER_ADDRESS)
+        if (b != 0) return true;
+    return false;
+}
+
 // Fork-choice rule (#8, Model 1): "better" means we should adopt theirs.
 //
 //   1. More cumulative audited plays wins (higher weight). This is the
@@ -259,11 +284,22 @@ private:
     // and the in-block staging set, deduping addresses.
     size_t effective_vote_count(const Hash256& prop_hash) const;
 
-    // Execute a HIDE/RELEASE proposal directly into `batch` and flip
-    // its propstatus to EXECUTED. Returns false if the action itself
-    // is invalid (e.g. release amount exceeds escrow balance).
+    // True iff EVERY currently voting-eligible (level >= OP) moderator has
+    // a YES vote recorded for `prop_hash` (on disk or staged in the current
+    // block). Empty voter set => false (never vacuously unanimous). Used
+    // only by GRANT_MODERATOR, which requires a unanimous moderator vote
+    // rather than a simple majority. Re-evaluated against the *current*
+    // moderator set on each apply (adding a mod mid-vote raises the bar;
+    // a revoked mod's stale vote no longer counts).
+    bool grant_is_unanimous(const Hash256& prop_hash) const;
+
+    // Execute a HIDE/RELEASE/GRANT_MODERATOR proposal directly into
+    // `batch` and flip its propstatus to EXECUTED. Returns false if the
+    // action itself is invalid (e.g. release amount exceeds escrow
+    // balance). `height` records the mod's active-since block on grant.
     bool execute_proposal(const ProposalTx& prop,
                           const Hash256& prop_hash,
+                          uint32_t height,
                           leveldb::WriteBatch& batch);
 
     bool load_tip();

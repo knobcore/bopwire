@@ -1,24 +1,13 @@
-// mc_rats_quic — the librats C API, reimplemented over msquic.
+// mc_rats_quic — the librats C API surface used across the codebase.
 //
-// Drop-in replacement for librats_c.h that we link instead of librats. Every
-// call site in our codebase (Dart FFI bindings, src/api/rats_api.cpp,
-// src/network/rats_link.cpp, tools/mini_node.cpp) continues to work.
-//
-// Wire-level changes:
-//   • Peer connections are QUIC instead of TCP.
-//   • Each rats_send_message opens a single bidirectional QUIC stream and
-//     writes [type-string \0 body-string \0]. The receiver closes the stream
-//     after delivering it to the callback.
-//   • rats_send_binary uses a stream with a single byte tag (0x42) followed
-//     by [u64 length] + body.
-//
-// What is intentionally simpler than librats:
-//   • No GossipSub mesh (mini-node still does pubsub manually).
-//   • No DHT discovery.
-//   • No BitTorrent layer.
-//   • No persistent peer cache.
-//   • STUN/ICE/TURN APIs delegate to librats's existing implementation for
-//     now; only the peer-to-peer message transport is replaced.
+// NOTE: despite the "quic" in the name, the msquic/QUIC transport was REMOVED
+// — this now maps straight onto the vendored librats (plain TCP). The name +
+// file are kept because every call site references this header/target: the
+// Dart FFI bindings, src/api/rats_api.cpp, src/network/rats_link.cpp,
+// tools/mini_node.cpp, and the admin modclient. It is ABI-compatible with
+// deps/librats/src/librats_c.h (a drop-in), so the two headers are used
+// interchangeably. Treat this as "the rats C API" — there is no QUIC here
+// anymore.
 
 #pragma once
 

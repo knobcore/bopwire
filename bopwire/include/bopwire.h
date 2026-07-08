@@ -218,6 +218,13 @@ BOPWIRE_API void mc_sha256(const uint8_t* data, size_t len, uint8_t* out_hash);
 /** Convert bytes to hex string. Caller must free with mc_free(). */
 BOPWIRE_API char* mc_bytes_to_hex(const uint8_t* data, size_t len);
 
+/** ECIES-encrypt `plaintext` to a single compressed secp256k1 recipient
+ *  pubkey (66-hex). Returns the ciphertext blob as a hex string (free with
+ *  mc_free()), or NULL on error. Used to seal DMCA/KYC forms to the shared
+ *  moderation key end-to-end. */
+BOPWIRE_API char* mc_ecies_encrypt(const uint8_t* plaintext, size_t len,
+                                   const char* recipient_pubkey_hex);
+
 /** Convert hex string to bytes.
  *  Allocates *out; caller must free with mc_free().
  *  Returns number of bytes, or -1 on error. */

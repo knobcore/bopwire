@@ -55,6 +55,28 @@ constexpr const char* MC_MOD_TYPE     = "bopwire.mod";
 constexpr const char* MC_LIBRARY_TYPE = "bopwire.library";  // DB2 delta gossip
 constexpr const char* MC_PLAYLIST_TYPE = "bopwire.playlist"; // DB2 playlist gossip
 
+namespace {
+// Load the Shared Moderation Key recipient — (address, pubkey) — from
+// <data_dir>/moderation.key (a dedicated ECIES keypair the founder wizard
+// generated; NOT a wallet). The node uses it as the SINGLE ECIES recipient
+// for DMCA/KYC submissions, so any moderator holding the SMK private key can
+// decrypt them. Returns nullopt if the key file is absent (pre-founder).
+std::optional<std::pair<Address, PubKey33>> load_smk_recipient(const std::string& data_dir) {
+    std::ifstream f(std::filesystem::path(data_dir) / "moderation.key");
+    if (!f) return std::nullopt;
+    try {
+        json j; f >> j;
+        auto pub = crypto::from_hex(j.value("pub",  std::string()));
+        auto adr = crypto::from_hex(j.value("addr", std::string()));
+        if (pub.size() != 33 || adr.size() != 20) return std::nullopt;
+        Address a{}; PubKey33 p{};
+        std::copy(adr.begin(), adr.end(), a.begin());
+        std::copy(pub.begin(), pub.end(), p.begin());
+        return std::make_pair(a, p);
+    } catch (...) { return std::nullopt; }
+}
+} // namespace
+
 // Server-side wall-clock ms (defined in the anonymous namespace lower down).
 // Forward-declared here so start()/on_peer_connected_cb — which precede that
 // definition — can stamp/compare presence + debounce timestamps with it.
@@ -994,6 +1016,65 @@ void RatsApi::handle_request(const std::string& peer_id,
                          {"error",  e.what()}};
             }
         }
+        // ---- moderator proposal submission ------------------------------
+        //
+        // A signer submits a locally-signed ProposalTx (GRANT_MODERATOR
+        // request, VOTE_YES vote, HIDE/RELEASE proposal). Same trust model
+        // as username.register / wallet.transfer: reconstruct + verify the
+        // signature + queue. The AUTHORITY check is done by consensus
+        // (Chain::apply_proposal): grant REQUESTS are permissionless, but
+        // VOTES and execution are moderator-gated and grants need a unanimous
+        // moderator vote — so a non-moderator submission simply fails to
+        // apply. This is what lets remote moderators act on a running node.
+        else if (type == "proposal.submit") {
+            try {
+                ProposalTx tx{};
+                tx.kind   = static_cast<uint8_t>(in.value("kind", 0));
+                tx.amount = in.value("amount", uint64_t{0});
+                tx.nonce  = in.value("nonce", uint64_t{0});
+                auto th  = crypto::from_hex(in.value("target_hash", ""));      // 32, optional (zero)
+                auto ta  = crypto::from_hex(in.value("target_addr", ""));      // 20, optional (zero)
+                auto pr  = crypto::from_hex(in.value("proposer", ""));         // 20
+                auto ppk = crypto::from_hex(in.value("proposer_pubkey", ""));  // 33
+                auto sig = crypto::from_hex(in.value("signature", ""));        // 64
+                auto spk = crypto::from_hex(in.value("subject_pubkey", ""));   // 33, GRANT_MODERATOR only
+                bool malformed = false;
+                if (th.size() == 32)      std::copy(th.begin(), th.end(), tx.target_hash.begin());
+                else if (!th.empty())     malformed = true;
+                if (ta.size() == 20)      std::copy(ta.begin(), ta.end(), tx.target_addr.begin());
+                else if (!ta.empty())     malformed = true;
+                if (pr.size() == 20)      std::copy(pr.begin(), pr.end(), tx.proposer.begin());
+                else                      malformed = true;
+                if (ppk.size() == 33)     std::copy(ppk.begin(), ppk.end(), tx.proposer_pubkey.begin());
+                else                      malformed = true;
+                if (sig.size() == 64)     std::copy(sig.begin(), sig.end(), tx.signature.begin());
+                else                      malformed = true;
+                if (spk.size() == 33)     std::copy(spk.begin(), spk.end(), tx.subject_pubkey.begin());
+                else if (!spk.empty())    malformed = true;
+                if (malformed) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "bad proposal field sizes"}};
+                } else if (!tx.verify_signature()) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "signature did not verify"}};
+                } else {
+                    const auto h = tx.tx_hash();
+                    if (!db_.put_pending_tx(h, tx.serialize())) {
+                        reply = {{"req_id", req_id}, {"status", "rejected"},
+                                 {"error", "could not queue proposal"}};
+                    } else {
+                        candidates_.wake();
+                        reply = {{"req_id", req_id}, {"status", "ok"},
+                                 {"body", {{"tx_hash", crypto::to_hex(h)}}}};
+                        std::cout << "[rats-api] proposal.submit: kind="
+                                  << static_cast<int>(tx.kind) << " queued\n";
+                    }
+                }
+            } catch (const std::exception& e) {
+                reply = {{"req_id", req_id}, {"status", "server_error"},
+                         {"error",  e.what()}};
+            }
+        }
         // ---- chat support reads -----------------------------------------
         //
         // Two pure-read verbs the mini-node leans on for its chat module.
@@ -1027,6 +1108,164 @@ void RatsApi::handle_request(const std::string& peer_id,
             }
             reply = {{"req_id", req_id}, {"status", "ok"},
                      {"body", {{"moderators", std::move(arr)}}}};
+        }
+        else if (type == "mod.list_proposals") {
+            // -> {proposals:[{hash,kind,target_addr,amount,proposer,votes,
+            //                 status[,subject_pubkey]}...]}. Pending proposals
+            // so a moderator client can see grant-moderator requests (and
+            // other proposals) to vote on. Pure read; no auth needed.
+            json arr = json::array();
+            for (const auto& ph : db_.list_pending_proposals()) {
+                auto raw = db_.get_proposal(ph);
+                if (!raw) continue;
+                ProposalTx p{};
+                if (!ProposalTx::deserialize(raw->data(), raw->size(), p)) continue;
+                json j = {
+                    {"hash",        crypto::to_hex(ph)},
+                    {"kind",        p.kind},
+                    {"target_addr", crypto::to_hex(p.target_addr.data(), p.target_addr.size())},
+                    {"amount",      p.amount},
+                    {"proposer",    crypto::to_hex(p.proposer.data(), p.proposer.size())},
+                    {"votes",       db_.count_proposal_votes(ph)},
+                    {"status",      db_.get_proposal_status(ph)},
+                };
+                if (static_cast<ProposalKind>(p.kind) == ProposalKind::GRANT_MODERATOR)
+                    j["subject_pubkey"] =
+                        crypto::to_hex(p.subject_pubkey.data(), p.subject_pubkey.size());
+                arr.push_back(std::move(j));
+            }
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body", {{"proposals", std::move(arr)}}}};
+        }
+        else if (type == "mod.moderation_key") {
+            // -> {pubkey: <66-hex SMK pubkey or "">}. The public half of the
+            // shared moderation key. DMCA/KYC submission forms fetch it and
+            // ECIES-encrypt their submission to it, so only moderators (who
+            // hold the SMK private key) can read takedown/KYC content.
+            std::string pk;
+            if (auto smk = load_smk_recipient(config_.data_dir))
+                pk = crypto::to_hex(smk->second.data(), smk->second.size());
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body", {{"pubkey", pk}}}};
+        }
+        else if (type == "mod.get_sealed_smk") {
+            // A newly-granted moderator fetches the shared moderation key,
+            // sealed (ECIES) to their wallet pubkey by the granting admin.
+            // -> {sealed: <hex or "">}. They unseal it with their wallet key.
+            // Safe to expose: the blob is readable only by the grantee's key.
+            const std::string addr_hex = in.value("address", std::string());
+            std::string sealed;
+            if (!addr_hex.empty()) {
+                auto raw = db_.get("sealed_smk:" + addr_hex);
+                if (raw) sealed = crypto::to_hex(raw->data(), raw->size());
+            }
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body", {{"sealed", sealed}}}};
+        }
+        else if (type == "mod.submit") {
+            // A moderator-signed moderation envelope (hide/unhide artist/album/
+            // title/hash). Routed through the same verify->apply->gossip path
+            // peers use; moderation::verify gates on the signer being a current
+            // moderator, so this is safe to accept over the open network.
+            mc::moderation::Envelope env;
+            if (!mc::moderation::from_json(in, env)) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "malformed moderation envelope"}};
+            } else if (!mc::moderation::verify(env, db_)) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "not a current moderator or bad signature"}};
+            } else {
+                handle_mod_envelope("self", in.dump(), /*broadcast_if_new=*/true);
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {{"action", env.action}}}};
+            }
+        }
+        else if (type == "net.probe_back") {
+            // A node running its first-launch reachability check asks us to
+            // connect back to its public address, proving it can accept
+            // inbound connections. We attempt a librats connect and report
+            // the result. (Definitive half of the peer-probe + STUN reach
+            // test; the founder's first node with no peers falls back to STUN.)
+            const std::string host = in.value("host", std::string());
+            const int         port = in.value("port", 0);
+            bool reachable = false;
+            if (!host.empty() && port > 0 && client_) {
+                reachable = (rats_connect(client_, host.c_str(), port) == RATS_SUCCESS);
+            }
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body", {{"reachable", reachable}}}};
+        }
+        else if (type == "mod.list_dmca" || type == "mod.list_kyc") {
+            // Return the ENCRYPTED submission blobs so a moderator client can
+            // decrypt them locally with the shared moderation key. Only
+            // SMK-encrypted files are returned (plaintext pre-SMK bootstrap
+            // files are withheld so this read never leaks cleartext).
+            const std::string sub = (type == "mod.list_kyc") ? "kyc" : "dmca";
+            json arr = json::array();
+            std::filesystem::path inbox =
+                std::filesystem::path(config_.data_dir) / sub;
+            std::error_code ec;
+            if (std::filesystem::exists(inbox, ec)) {
+                for (auto& e : std::filesystem::directory_iterator(inbox, ec)) {
+                    if (!e.is_regular_file()) continue;
+                    std::ifstream f(e.path(), std::ios::binary);
+                    std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)),
+                                            std::istreambuf_iterator<char>());
+                    if (!mc::crypto::ecies_looks_encrypted(b.data(), b.size())) continue;
+                    arr.push_back({{"name", e.path().filename().string()},
+                                   {"data", crypto::to_hex(b.data(), b.size())}});
+                }
+            }
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body", {{"items", std::move(arr)}}}};
+        }
+        else if (type == "modop.submit") {
+            // A signed ModeratorOpTx (e.g. TAG_LABEL_EDIT label define/assign).
+            // Reconstruct + verify + queue; consensus (apply_moderator_op)
+            // enforces authority (label edits are founder-only).
+            try {
+                ModeratorOpTx tx{};
+                tx.op_code   = static_cast<uint8_t>(in.value("op_code", 0));
+                tx.level     = static_cast<uint8_t>(in.value("level", 0));
+                tx.nonce     = in.value("nonce", uint64_t{0});
+                tx.meta_json = in.value("meta_json", std::string());
+                auto sub = crypto::from_hex(in.value("subject", ""));         // 20, optional
+                auto spk = crypto::from_hex(in.value("subject_pubkey", ""));  // 33, optional
+                auto pr  = crypto::from_hex(in.value("proposer", ""));        // 20
+                auto ppk = crypto::from_hex(in.value("proposer_pubkey", "")); // 33
+                auto sig = crypto::from_hex(in.value("signature", ""));       // 64
+                bool bad = false;
+                if (sub.size() == 20) std::copy(sub.begin(), sub.end(), tx.subject.begin());
+                else if (!sub.empty()) bad = true;
+                if (spk.size() == 33) std::copy(spk.begin(), spk.end(), tx.subject_pubkey.begin());
+                else if (!spk.empty()) bad = true;
+                if (pr.size()  == 20) std::copy(pr.begin(),  pr.end(),  tx.proposer.begin());
+                else bad = true;
+                if (ppk.size() == 33) std::copy(ppk.begin(), ppk.end(), tx.proposer_pubkey.begin());
+                else bad = true;
+                if (sig.size() == 64) std::copy(sig.begin(), sig.end(), tx.signature.begin());
+                else bad = true;
+                if (bad) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "bad moderator-op field sizes"}};
+                } else if (!tx.verify_signature()) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "signature did not verify"}};
+                } else {
+                    const auto h = tx.tx_hash();
+                    if (!db_.put_pending_tx(h, tx.serialize())) {
+                        reply = {{"req_id", req_id}, {"status", "rejected"},
+                                 {"error", "could not queue moderator op"}};
+                    } else {
+                        candidates_.wake();
+                        reply = {{"req_id", req_id}, {"status", "ok"},
+                                 {"body", {{"tx_hash", crypto::to_hex(h)}}}};
+                    }
+                }
+            } catch (const std::exception& e) {
+                reply = {{"req_id", req_id}, {"status", "server_error"},
+                         {"error", e.what()}};
+            }
         }
         // ---- session control --------------------------------------------
         else if (type == "session.start") {
@@ -1936,32 +2175,23 @@ void RatsApi::handle_request(const std::string& peer_id,
                 std::filesystem::create_directories(inbox, ec);
                 const auto path = inbox / (prefix + safe);
 
-                // Phase 4: encrypt the inbox file to every currently
-                // active moderator on chain. Any moderator can later
-                // decrypt with their own private key; the node
-                // operator cannot read the contents without being a
-                // moderator. If no moderator pubkeys are known (no
-                // founder yet, or DB corruption) we fall back to
-                // storing the plaintext so the operator can still see
-                // submissions during bootstrap — early-chain operators
-                // are expected to be the founder anyway.
-                std::vector<std::pair<Address, PubKey33>> recipients;
-                for (const auto& a : db_.list_active_moderators()) {
-                    auto pk = db_.get_mod_pubkey(a);
-                    if (pk.has_value()) recipients.emplace_back(a, *pk);
-                }
-
+                // Encrypt the inbox file to the Shared Moderation Key (SMK) —
+                // one dedicated recipient every moderator can decrypt with the
+                // SMK private key. If the submitter already ECIES-encrypted it
+                // (end-to-end from the form), store that ciphertext as-is.
+                // Pre-SMK (bootstrap, no moderation.key yet) => plaintext, so
+                // the founder can still read submissions during setup.
                 std::vector<uint8_t> blob_to_write = bytes;
                 std::string suffix_marker;
-                if (!recipients.empty()) {
-                    auto encrypted = mc::crypto::ecies_encrypt(bytes, recipients);
+                if (mc::crypto::ecies_looks_encrypted(bytes.data(), bytes.size())) {
+                    suffix_marker = ".enc";
+                } else if (auto smk = load_smk_recipient(config_.data_dir)) {
+                    auto encrypted = mc::crypto::ecies_encrypt(bytes, {*smk});
                     if (!encrypted.empty()) {
                         blob_to_write = std::move(encrypted);
                         suffix_marker = ".enc";
                     } else {
-                        std::cerr << "[rats-api] ecies_encrypt failed for "
-                                  << recipients.size()
-                                  << " recipients; storing plaintext\n";
+                        std::cerr << "[rats-api] SMK ecies_encrypt failed; storing plaintext\n";
                     }
                 }
 
@@ -1981,7 +2211,8 @@ void RatsApi::handle_request(const std::string& peer_id,
                     std::cout << "[rats-api] " << type << ": stored "
                               << blob_to_write.size() << " bytes as "
                               << final_path.filename().string()
-                              << " (recipients=" << recipients.size() << ")\n";
+                              << (suffix_marker.empty() ? " (plaintext)" : " (SMK-encrypted)")
+                              << "\n";
                     reply = {{"req_id", req_id}, {"status", "ok"},
                              {"body", {
                                  {"stored_as", path.filename().string()},
@@ -2001,9 +2232,48 @@ void RatsApi::handle_request(const std::string& peer_id,
         // fallback pre-founder) — so the TUI's DMCA review screen lists both
         // kinds and can hide the named content hashes on approval.
         else if (type == "dmca.submit") {
+            const std::string enc_hex = in.value("encrypted", std::string());
             const std::string email   = in.value("email", std::string());
             const json        targets = in.value("targets", json::array());
-            if (email.empty() || !targets.is_array() || targets.empty()) {
+            if (!enc_hex.empty()) {
+                // END-TO-END: the submitter (player / gateway) already
+                // ECIES-encrypted the takedown to the shared moderation key.
+                // Store the ciphertext verbatim — the node never sees plaintext.
+                auto blob = crypto::from_hex(enc_hex);
+                if (blob.empty() ||
+                    !mc::crypto::ecies_looks_encrypted(blob.data(), blob.size())) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "encrypted blob is not valid ECIES ciphertext"}};
+                } else {
+                    std::error_code ec;
+                    std::filesystem::path inbox =
+                        std::filesystem::path(config_.data_dir) / "dmca";
+                    std::filesystem::create_directories(inbox, ec);
+                    const auto tnow = std::chrono::system_clock::now();
+                    const auto tt   = std::chrono::system_clock::to_time_t(tnow);
+                    std::tm etm{};
+#ifdef _WIN32
+                    gmtime_s(&etm, &tt);
+#else
+                    gmtime_r(&tt, &etm);
+#endif
+                    char ets[32];
+                    std::snprintf(ets, sizeof(ets), "%04d%02d%02d_%02d%02d%02d_",
+                                  etm.tm_year + 1900, etm.tm_mon + 1, etm.tm_mday,
+                                  etm.tm_hour, etm.tm_min, etm.tm_sec);
+                    auto final_path = inbox / (std::string(ets) + "takedown.json.enc");
+                    std::ofstream f(final_path, std::ios::binary | std::ios::trunc);
+                    if (f) {
+                        f.write(reinterpret_cast<const char*>(blob.data()),
+                                static_cast<std::streamsize>(blob.size()));
+                        f.close();
+                    }
+                    std::cout << "[rats-api] dmca.submit: stored E2E-encrypted takedown as "
+                              << final_path.filename().string() << "\n";
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {{"stored_as", final_path.filename().string()}}}};
+                }
+            } else if (email.empty() || !targets.is_array() || targets.empty()) {
                 reply = {{"req_id", req_id}, {"status", "invalid"},
                          {"error", "email and a non-empty targets array are required"}};
             } else {
@@ -2033,15 +2303,15 @@ void RatsApi::handle_request(const std::string& peer_id,
                 const std::string body_str = submission.dump(2);
                 std::vector<uint8_t> bytes(body_str.begin(), body_str.end());
 
-                std::vector<std::pair<Address, PubKey33>> recipients;
-                for (const auto& a : db_.list_active_moderators()) {
-                    auto pk = db_.get_mod_pubkey(a);
-                    if (pk.has_value()) recipients.emplace_back(a, *pk);
-                }
+                // Encrypt to the Shared Moderation Key (single recipient every
+                // moderator can decrypt); accept an already-E2E-encrypted blob
+                // as-is; plaintext pre-SMK during bootstrap.
                 std::vector<uint8_t> blob_to_write = bytes;
                 std::string suffix_marker;
-                if (!recipients.empty()) {
-                    auto encrypted = mc::crypto::ecies_encrypt(bytes, recipients);
+                if (mc::crypto::ecies_looks_encrypted(bytes.data(), bytes.size())) {
+                    suffix_marker = ".enc";
+                } else if (auto smk = load_smk_recipient(config_.data_dir)) {
+                    auto encrypted = mc::crypto::ecies_encrypt(bytes, {*smk});
                     if (!encrypted.empty()) {
                         blob_to_write = std::move(encrypted);
                         suffix_marker = ".enc";
@@ -2067,7 +2337,8 @@ void RatsApi::handle_request(const std::string& peer_id,
                     std::cout << "[rats-api] dmca.submit: stored takedown form ("
                               << targets.size() << " target(s)) as "
                               << final_path.filename().string()
-                              << " (recipients=" << recipients.size() << ")\n";
+                              << (suffix_marker.empty() ? " (plaintext)" : " (SMK-encrypted)")
+                              << "\n";
                     reply = {{"req_id", req_id}, {"status", "ok"},
                              {"body", {{"stored_as", fname},
                                        {"reportId",  fname},

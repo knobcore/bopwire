@@ -9,6 +9,7 @@
 #include "../crypto/keys.h"
 #include <chrono>
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -319,6 +320,17 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                         why = "MODERATOR_OP: deserialize failed";
                     } else if (!tx.verify_signature()) {
                         why = "MODERATOR_OP: verify_signature failed";
+                    } else if (static_cast<ModOpCode>(tx.op_code) == ModOpCode::GRANT
+                               && static_cast<ModLevel>(tx.level) == ModLevel::FOUNDER
+                               && std::memcmp(tx.proposer.data(), tx.subject.data(), 20) == 0
+                               && founder_is_pinned()
+                               && std::memcmp(tx.subject.data(),
+                                              PINNED_FOUNDER_ADDRESS.data(), 20) != 0) {
+                        // Defense-in-depth: never even stage a founder-bootstrap
+                        // self-grant for a non-pinned address. The authoritative
+                        // reject is in Chain::apply_moderator_op; this just keeps
+                        // a bogus claim out of the local mempool / a mined block.
+                        why = "MODERATOR_OP: bootstrap subject is not the pinned founder";
                     } else {
                         slot.sender = tx.proposer;
                         slot.nonce  = tx.nonce;

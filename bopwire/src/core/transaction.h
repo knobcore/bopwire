@@ -193,9 +193,10 @@ struct ModeratorOpTx {
 // fields so the tx hash is canonical.
 
 enum class ProposalKind : uint8_t {
-    HIDE_CONTENT   = 1,   // hide a song by content_hash
-    RELEASE_ESCROW = 2,   // release escrow from artist's escrow_address
-    VOTE_YES       = 3,   // cast a YES vote on an existing proposal
+    HIDE_CONTENT    = 1,   // hide a song by content_hash
+    RELEASE_ESCROW  = 2,   // release escrow from artist's escrow_address
+    VOTE_YES        = 3,   // cast a YES vote on an existing proposal
+    GRANT_MODERATOR = 4,   // request a moderator grant; needs UNANIMOUS mod votes
 };
 
 struct ProposalTx {
@@ -203,12 +204,22 @@ struct ProposalTx {
 
     // Per-kind payload (union, on the wire it's always all three).
     Hash256   target_hash{};            // HIDE: content_hash; VOTE_YES: prop_hash
-    Address   target_addr{};            // RELEASE: artist address (else zero)
-    uint64_t  amount          = 0;      // RELEASE: amount in internal units (else 0)
+    Address   target_addr{};            // RELEASE: artist address; GRANT_MODERATOR: subject wallet
+    uint64_t  amount          = 0;      // RELEASE: amount; GRANT_MODERATOR: target ModLevel (VOICE/OP)
 
     Address   proposer{};               // voter / proposer (mlvl must be >= OP)
     PubKey33  proposer_pubkey{};
     uint64_t  nonce           = 0;      // per-proposer replay protection
+
+    // Only present on the wire (and in the signed message) for
+    // GRANT_MODERATOR — the subject's compressed pubkey, so the chain can
+    // record set_mod_pubkey without a separate registry. Appended after
+    // nonce and length-discriminated by `kind`, so HIDE/RELEASE/VOTE_YES
+    // bytes and hashes are byte-identical to before this field existed.
+    // verify_signature() binds it: address_from_pubkey(subject_pubkey)
+    // must equal target_addr.
+    PubKey33  subject_pubkey{};
+
     Sig64     signature{};              // ECDSA(sign_message())
 
     std::vector<uint8_t> serialize() const;

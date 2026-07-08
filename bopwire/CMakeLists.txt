@@ -337,6 +337,7 @@ set(MC_SOURCES
   src/tokens/mint.cpp
   src/network/manager.cpp       # thin shim now — no TCP mesh
   src/network/rats_link.cpp
+  src/network/upnp.cpp          # UpnpMapper (miniupnpc) for first-launch port opening
   src/storage/database.cpp
   src/store/swarm.cpp
   src/store/library_store.cpp
@@ -431,8 +432,13 @@ add_library(bopwire_static STATIC ${MC_SOURCES})
 target_include_directories(bopwire_static PUBLIC ${MC_INCLUDE_DIRS})
 target_link_libraries(bopwire_static PUBLIC ${MC_LINK_LIBS})
 
-# Node executable
-add_executable(bopwire-node tools/node_main.cpp tools/node_tui.cpp)
+# Node executable (public). Read-only monitor TUI only — the moderation /
+# bootstrap TUI lives in the optional private bopwire-admin target below.
+add_executable(bopwire-node
+    tools/node_main.cpp
+    tools/node_tui_adapter.cpp
+    tools/monitor_tui.cpp
+    tools/net_check.cpp)
 target_include_directories(bopwire-node PRIVATE ${MC_INCLUDE_DIRS})
 target_link_libraries(bopwire-node PRIVATE bopwire_static)
 
@@ -462,6 +468,44 @@ else()
     target_link_libraries(bopwire-node PRIVATE ${CURSES_LIBRARIES})
 endif()
 
+# --------------------------------------------------------------------
+# bopwire-admin (PRIVATE, optional). The founder/moderator program: a full
+# node PLUS the bootstrap + moderation TUI + first-boot wallet wizard. Its
+# source lives in tools/admin/ which is .gitignored — copied to the
+# operator's host, never committed. It shares tools/node_main.cpp with the
+# public node but links its OWN run_tui() (the full admin TUI) instead of
+# the read-only monitor adapter. Built only when the private source is
+# present, so a public checkout still builds bopwire-node + mini cleanly.
+# --------------------------------------------------------------------
+if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/admin_tui.cpp")
+  message(STATUS "bopwire-admin: private admin source found — ENABLED")
+  add_executable(bopwire-admin
+      tools/node_main.cpp
+      tools/admin/admin_tui.cpp
+      tools/net_check.cpp)
+  target_include_directories(bopwire-admin PRIVATE ${MC_INCLUDE_DIRS})
+  target_link_libraries(bopwire-admin PRIVATE bopwire_static)
+  target_compile_definitions(bopwire-admin PRIVATE BOPWIRE_ADMIN=1)
+  if(MC_WITH_ART)
+    add_dependencies(bopwire-admin sacad_ffi_build)
+    target_sources(bopwire-admin PRIVATE src/art/art_scraper.cpp)
+    target_compile_definitions(bopwire-admin PRIVATE MC_WITH_ART=1)
+    target_link_libraries(bopwire-admin PRIVATE ${SACAD_FFI_LIB} pthread dl m rt)
+  endif()
+  if (WIN32)
+    find_package(unofficial-pdcurses CONFIG REQUIRED)
+    target_link_libraries(bopwire-admin PRIVATE unofficial::pdcurses::pdcurses)
+    target_compile_definitions(bopwire-admin PRIVATE MC_TUI_PDCURSES=1)
+  else()
+    set(CURSES_NEED_NCURSES TRUE)
+    find_package(Curses REQUIRED)
+    target_include_directories(bopwire-admin PRIVATE ${CURSES_INCLUDE_DIRS})
+    target_link_libraries(bopwire-admin PRIVATE ${CURSES_LIBRARIES})
+  endif()
+else()
+  message(STATUS "bopwire-admin: private source absent — public node only")
+endif()
+
 endif() # NOT MC_MINI_NODE_ONLY
 
 # Mini-node — VPS rendezvous binary, vanilla librats TCP transport.
@@ -473,7 +517,7 @@ endif() # NOT MC_MINI_NODE_ONLY
 # RELAY_REWARD tx type.
 add_executable(bopwire-mini-node
   tools/mini_node.cpp
-  tools/mini_node_tui.cpp
+  tools/monitor_tui.cpp
   src/net/load_monitor.cpp
   src/crypto/hash.cpp
   src/crypto/keys.cpp
@@ -533,6 +577,51 @@ endif()
 if(NOT MSVC AND NOT APPLE AND NOT ANDROID)
   target_link_options(library_smoke_cli PRIVATE
     -static-libstdc++ -static-libgcc)
+endif()
+
+# --------------------------------------------------------------------
+# bopwire-modclient (PRIVATE, optional) — standalone remote moderator client.
+# A lightweight librats client (like library_smoke_cli) plus the focused
+# crypto/ProposalTx subset (like the mini-node) so it can sign moderator
+# actions. No chain/db. Drives the node's moderator RPC (proposal.submit /
+# mod.list_proposals). Source lives in the gitignored tools/admin/ dir; the
+# BINARY is handed to moderators. Built only when that private source exists.
+# --------------------------------------------------------------------
+if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/modclient_main.cpp")
+  message(STATUS "bopwire-modclient: private source found — ENABLED")
+  add_executable(bopwire-modclient
+    tools/admin/modclient_main.cpp
+    src/crypto/hash.cpp
+    src/crypto/keys.cpp
+    src/crypto/keystore.cpp
+    src/crypto/keccak256.cpp
+    src/crypto/signature.cpp
+    src/crypto/ecies.cpp
+    src/crypto/wally_bip39.cpp
+    src/core/block.cpp
+    src/core/transaction.cpp)
+  target_link_libraries(bopwire-modclient PRIVATE
+    mc_rats_quic
+    wallycore
+    secp256k1
+    ${MC_OPENSSL_SSL}
+    ${MC_OPENSSL_CRYPTO})
+  target_include_directories(bopwire-modclient PRIVATE
+    ${MC_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/deps/libwally-core/include
+    ${CMAKE_SOURCE_DIR}/deps/libwally-core/src/secp256k1/include)
+  if(WIN32)
+    target_link_libraries(bopwire-modclient PRIVATE ws2_32 iphlpapi bcrypt)
+  endif()
+  if(NOT MSVC)
+    target_link_libraries(bopwire-modclient PRIVATE Threads::Threads)
+  endif()
+  if(NOT MSVC AND NOT APPLE AND NOT ANDROID)
+    target_link_options(bopwire-modclient PRIVATE -static-libstdc++ -static-libgcc)
+  endif()
+else()
+  message(STATUS "bopwire-modclient: private source absent — skipped")
 endif()
 
 # (h3_smoke removed — HTTP/3 surface gone)

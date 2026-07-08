@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:path_provider/path_provider.dart';
 
+import '../ffi/ecies_bindings.dart';
 import '../models/collection.dart';
 import '../models/song.dart';
 import '../models/session.dart';
@@ -212,19 +213,43 @@ class NodeClient {
     required String email,
     required List<Map<String, dynamic>> targets,
   }) async {
-    final r = await _rpc(
-      'dmca.submit',
-      {
-        'representing': representing,
-        'phone':        phone,
-        'email':        email,
-        'source':       'player',
-        'targets':      targets,
-      },
-      timeout: const Duration(seconds: 20),
-    );
+    final plain = {
+      'representing': representing,
+      'phone':        phone,
+      'email':        email,
+      'source':       'player',
+      'targets':      targets,
+    };
+    // If the network publishes a shared moderation key, ECIES-encrypt the whole
+    // takedown to it END-TO-END so the node never sees the plaintext; else fall
+    // back to sending it structured (the node encrypts server-side).
+    Map<String, dynamic> body = plain;
+    final smkPub = await moderationKey();
+    if (smkPub != null) {
+      final sealed = {
+        'kind':         'takedown_form',
+        'submitted_ms': DateTime.now().millisecondsSinceEpoch,
+        ...plain,
+      };
+      final enc = EciesBindings.encryptToHex(jsonEncode(sealed), smkPub);
+      if (enc != null) body = {'encrypted': enc};
+    }
+    final r = await _rpc('dmca.submit', body, timeout: const Duration(seconds: 20));
     final m = Map<String, dynamic>.from(r as Map);
     return (m['stored_as'] as String?) ?? 'submitted';
+  }
+
+  /// Fetch the shared moderation key's public half (66-hex), or null if the
+  /// network hasn't published one yet. DMCA/KYC forms encrypt to it.
+  Future<String?> moderationKey() async {
+    try {
+      final r = await _rpc('mod.moderation_key', {});
+      if (r is Map) {
+        final pk = r['pubkey'];
+        if (pk is String && pk.isNotEmpty) return pk;
+      }
+    } catch (_) {}
+    return null;
   }
 
   /// Push a KYC form / ID scan to the full node so the moderator can

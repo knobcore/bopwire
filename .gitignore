@@ -152,3 +152,14 @@ bopwire/scripts/deploy-vps.sh
 bopwire/deps/librats/src/config.json
 bopwire/deps/librats/src/dht_routing_*.json
 bopwire/deps/librats/src/peers*.rats
+
+# --------------------------------------------------------------------
+# Private founder/moderator program (bopwire-admin). The moderation +
+# bootstrap TUI is copied to the operator's host but never committed —
+# it holds the moderation tooling we keep out of the public repo. The
+# public node builds fine without it (CMake makes the target optional).
+# Founder wallet seed is likewise operator-only and never committed.
+# --------------------------------------------------------------------
+/bopwire/tools/admin/
+founder.seed
+moderation.key

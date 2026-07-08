@@ -358,10 +358,19 @@ bool Chain::apply_moderator_op(const ModeratorOpTx& tx,
             // permitted self-grant on the entire chain — every other
             // grant must come from an existing FOUNDER (Phase 2) or a
             // majority of OPs (Phase 3, future work).
+            // The subject must also match the pinned founder address when
+            // one is baked in (chain.h). This is what makes the founder
+            // un-re-bootstrappable: even in the empty-chain window after a
+            // wipe, only the holder of the pinned wallet can claim it.
+            // Unpinned (all-zero) => dev/test fallback: first self-grant wins.
             const bool bootstrap = !founder.has_value()
                                  && lv == ModLevel::FOUNDER
                                  && std::memcmp(tx.proposer.data(),
-                                                tx.subject.data(), 20) == 0;
+                                                tx.subject.data(), 20) == 0
+                                 && (!founder_is_pinned()
+                                     || std::memcmp(tx.subject.data(),
+                                                    PINNED_FOUNDER_ADDRESS.data(),
+                                                    20) == 0);
             if (bootstrap) {
                 db_.set_mod_level(batch, tx.subject,
                                   static_cast<uint8_t>(ModLevel::FOUNDER));
@@ -372,19 +381,16 @@ bool Chain::apply_moderator_op(const ModeratorOpTx& tx,
                 record_applied_nonce(tx.proposer, expected + 1);
                 return true;
             }
-            // Non-bootstrap GRANT: founder must already exist, proposer
-            // must be the founder, and the new level can't escalate to
-            // FOUNDER (there is exactly one founder per chain).
-            if (!founder.has_value()) return false;
-            if (proposer_level != static_cast<uint8_t>(ModLevel::FOUNDER)) return false;
-            if (lv == ModLevel::NONE || lv == ModLevel::FOUNDER) return false;
-            // Granting to an existing founder is a no-op-with-bad-intent.
-            if (std::memcmp(tx.subject.data(), founder->data(), 20) == 0) return false;
-            db_.set_mod_level(batch, tx.subject, static_cast<uint8_t>(lv));
-            db_.set_mod_pubkey(batch, tx.subject, tx.subject_pubkey);
-            db_.set_mod_active_block(batch, tx.subject, height);
-            db_.set_nonce(batch, tx.proposer, expected + 1);
-            return true;
+            // Non-bootstrap GRANT via MODERATOR_OP is DISABLED. Every real
+            // moderator grant now goes through a GRANT_MODERATOR proposal
+            // that requires a unanimous vote of all current moderators
+            // (see apply_proposal). This removes the founder's ability to
+            // unilaterally appoint moderators — the whole point of the
+            // unanimous-vote model. (When the founder is the sole mod,
+            // unanimous == the founder alone, so bootstrapping the first
+            // additional moderator still works.) REVOKE / TAG_LABEL_EDIT
+            // are unchanged.
+            return false;
         }
         case ModOpCode::REVOKE: {
             // Founder is the only one with revoke power in Phase 2. The
@@ -691,8 +697,28 @@ size_t Chain::effective_vote_count(const Hash256& prop_hash) const {
     return n;
 }
 
+bool Chain::grant_is_unanimous(const Hash256& prop_hash) const {
+    // Voting-eligible moderators are OP and FOUNDER (VOICE is observer-only
+    // and cannot cast a VOTE_YES — see apply_proposal's proposer_level gate).
+    // Requiring a VOICE mod's vote would deadlock, so we count only OP+.
+    auto it = proposal_votes_in_block_.find(prop_hash);
+    size_t eligible = 0;
+    for (const Address& m : db_.list_active_moderators()) {
+        if (db_.get_mod_level(m) < static_cast<uint8_t>(ModLevel::OP)) continue;
+        ++eligible;
+        const bool voted =
+            db_.has_proposal_vote(prop_hash, m) ||
+            (it != proposal_votes_in_block_.end() && it->second.count(m));
+        if (!voted) return false;
+    }
+    // Guard: with zero eligible moderators, "all voted" is vacuously true —
+    // that would let a permissionless request self-execute with no approval.
+    return eligible > 0;
+}
+
 bool Chain::execute_proposal(const ProposalTx& prop,
                              const Hash256& prop_hash,
+                             uint32_t height,
                              leveldb::WriteBatch& batch) {
     const ProposalKind kind = static_cast<ProposalKind>(prop.kind);
     switch (kind) {
@@ -754,6 +780,25 @@ bool Chain::execute_proposal(const ProposalTx& prop,
             db_.set_proposal_status(batch, prop_hash, Database::PROP_EXECUTED);
             return true;
         }
+        case ProposalKind::GRANT_MODERATOR: {
+            // Applied only after grant_is_unanimous() passed. Promote the
+            // subject to the requested level (VOICE/OP). Never touch the
+            // founder seat (that's set once, at bootstrap).
+            const ModLevel lv = static_cast<ModLevel>(prop.amount);
+            if (lv != ModLevel::VOICE && lv != ModLevel::OP) return false;
+            auto founder = db_.get_founder();
+            if (founder && std::memcmp(prop.target_addr.data(),
+                                       founder->data(), 20) == 0) {
+                // Idempotent close: never re-level the founder.
+                db_.set_proposal_status(batch, prop_hash, Database::PROP_EXECUTED);
+                return true;
+            }
+            db_.set_mod_level(batch, prop.target_addr, static_cast<uint8_t>(lv));
+            db_.set_mod_pubkey(batch, prop.target_addr, prop.subject_pubkey);
+            db_.set_mod_active_block(batch, prop.target_addr, height);
+            db_.set_proposal_status(batch, prop_hash, Database::PROP_EXECUTED);
+            return true;
+        }
         case ProposalKind::VOTE_YES: {
             // VOTE_YES isn't itself executable — we never call execute
             // on a vote tx. If we somehow got here, treat it as a no-op.
@@ -764,7 +809,7 @@ bool Chain::execute_proposal(const ProposalTx& prop,
 }
 
 bool Chain::apply_proposal(const ProposalTx& tx,
-                           uint32_t /*height*/,
+                           uint32_t height,
                            leveldb::WriteBatch& batch) {
     if (!tx.verify_signature()) return false;
 
@@ -773,18 +818,24 @@ bool Chain::apply_proposal(const ProposalTx& tx,
     uint64_t expected = next_expected_nonce(tx.proposer);
     if (tx.nonce != expected) return false;
 
-    // Only OP and FOUNDER may propose or vote. VOICE is observer-only
-    // for now.
-    uint8_t proposer_level = db_.get_mod_level(tx.proposer);
-    if (proposer_level < static_cast<uint8_t>(ModLevel::OP)) return false;
+    const ProposalKind kind = static_cast<ProposalKind>(tx.kind);
 
-    // Compute current quorum threshold: strict majority of currently
-    // active moderators. Single-mod chains (e.g. just the founder)
-    // execute on the proposer's own implicit YES.
+    // Only OP and FOUNDER may propose or vote — EXCEPT a GRANT_MODERATOR
+    // request, which is permissionless: anyone can request a grant for any
+    // wallet, but it still takes a unanimous moderator vote to take effect.
+    // (VOTE_YES on a grant remains moderator-only, and only OP+ votes count
+    // toward unanimity.)
+    uint8_t proposer_level = db_.get_mod_level(tx.proposer);
+    if (kind != ProposalKind::GRANT_MODERATOR
+        && proposer_level < static_cast<uint8_t>(ModLevel::OP)) return false;
+
+    // Majority threshold for HIDE / RELEASE / VOTE_YES: strict majority of
+    // currently active moderators. Single-mod chains (e.g. just the founder)
+    // execute on the proposer's own implicit YES. GRANT_MODERATOR ignores
+    // this and uses grant_is_unanimous() instead.
     const size_t active_n = db_.list_active_moderators().size();
     const size_t needed   = (active_n / 2) + 1;
 
-    const ProposalKind kind = static_cast<ProposalKind>(tx.kind);
     switch (kind) {
         case ProposalKind::HIDE_CONTENT: {
             // Unused fields must be zeroed so the tx hash is canonical.
@@ -802,7 +853,7 @@ bool Chain::apply_proposal(const ProposalTx& tx,
             proposal_votes_in_block_[prop_hash].insert(tx.proposer);
 
             if (effective_vote_count(prop_hash) >= needed) {
-                if (!execute_proposal(tx, prop_hash, batch)) return false;
+                if (!execute_proposal(tx, prop_hash, height, batch)) return false;
             }
             db_.set_nonce(batch, tx.proposer, expected + 1);
             record_applied_nonce(tx.proposer, expected + 1);
@@ -821,7 +872,7 @@ bool Chain::apply_proposal(const ProposalTx& tx,
             proposal_votes_in_block_[prop_hash].insert(tx.proposer);
 
             if (effective_vote_count(prop_hash) >= needed) {
-                if (!execute_proposal(tx, prop_hash, batch)) return false;
+                if (!execute_proposal(tx, prop_hash, height, batch)) return false;
             }
             db_.set_nonce(batch, tx.proposer, expected + 1);
             record_applied_nonce(tx.proposer, expected + 1);
@@ -847,10 +898,52 @@ bool Chain::apply_proposal(const ProposalTx& tx,
             db_.add_proposal_vote(batch, prop_hash, tx.proposer);
             in_block.insert(tx.proposer);
 
-            if (effective_vote_count(prop_hash) >= needed) {
-                ProposalTx prop;
-                if (!ProposalTx::deserialize(raw->data(), raw->size(), prop)) return false;
-                if (!execute_proposal(prop, prop_hash, batch)) return false;
+            // The approval rule depends on the *referenced* proposal's kind:
+            // GRANT_MODERATOR requires a unanimous moderator vote; everything
+            // else is a simple majority.
+            ProposalTx prop;
+            if (!ProposalTx::deserialize(raw->data(), raw->size(), prop)) return false;
+            const bool approved =
+                (static_cast<ProposalKind>(prop.kind) == ProposalKind::GRANT_MODERATOR)
+                    ? grant_is_unanimous(prop_hash)
+                    : (effective_vote_count(prop_hash) >= needed);
+            if (approved) {
+                if (!execute_proposal(prop, prop_hash, height, batch)) return false;
+            }
+            db_.set_nonce(batch, tx.proposer, expected + 1);
+            record_applied_nonce(tx.proposer, expected + 1);
+            return true;
+        }
+        case ProposalKind::GRANT_MODERATOR: {
+            // Permissionless request (proposer_level gate skipped above).
+            // Field discipline: target_addr = subject wallet, amount = target
+            // level (VOICE/OP), target_hash unused. subject_pubkey↔target_addr
+            // is bound in verify_signature().
+            if (!hash_is_zero(tx.target_hash))    return false;
+            if (address_is_zero(tx.target_addr))  return false;
+            const ModLevel lv = static_cast<ModLevel>(tx.amount);
+            if (lv != ModLevel::VOICE && lv != ModLevel::OP) return false;
+            // No grants until a founder exists — otherwise there'd be nobody
+            // to approve them and grant_is_unanimous would (correctly) never
+            // fire, but reject early for clarity.
+            if (!db_.get_founder().has_value())   return false;
+            // Nothing to do if the subject is already at/above that level
+            // (also rejects targeting the founder, who is FOUNDER > OP).
+            if (db_.get_mod_level(tx.target_addr) >= static_cast<uint8_t>(lv))
+                return false;
+
+            Hash256 prop_hash = tx.tx_hash();
+            if (db_.has_proposal(prop_hash))      return false;
+
+            db_.put_proposal(batch, prop_hash, tx.serialize());
+            // Record the proposer's implicit YES. It only counts toward
+            // unanimity if the proposer is itself an OP+ moderator; a
+            // non-moderator requester's vote is ignored by grant_is_unanimous.
+            db_.add_proposal_vote(batch, prop_hash, tx.proposer);
+            proposal_votes_in_block_[prop_hash].insert(tx.proposer);
+
+            if (grant_is_unanimous(prop_hash)) {
+                if (!execute_proposal(tx, prop_hash, height, batch)) return false;
             }
             db_.set_nonce(batch, tx.proposer, expected + 1);
             record_applied_nonce(tx.proposer, expected + 1);

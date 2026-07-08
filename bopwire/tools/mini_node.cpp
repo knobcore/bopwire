@@ -20,7 +20,7 @@
 #include "../src/crypto/signature.h"  // sign_data for relay.report (#10), verify_data for chat
 #include "../src/crypto/bip39.h"   // bip39_generate_12 / bip39_mnemonic_to_keypair
 #include "../src/crypto/keystore.h" // wallet keystore (export/import, headless load)
-#include "mini_node_tui.h"
+#include "monitor_tui.h"
 #include <array>                    // DeliveryAccum delivery_id (#10)
 #include <fstream>
 #include <memory>
@@ -3478,16 +3478,22 @@ int main(int argc, char** argv) {
     if (tui_enabled) {
         // Interactive curses TUI (wallet export/import + live status). Runs on
         // this thread until Q / signal; never touches the librats io thread.
-        mc::mini::MiniTuiState st;
-        st.peer_count     = [client]() { return rats_get_peer_count(client); };
-        st.route_count    = []() {
-            std::lock_guard<std::mutex> lk(g_routes_mu);
-            return g_routes.size();
-        };
+        mc::ui::MonitorState st;
+        st.title          = "bopwire mini-node";
+        st.seed_path      = mini_seed_path;   // X/P export/import the mini's own seed
         st.wallet_address = []() { return g_wallet_address_hex; };
-        st.seed_path      = mini_seed_path;
-        st.rats_port      = rats_port;
-        mc::mini::run_mini_tui(st, g_running);
+        st.peers          = [client]() { return std::to_string(rats_get_peer_count(client)); };
+        st.routes         = []() {
+            std::lock_guard<std::mutex> lk(g_routes_mu);
+            return std::to_string(g_routes.size());
+        };
+        st.players        = []() {
+            std::lock_guard<std::mutex> lk(g_players_mu);
+            return std::to_string(g_players.size());
+        };
+        st.rats_port      = [rats_port]() { return std::to_string(rats_port); };
+        mc::ui::monitor_start_log_capture();
+        mc::ui::run_monitor_tui(st, g_running);
     } else {
         // Display-only: redraw the ANSI monitor every second (non-quiet), or emit
         // a one-line status every minute in --quiet mode (clean for journald).

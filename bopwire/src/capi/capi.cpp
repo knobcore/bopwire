@@ -6,6 +6,7 @@
 #include "../crypto/hash.h"
 #include "../crypto/keys.h"
 #include "../crypto/keystore.h"
+#include "../crypto/ecies.h"
 #include "../crypto/signature.h"
 #include "../crypto/bip39.h"
 #include "../audio/ogg_validator.h"
@@ -14,10 +15,13 @@
 #include "../core/block.h"
 #include "../util/hw_fingerprint.h"
 
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <string>
 #include <memory>
+#include <utility>
+#include <vector>
 
 // Thread-local last error string
 static thread_local std::string g_last_error;
@@ -296,6 +300,31 @@ void mc_sha256(const uint8_t* data, size_t len, uint8_t* out_hash) {
 
 char* mc_bytes_to_hex(const uint8_t* data, size_t len) {
     return make_cstring(mc::crypto::to_hex(data, len));
+}
+
+// ECIES-encrypt `plaintext` to a single recipient pubkey (66-hex compressed
+// secp256k1). Used by the DMCA/KYC forms to seal a submission to the shared
+// moderation key END-TO-END so the node never sees plaintext. Returns the
+// ciphertext blob as a hex string (free with mc_free), nullptr on failure.
+char* mc_ecies_encrypt(const uint8_t* plaintext, size_t len,
+                       const char* recipient_pubkey_hex) {
+    if (!plaintext || !recipient_pubkey_hex) {
+        set_error("ecies: null argument"); return nullptr;
+    }
+    try {
+        auto pk = mc::crypto::from_hex(recipient_pubkey_hex);
+        if (pk.size() != 33) {
+            set_error("ecies: recipient pubkey must be 33 bytes"); return nullptr;
+        }
+        mc::PubKey33 pub{};
+        std::copy(pk.begin(), pk.end(), pub.begin());
+        const mc::Address addr = mc::crypto::address_from_pubkey(pub);
+        std::vector<uint8_t> pt(plaintext, plaintext + len);
+        std::vector<std::pair<mc::Address, mc::PubKey33>> recips{{addr, pub}};
+        auto blob = mc::crypto::ecies_encrypt(pt, recips);
+        if (blob.empty()) { set_error("ecies encrypt failed"); return nullptr; }
+        return make_cstring(mc::crypto::to_hex(blob.data(), blob.size()));
+    } catch (const std::exception& e) { set_error(e.what()); return nullptr; }
 }
 
 int mc_hex_to_bytes(const char* hex, uint8_t** out) {

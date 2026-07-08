@@ -39,6 +39,7 @@
 #include "../src/audio/fingerprint.h"
 #include <unordered_set>
 #include "node_tui.h"
+#include "net_check.h"
 
 #include "../deps/librats/src/librats_c.h"
 
@@ -63,6 +64,14 @@ namespace fs = std::filesystem;
 // the LoadMonitor below. File-scope so load_config can populate it
 // without changing the function signature.
 static mc::net::LoadConfig g_load_cfg{};
+
+// First-launch network check state (persisted in config.json). Once the
+// reachability + speed test have passed, `network_checked` stays true so we
+// don't re-run it on every boot. `skip_network_check` is an operator escape
+// hatch for hosts where the check can't work (e.g. a node co-located with
+// the rendezvous it would STUN against).
+static bool g_network_checked    = false;
+static bool g_skip_network_check = false;
 
 // ---- Configuration --------------------------------------------------
 
@@ -174,6 +183,8 @@ static mc::net::NodeConfig load_config(const std::string& path) {
         if (lm.contains("disable_cpu_metric"))
             g_load_cfg.disable_cpu_metric = lm["disable_cpu_metric"];
     }
+    if (j.contains("network_checked"))    g_network_checked    = j["network_checked"];
+    if (j.contains("skip_network_check")) g_skip_network_check = j["skip_network_check"];
     return cfg;
 }
 
@@ -218,6 +229,8 @@ static void save_config(const std::string& path,
     lm["disable_net_metric"]   = g_load_cfg.disable_net_metric;
     lm["disable_cpu_metric"]   = g_load_cfg.disable_cpu_metric;
     j["load_monitor"]      = lm;
+    j["network_checked"]    = g_network_checked;
+    j["skip_network_check"] = g_skip_network_check;
     try {
         fs::create_directories(fs::path(path).parent_path());
         std::ofstream f(path);
@@ -576,6 +589,36 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
             int n = rats.validated_peer_count();
             return n < 0 ? size_t{0} : static_cast<size_t>(n);
         });
+
+        // First-launch network self-check: open the ports via UPnP, verify the
+        // node can accept inbound connections, and calibrate the load ceiling
+        // from a speed test. A node that can't be reached is useless to the
+        // mesh, so setup is REFUSED if it isn't reachable.
+        if (!g_network_checked && !g_skip_network_check) {
+            auto nc = mc::net::run_net_check(
+                cfg.rats_port, cfg.api_port,
+                [&rats] { return rats.public_address(); });
+            if (!nc.reachable) {
+                std::cerr << "\n[netcheck] FATAL: this node cannot accept inbound "
+                             "connections\n"
+                             "           (STUN port remapped and UPnP mapping "
+                             "failed). A node that can't be\n"
+                             "           reached is useless to the mesh, so setup is "
+                             "refused. Fix port\n"
+                             "           forwarding for port " << cfg.rats_port
+                          << ", or set \"skip_network_check\": true\n"
+                             "           in config.json to override.\n";
+                rats.stop();
+                load_mon.stop();
+                return 1;
+            }
+            if (nc.measured) g_load_cfg.max_bandwidth_bps = nc.max_bandwidth_bps;
+            g_network_checked = true;
+            const std::string nc_save_path = config_path.empty()
+                ? cfg.data_dir + "/config.json" : config_path;
+            save_config(nc_save_path, cfg, tui_mode);
+            std::cout << "[netcheck] passed; capacity recorded to config.\n";
+        }
     } else {
         std::cerr << "[node] rats link failed to start — continuing without NAT punch\n";
     }

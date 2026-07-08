@@ -274,6 +274,7 @@ std::vector<uint8_t> ProposalTx::sign_message() const {
     // Wire layout (excluding type byte + signature):
     //   chain_id(4) | kind | target_hash(32) | target_addr(20)
     //        | amount(8) | proposer(20) | proposer_pubkey(33) | nonce(8)
+    //        [ | subject_pubkey(33)  only when kind == GRANT_MODERATOR ]
     std::vector<uint8_t> msg;
     write_u32le(msg, MC_CHAIN_ID);
     msg.push_back(kind);
@@ -283,6 +284,8 @@ std::vector<uint8_t> ProposalTx::sign_message() const {
     write_bytes(msg, proposer.data(),        20);
     write_bytes(msg, proposer_pubkey.data(), 33);
     write_u64le(msg, nonce);
+    if (static_cast<ProposalKind>(kind) == ProposalKind::GRANT_MODERATOR)
+        write_bytes(msg, subject_pubkey.data(), 33);
     return msg;
 }
 
@@ -298,6 +301,10 @@ std::vector<uint8_t> ProposalTx::serialize() const {
     write_bytes(buf, proposer.data(),        20);
     write_bytes(buf, proposer_pubkey.data(), 33);
     write_u64le(buf, nonce);
+    // Length-discriminated: subject_pubkey only for GRANT_MODERATOR, so
+    // every other kind serializes to the exact bytes/hash it always did.
+    if (static_cast<ProposalKind>(kind) == ProposalKind::GRANT_MODERATOR)
+        write_bytes(buf, subject_pubkey.data(), 33);
     write_bytes(buf, signature.data(), 64);
     return buf;
 }
@@ -314,6 +321,10 @@ bool ProposalTx::deserialize(const uint8_t* data, size_t len,
     if (!read_bytes(p, end, out.proposer.data(),        20)) return false;
     if (!read_bytes(p, end, out.proposer_pubkey.data(), 33)) return false;
     if (!read_u64le(p, end, out.nonce))                      return false;
+    // kind was read first, so we know whether the subject_pubkey trailer
+    // is present. HIDE/RELEASE/VOTE_YES have no trailer.
+    if (static_cast<ProposalKind>(out.kind) == ProposalKind::GRANT_MODERATOR)
+        if (!read_bytes(p, end, out.subject_pubkey.data(), 33)) return false;
     if (!read_bytes(p, end, out.signature.data(),       64)) return false;
     return true;
 }
@@ -331,6 +342,13 @@ bool ProposalTx::verify_signature() const {
     // the address the chain will credit the vote against.
     Address derived = crypto::address_from_pubkey(proposer_pubkey);
     if (std::memcmp(derived.data(), proposer.data(), 20) != 0) return false;
+    // GRANT_MODERATOR carries the subject's pubkey so the chain can record
+    // it on grant; bind it to target_addr the same way so the subject the
+    // proposal names is exactly the key that will become a moderator.
+    if (static_cast<ProposalKind>(kind) == ProposalKind::GRANT_MODERATOR) {
+        Address subj = crypto::address_from_pubkey(subject_pubkey);
+        if (std::memcmp(subj.data(), target_addr.data(), 20) != 0) return false;
+    }
     return crypto::verify_ecdsa(hash, signature, proposer_pubkey);
 }
 
