@@ -27,4 +27,9 @@ bool keystore_decrypt(const std::string& keystore_json,
 // Best-effort read of the informational "addr" field without decrypting.
 std::string keystore_address(const std::string& keystore_json);
 
+// Wallet password policy (shared with the Flutter side): returns an empty string
+// when `password` is acceptable (>=12 chars, >=1 uppercase, >=1 special / non-
+// alphanumeric character), otherwise a human-readable reason.
+std::string password_policy_error(const std::string& password);
+
 }  // namespace mc::crypto

@@ -6,6 +6,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -133,6 +134,18 @@ std::string keystore_address(const std::string& keystore_json) {
     json j = json::parse(keystore_json, nullptr, false);
     if (!j.is_object()) return {};
     return j.value("addr", std::string());
+}
+
+std::string password_policy_error(const std::string& pw) {
+    if (pw.size() < 12) return "password must be at least 12 characters";
+    bool has_upper = false, has_special = false;
+    for (unsigned char c : pw) {
+        if (c >= 'A' && c <= 'Z') has_upper = true;
+        else if (!std::isalnum(c) && !std::isspace(c)) has_special = true;
+    }
+    if (!has_upper) return "add at least one uppercase letter";
+    if (!has_special) return "add at least one special character";
+    return "";
 }
 
 }  // namespace mc::crypto

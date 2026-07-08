@@ -9,6 +9,7 @@
 #include "../src/crypto/signature.h"
 #include "../src/crypto/ecies.h"
 #include "../src/crypto/bip39.h"
+#include "../src/crypto/keystore.h"
 #include "../src/network/manager.h"
 #include "../src/store/swarm.h"
 #include "../src/storage/database.h"
@@ -2142,6 +2143,135 @@ std::string founder_seed_path(const std::string& data_dir) {
     return data_dir + "/founder.seed";
 }
 
+// Export the founder wallet mnemonic as a passphrase-encrypted keystore file
+// (portable, device-independent — the same format the player + mini-node use, so
+// it imports anywhere; only the passphrase opens it, so it is safe to store off
+// the machine). Reads founder.seed; writes the keystore to an operator path.
+void action_export_wallet(const std::string& data_dir, ModView& mv) {
+    const auto seed_path = founder_seed_path(data_dir);
+    std::ifstream sf(seed_path);
+    if (!sf) {
+        mv.last_action = "export: no founder.seed on this node";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    std::string mnemonic;
+    std::getline(sf, mnemonic);
+    sf.close();
+    while (!mnemonic.empty() &&
+           (mnemonic.back() == '\r' || mnemonic.back() == '\n' || mnemonic.back() == ' '))
+        mnemonic.pop_back();
+    if (mnemonic.empty()) {
+        mv.last_action = "export: founder.seed is empty";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    std::string pass;
+    if (!prompt_secret("Export passphrase (>=12 chars, 1 upper, 1 special)", pass, 128)) {
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+        mv.last_action = "export: cancelled";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    const std::string perr = mc::crypto::password_policy_error(pass);
+    if (!perr.empty()) {
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+        std::fill(pass.begin(), pass.end(), '\0');
+        mv.last_action = "export: " + perr;
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    std::string confirm;
+    if (!prompt_secret("Confirm passphrase", confirm, 128) || confirm != pass) {
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+        std::fill(pass.begin(), pass.end(), '\0');
+        mv.last_action = "export: passphrases do not match";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    std::string ks = mc::crypto::keystore_encrypt(mnemonic, pass);
+    std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+    std::fill(pass.begin(), pass.end(), '\0');
+    std::fill(confirm.begin(), confirm.end(), '\0');
+    if (ks.empty()) {
+        mv.last_action = "export: encryption failed";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    std::string out_path;
+    if (!prompt_string("Save keystore to path (e.g. /root/bopwire-wallet.json)", out_path, 220)) {
+        mv.last_action = "export: cancelled";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    std::ofstream of(out_path, std::ios::trunc | std::ios::binary);
+    if (!of) {
+        mv.last_action = "export: cannot write " + out_path;
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    of << ks;
+    of.close();
+    mv.last_action = "export: wrote " + out_path;
+    mv.last_action_color = CP_OK;
+}
+
+// Import a passphrase-encrypted keystore into founder.seed. After import, press
+// L to log in as the imported identity. Chain state is untouched.
+void action_import_wallet(const std::string& data_dir, ModView& mv) {
+    std::string in_path;
+    if (!prompt_string("Keystore file to import", in_path, 220)) {
+        mv.last_action = "import: cancelled";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    std::ifstream inf(in_path, std::ios::binary);
+    if (!inf) {
+        mv.last_action = "import: cannot read " + in_path;
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    std::stringstream ss;
+    ss << inf.rdbuf();
+    inf.close();
+    const std::string ks = ss.str();
+    std::string pass;
+    if (!prompt_secret("Import passphrase", pass, 128)) {
+        mv.last_action = "import: cancelled";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    std::string mnemonic;
+    const bool ok = mc::crypto::keystore_decrypt(ks, pass, mnemonic);
+    std::fill(pass.begin(), pass.end(), '\0');
+    if (!ok) {
+        mv.last_action = "import: wrong passphrase or corrupt file";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    auto kp = mc::crypto::bip39_mnemonic_to_keypair(mnemonic, "");
+    if (!kp) {
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+        mv.last_action = "import: not a valid wallet mnemonic";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    const auto seed_path = founder_seed_path(data_dir);
+    std::ofstream osf(seed_path, std::ios::trunc);
+    if (!osf) {
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+        mv.last_action = "import: cannot write founder.seed";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    osf << mnemonic << "\n";
+    osf.close();
+    const std::string addr = mc::crypto::to_checksum_hex(kp->address);
+    std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+    mv.last_action = "import: " + addr.substr(0, 12) + " -> founder.seed (press L to log in)";
+    mv.last_action_color = CP_OK;
+}
+
 void action_bootstrap_founder(mc::Database& db,
                               const std::string& data_dir,
                               ModView& mv) {
@@ -2604,6 +2734,8 @@ void run_tui(mc::api::HttpServer& /*http*/,
                             {"F1", "Main"},
                             {"F2", "Logs"},
                             {"L",  "Login"},
+                            {"X",  "Export"},
+                            {"P",  "Import"},
                             {"Q",  "Quit"},
                         });
                     } else {
@@ -2618,6 +2750,8 @@ void run_tui(mc::api::HttpServer& /*http*/,
                             {"F2", "Logs"},
                             {"B",  "Bootstrap"},
                             {"L",  "Login"},
+                            {"X",  "Export"},
+                            {"P",  "Import"},
                             {"Q",  "Quit"},
                         });
                     }
@@ -2649,6 +2783,10 @@ void run_tui(mc::api::HttpServer& /*http*/,
                 action_login(db, data_dir, mod, mv);
             } else if (key == 'o' || key == 'O') {
                 action_logout(mod, mv);
+            } else if (key == 'x' || key == 'X') {
+                action_export_wallet(data_dir, mv);
+            } else if (key == 'p' || key == 'P') {
+                action_import_wallet(data_dir, mv);
             } else if ((key == 'b' || key == 'B') && !mod.logged_in
                        && !db.get_founder().has_value()) {
                 action_bootstrap_founder(db, data_dir, mv);

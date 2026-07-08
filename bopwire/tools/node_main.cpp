@@ -31,6 +31,7 @@
 #include "../src/art/art_scraper.h"
 #endif
 #include "../src/crypto/bip39.h"
+#include "../src/crypto/keystore.h"
 #include "../src/core/transaction.h"
 #include "../src/crypto/keys.h"
 #include "../src/crypto/hash.h"
@@ -50,6 +51,8 @@
 #include <thread>
 #include <chrono>
 #include <string>
+#include <sstream>
+#include <algorithm>
 #include <vector>
 #include <cstring>
 
@@ -70,6 +73,48 @@ static mc::net::LoadConfig g_load_cfg{};
 // (loopback-free 9333/9334/8080 + small caches) so a fresh install with
 // no config still produces a useful node.
 static bool g_tui_mode_persisted = true;
+// Optional headless wallet-import config (mirrors the --wallet-file/--wallet-password
+// flags). A password in the config file is not visible in the process list.
+static std::string g_wallet_file_cfg;
+static std::string g_wallet_password_cfg;
+
+// Headless wallet import: decrypt a keystore file and adopt it as the founder
+// identity at <data_dir>/founder.seed. Never throws; logs the outcome.
+static void import_wallet_keystore(const std::string& data_dir,
+                                   const std::string& wallet_file,
+                                   const std::string& password) {
+    std::ifstream inf(wallet_file, std::ios::binary);
+    if (!inf) {
+        std::cerr << "[wallet] --wallet-file: cannot read " << wallet_file << "\n";
+        return;
+    }
+    std::stringstream ss;
+    ss << inf.rdbuf();
+    inf.close();
+    std::string mnemonic;
+    if (!mc::crypto::keystore_decrypt(ss.str(), password, mnemonic)) {
+        std::cerr << "[wallet] --wallet-file: wrong password or corrupt keystore\n";
+        return;
+    }
+    auto kp = mc::crypto::bip39_mnemonic_to_keypair(mnemonic, "");
+    if (!kp) {
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+        std::cerr << "[wallet] --wallet-file: not a valid wallet mnemonic\n";
+        return;
+    }
+    const std::string seed_path = data_dir + "/founder.seed";
+    std::ofstream sf(seed_path, std::ios::trunc);
+    if (!sf) {
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+        std::cerr << "[wallet] --wallet-file: cannot write " << seed_path << "\n";
+        return;
+    }
+    sf << mnemonic << "\n";
+    sf.close();
+    std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+    std::cout << "[wallet] imported " << mc::crypto::to_checksum_hex(kp->address)
+              << " -> founder.seed\n";
+}
 
 static mc::net::NodeConfig load_config(const std::string& path) {
     mc::net::NodeConfig cfg;
@@ -86,6 +131,8 @@ static mc::net::NodeConfig load_config(const std::string& path) {
     if (j.contains("validator_enabled"))  cfg.validator_enabled = j["validator_enabled"];
     if (j.contains("log_level"))          cfg.log_level = j["log_level"];
     if (j.contains("tui_mode"))           g_tui_mode_persisted = j["tui_mode"];
+    if (j.contains("wallet_file"))        g_wallet_file_cfg = j["wallet_file"];
+    if (j.contains("wallet_password"))    g_wallet_password_cfg = j["wallet_password"];
     if (j.contains("seed_nodes")) {
         for (auto& s : j["seed_nodes"]) cfg.seed_nodes.push_back(s);
     }
@@ -197,6 +244,10 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // leave the controlling terminal in raw mode.
     bool tui_mode      = true;
     bool tui_cli_set   = false;  // true iff --tui/--no-tui/--daemon/--quiet was passed
+    // Headless wallet import: adopt a keystore file as the founder identity at
+    // startup (no TUI needed). Password sources, in precedence: --wallet-password
+    // > --wallet-password-file > $BOPWIRE_WALLET_PASSWORD > config wallet_password.
+    std::string wallet_file, wallet_password, wallet_password_file;
 
     // Parse arguments
     for (size_t i = 0; i < args.size(); ++i) {
@@ -204,6 +255,9 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         else if (args[i] == "--data-dir" && i+1 < args.size())  { cfg.data_dir = args[++i]; }
         else if (args[i] == "--p2p-port" && i+1 < args.size())  { cfg.p2p_port = static_cast<uint16_t>(std::stoi(args[++i])); }
         else if (args[i] == "--api-port" && i+1 < args.size())  { cfg.api_port = static_cast<uint16_t>(std::stoi(args[++i])); }
+        else if (args[i] == "--wallet-file" && i+1 < args.size())          { wallet_file = args[++i]; }
+        else if (args[i] == "--wallet-password" && i+1 < args.size())      { wallet_password = args[++i]; }
+        else if (args[i] == "--wallet-password-file" && i+1 < args.size()) { wallet_password_file = args[++i]; }
         else if (args[i] == "--no-tui" || args[i] == "--daemon"
                                        || args[i] == "--quiet") { tui_mode = false; tui_cli_set = true; }
         else if (args[i] == "--tui")                            { tui_mode = true;  tui_cli_set = true; }
@@ -301,6 +355,33 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     fs::create_directories(cfg.data_dir + "/blockchain.db");
     fs::create_directories(cfg.data_dir + "/keys");
     fs::create_directories(cfg.data_dir + "/logs");
+
+    // Headless wallet import (before the founder identity is read). Password
+    // precedence: --wallet-password > --wallet-password-file > env > config.
+    if (wallet_file.empty()) wallet_file = g_wallet_file_cfg;
+    if (!wallet_file.empty()) {
+        if (wallet_password.empty() && !wallet_password_file.empty()) {
+            std::ifstream pf(wallet_password_file);
+            if (pf) {
+                std::getline(pf, wallet_password);
+                while (!wallet_password.empty() &&
+                       (wallet_password.back() == '\r' || wallet_password.back() == '\n'))
+                    wallet_password.pop_back();
+            }
+        }
+        if (wallet_password.empty()) {
+            if (const char* e = std::getenv("BOPWIRE_WALLET_PASSWORD")) wallet_password = e;
+        }
+        if (wallet_password.empty()) wallet_password = g_wallet_password_cfg;
+        if (wallet_password.empty()) {
+            std::cerr << "[wallet] --wallet-file given but no password "
+                         "(--wallet-password / --wallet-password-file / "
+                         "$BOPWIRE_WALLET_PASSWORD / config wallet_password)\n";
+        } else {
+            import_wallet_keystore(cfg.data_dir, wallet_file, wallet_password);
+            std::fill(wallet_password.begin(), wallet_password.end(), '\0');
+        }
+    }
 
     std::cout << "[node] data_dir : " << cfg.data_dir << "\n";
     std::cout << "[node] rats port: " << cfg.rats_port
