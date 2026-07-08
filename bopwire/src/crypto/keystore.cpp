@@ -1,8 +1,8 @@
 #include "keystore.h"
 
-#include "../audio/fingerprint.h"  // mc::audio::base64_encode / base64_decode
-
 #include <nlohmann/json.hpp>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
@@ -34,8 +34,38 @@ bool scrypt_kdf(const std::string& password, const uint8_t* salt, size_t salt_le
                           N, r, p, kMaxMem, out_key, key_len) == 1;
 }
 
+// Self-contained base64 (OpenSSL BIO, standard +/ alphabet, no newlines) so the
+// keystore links into any target — including the mini-node, which does not pull
+// in the audio TU that used to own base64.
+std::string b64_encode(const uint8_t* data, size_t len) {
+    BIO* b64 = BIO_new(BIO_f_base64());
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    BIO* mem = BIO_new(BIO_s_mem());
+    b64 = BIO_push(b64, mem);
+    BIO_write(b64, data, static_cast<int>(len));
+    (void)BIO_flush(b64);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(b64, &bptr);
+    std::string out(bptr->data, bptr->length);
+    BIO_free_all(b64);
+    return out;
+}
+
+std::vector<uint8_t> b64_decode(const std::string& s) {
+    BIO* b64 = BIO_new(BIO_f_base64());
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    BIO* mem = BIO_new_mem_buf(s.data(), static_cast<int>(s.size()));
+    mem = BIO_push(b64, mem);
+    std::vector<uint8_t> out(s.size());
+    int n = BIO_read(mem, out.data(), static_cast<int>(out.size()));
+    if (n < 0) n = 0;
+    out.resize(static_cast<size_t>(n));
+    BIO_free_all(mem);
+    return out;
+}
+
 std::string b64(const std::vector<uint8_t>& v) {
-    return mc::audio::base64_encode(v.data(), v.size());
+    return b64_encode(v.data(), v.size());
 }
 }  // namespace
 
@@ -89,10 +119,10 @@ bool keystore_decrypt(const std::string& keystore_json, const std::string& passw
     if (j.value("cipher", std::string()) != "aes-256-gcm") return false;
     if (j.value("kdf", std::string()) != "scrypt") return false;
 
-    const auto salt  = mc::audio::base64_decode(j.value("salt", std::string()));
-    const auto nonce = mc::audio::base64_decode(j.value("nonce", std::string()));
-    const auto ct    = mc::audio::base64_decode(j.value("ct", std::string()));
-    const auto tag   = mc::audio::base64_decode(j.value("tag", std::string()));
+    const auto salt  = b64_decode(j.value("salt", std::string()));
+    const auto nonce = b64_decode(j.value("nonce", std::string()));
+    const auto ct    = b64_decode(j.value("ct", std::string()));
+    const auto tag   = b64_decode(j.value("tag", std::string()));
     if (salt.empty() || nonce.size() != kNonceLen || tag.size() != kTagLen) return false;
 
     const uint64_t N     = j.value("n", kScryptN);

@@ -19,6 +19,8 @@
 #include "../src/crypto/hash.h"       // from_hex / to_hex for chat sig verify
 #include "../src/crypto/signature.h"  // sign_data for relay.report (#10), verify_data for chat
 #include "../src/crypto/bip39.h"   // bip39_generate_12 / bip39_mnemonic_to_keypair
+#include "../src/crypto/keystore.h" // wallet keystore (export/import, headless load)
+#include "mini_node_tui.h"
 #include <array>                    // DeliveryAccum delivery_id (#10)
 #include <fstream>
 #include <memory>
@@ -3059,6 +3061,8 @@ int main(int argc, char** argv) {
     uint16_t rats_port = kDefaultRatsPort;
     std::string config_path;
     mc::net::LoadConfig load_cfg;
+    bool tui_enabled = false;  // --tui: run the interactive curses TUI
+    std::string wallet_file, wallet_password, wallet_password_file;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -3099,6 +3103,14 @@ int main(int argc, char** argv) {
             g_mininodes_list_max = std::atoi(argv[++i]);
         } else if (a == "--require-signed-routes") {
             g_require_signed_routes = true;
+        } else if (a == "--tui") {
+            tui_enabled = true;
+        } else if (a == "--wallet-file" && i + 1 < argc) {
+            wallet_file = argv[++i];
+        } else if (a == "--wallet-password" && i + 1 < argc) {
+            wallet_password = argv[++i];
+        } else if (a == "--wallet-password-file" && i + 1 < argc) {
+            wallet_password_file = argv[++i];
         } else if (a == "-h" || a == "--help") {
             std::cout << "Usage: mini-node [--rats-port N] [--quiet]\n"
                       << "  --rats-port          librats TCP port (default " << kDefaultRatsPort << ")\n"
@@ -3221,11 +3233,60 @@ int main(int argc, char** argv) {
     // resulting address is portable — an operator can import the
     // mnemonic into MetaMask, ethers.js, the player's wallet flow, etc.
     // and see the same address.
-    {
-        std::string seed_path = "mini-node.seed";
-        if (const char* env = std::getenv("BOPWIRE_MINI_SEED")) {
-            if (*env) seed_path = env;
+    // Resolve the seed path once (shared by headless import, wallet setup, TUI).
+    std::string mini_seed_path = "mini-node.seed";
+    if (const char* env = std::getenv("BOPWIRE_MINI_SEED")) {
+        if (*env) mini_seed_path = env;
+    }
+    // Headless wallet import: decrypt a keystore into the seed file BEFORE it is
+    // read. Password precedence: --wallet-password > --wallet-password-file >
+    // $BOPWIRE_WALLET_PASSWORD.
+    if (!wallet_file.empty()) {
+        if (wallet_password.empty() && !wallet_password_file.empty()) {
+            std::ifstream pf(wallet_password_file);
+            if (pf) {
+                std::getline(pf, wallet_password);
+                while (!wallet_password.empty() &&
+                       (wallet_password.back() == '\r' || wallet_password.back() == '\n'))
+                    wallet_password.pop_back();
+            }
         }
+        if (wallet_password.empty()) {
+            if (const char* e = std::getenv("BOPWIRE_WALLET_PASSWORD")) wallet_password = e;
+        }
+        if (wallet_password.empty()) {
+            std::cerr << "[mini-node] --wallet-file given but no password "
+                         "(--wallet-password / --wallet-password-file / env)\n";
+        } else {
+            std::ifstream inf(wallet_file, std::ios::binary);
+            if (!inf) {
+                std::cerr << "[mini-node] --wallet-file: cannot read " << wallet_file << "\n";
+            } else {
+                std::stringstream wss;
+                wss << inf.rdbuf();
+                inf.close();
+                std::string wm;
+                if (!mc::crypto::keystore_decrypt(wss.str(), wallet_password, wm)) {
+                    std::cerr << "[mini-node] --wallet-file: wrong password or corrupt keystore\n";
+                } else if (!mc::crypto::bip39_mnemonic_to_keypair(wm, "")) {
+                    std::cerr << "[mini-node] --wallet-file: not a valid wallet mnemonic\n";
+                } else {
+                    std::ofstream osf(mini_seed_path, std::ios::trunc);
+                    if (osf) {
+                        osf << wm << "\n";
+                        std::cout << "[mini-node] imported wallet -> " << mini_seed_path << "\n";
+                    } else {
+                        std::cerr << "[mini-node] --wallet-file: cannot write " << mini_seed_path << "\n";
+                    }
+                }
+                std::fill(wm.begin(), wm.end(), '\0');
+            }
+        }
+        std::fill(wallet_password.begin(), wallet_password.end(), '\0');
+    }
+
+    {
+        const std::string& seed_path = mini_seed_path;
         std::string mnemonic;
         {
             std::ifstream f(seed_path);
@@ -3414,31 +3475,45 @@ int main(int argc, char** argv) {
         redraw_monitor();
     }
 
-    // In TUI mode we redraw the monitor every second so the timestamp footer
-    // and peer count stay live even when nothing is happening. In --quiet mode
-    // we emit a one-line status every minute (clean for journald).
-    auto next_redraw = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    auto next_report = std::chrono::steady_clock::now() + std::chrono::minutes(1);
-    while (g_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        const auto now = std::chrono::steady_clock::now();
+    if (tui_enabled) {
+        // Interactive curses TUI (wallet export/import + live status). Runs on
+        // this thread until Q / signal; never touches the librats io thread.
+        mc::mini::MiniTuiState st;
+        st.peer_count     = [client]() { return rats_get_peer_count(client); };
+        st.route_count    = []() {
+            std::lock_guard<std::mutex> lk(g_routes_mu);
+            return g_routes.size();
+        };
+        st.wallet_address = []() { return g_wallet_address_hex; };
+        st.seed_path      = mini_seed_path;
+        st.rats_port      = rats_port;
+        mc::mini::run_mini_tui(st, g_running);
+    } else {
+        // Display-only: redraw the ANSI monitor every second (non-quiet), or emit
+        // a one-line status every minute in --quiet mode (clean for journald).
+        auto next_redraw = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        auto next_report = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const auto now = std::chrono::steady_clock::now();
 
-        // Keep the displayed peer count honest (the callbacks can race).
-        g_peer_count.store(rats_get_peer_count(client));
+            // Keep the displayed peer count honest (the callbacks can race).
+            g_peer_count.store(rats_get_peer_count(client));
 
-        if (!g_quiet && now >= next_redraw) {
-            redraw_monitor();
-            next_redraw = now + std::chrono::seconds(1);
-        }
-        if (g_quiet && now >= next_report) {
-            size_t routes_n;
-            {
-                std::lock_guard<std::mutex> lk(g_routes_mu);
-                routes_n = g_routes.size();
+            if (!g_quiet && now >= next_redraw) {
+                redraw_monitor();
+                next_redraw = now + std::chrono::seconds(1);
             }
-            std::cout << "[mini-node] peers=" << g_peer_count.load()
-                      << " routes=" << routes_n << "\n";
-            next_report = now + std::chrono::minutes(1);
+            if (g_quiet && now >= next_report) {
+                size_t routes_n;
+                {
+                    std::lock_guard<std::mutex> lk(g_routes_mu);
+                    routes_n = g_routes.size();
+                }
+                std::cout << "[mini-node] peers=" << g_peer_count.load()
+                          << " routes=" << routes_n << "\n";
+                next_report = now + std::chrono::minutes(1);
+            }
         }
     }
 

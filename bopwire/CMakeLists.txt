@@ -473,9 +473,11 @@ endif() # NOT MC_MINI_NODE_ONLY
 # RELAY_REWARD tx type.
 add_executable(bopwire-mini-node
   tools/mini_node.cpp
+  tools/mini_node_tui.cpp
   src/net/load_monitor.cpp
   src/crypto/hash.cpp
   src/crypto/keys.cpp
+  src/crypto/keystore.cpp
   src/crypto/keccak256.cpp
   src/crypto/signature.cpp
   src/crypto/wally_bip39.cpp
@@ -496,6 +498,17 @@ if(WIN32)
 endif()
 if(NOT MSVC)
   target_link_libraries(bopwire-mini-node PRIVATE Threads::Threads)
+endif()
+# Curses for the mini-node's interactive TUI (--tui), mirroring bopwire-node.
+if (WIN32)
+  find_package(unofficial-pdcurses CONFIG REQUIRED)
+  target_link_libraries(bopwire-mini-node PRIVATE unofficial::pdcurses::pdcurses)
+  target_compile_definitions(bopwire-mini-node PRIVATE MC_TUI_PDCURSES=1)
+else()
+  set(CURSES_NEED_NCURSES TRUE)
+  find_package(Curses REQUIRED)
+  target_include_directories(bopwire-mini-node PRIVATE ${CURSES_INCLUDE_DIRS})
+  target_link_libraries(bopwire-mini-node PRIVATE ${CURSES_LIBRARIES})
 endif()
 # Static-link libstdc++/libgcc so the deploy ELF has no C++ runtime ABI
 # dependency on whatever glibc/g++ ships on the VPS. glibc itself stays
