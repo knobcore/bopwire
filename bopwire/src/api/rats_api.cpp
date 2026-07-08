@@ -61,19 +61,15 @@ namespace {
 // generated; NOT a wallet). The node uses it as the SINGLE ECIES recipient
 // for DMCA/KYC submissions, so any moderator holding the SMK private key can
 // decrypt them. Returns nullopt if the key file is absent (pre-founder).
-std::optional<std::pair<Address, PubKey33>> load_smk_recipient(const std::string& data_dir) {
-    std::ifstream f(std::filesystem::path(data_dir) / "moderation.key");
-    if (!f) return std::nullopt;
-    try {
-        json j; f >> j;
-        auto pub = crypto::from_hex(j.value("pub",  std::string()));
-        auto adr = crypto::from_hex(j.value("addr", std::string()));
-        if (pub.size() != 33 || adr.size() != 20) return std::nullopt;
-        Address a{}; PubKey33 p{};
-        std::copy(adr.begin(), adr.end(), a.begin());
-        std::copy(pub.begin(), pub.end(), p.begin());
-        return std::make_pair(a, p);
-    } catch (...) { return std::nullopt; }
+std::optional<std::pair<Address, PubKey33>> load_smk_recipient(const Database& db) {
+    // The SMK PUBLIC key is published into chain state at genesis (key
+    // "modkey:"), so any node serves it via mod.moderation_key without ever
+    // holding the private moderation.key (that lives on the admin box).
+    auto raw = db.get("modkey:");
+    if (!raw || raw->size() != 33) return std::nullopt;
+    PubKey33 p{};
+    std::copy(raw->begin(), raw->end(), p.begin());
+    return std::make_pair(crypto::address_from_pubkey(p), p);
 }
 } // namespace
 
@@ -1143,7 +1139,7 @@ void RatsApi::handle_request(const std::string& peer_id,
             // ECIES-encrypt their submission to it, so only moderators (who
             // hold the SMK private key) can read takedown/KYC content.
             std::string pk;
-            if (auto smk = load_smk_recipient(config_.data_dir))
+            if (auto smk = load_smk_recipient(db_))
                 pk = crypto::to_hex(smk->second.data(), smk->second.size());
             reply = {{"req_id", req_id}, {"status", "ok"},
                      {"body", {{"pubkey", pk}}}};
@@ -2185,7 +2181,7 @@ void RatsApi::handle_request(const std::string& peer_id,
                 std::string suffix_marker;
                 if (mc::crypto::ecies_looks_encrypted(bytes.data(), bytes.size())) {
                     suffix_marker = ".enc";
-                } else if (auto smk = load_smk_recipient(config_.data_dir)) {
+                } else if (auto smk = load_smk_recipient(db_)) {
                     auto encrypted = mc::crypto::ecies_encrypt(bytes, {*smk});
                     if (!encrypted.empty()) {
                         blob_to_write = std::move(encrypted);
@@ -2310,7 +2306,7 @@ void RatsApi::handle_request(const std::string& peer_id,
                 std::string suffix_marker;
                 if (mc::crypto::ecies_looks_encrypted(bytes.data(), bytes.size())) {
                     suffix_marker = ".enc";
-                } else if (auto smk = load_smk_recipient(config_.data_dir)) {
+                } else if (auto smk = load_smk_recipient(db_)) {
                     auto encrypted = mc::crypto::ecies_encrypt(bytes, {*smk});
                     if (!encrypted.empty()) {
                         blob_to_write = std::move(encrypted);

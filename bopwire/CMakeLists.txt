@@ -471,29 +471,21 @@ endif()
 
 # --------------------------------------------------------------------
 # bopwire-admin (PRIVATE, optional). The founder/moderator program: a full
-# node PLUS the bootstrap + moderation TUI + first-boot wallet wizard. Its
-# source lives in tools/admin/ which is .gitignored — copied to the
-# operator's host, never committed. It shares tools/node_main.cpp with the
-# public node but links its OWN run_tui() (the full admin TUI) instead of
-# the read-only monitor adapter. Built only when the private source is
-# present, so a public checkout still builds bopwire-node + mini cleanly.
+# founder BOOTSTRAP tool (genesis writer) — NOT a full node. It opens the
+# chain DB, writes block 1 (founder GRANT only, no premine) + the founder /
+# moderation keys, and exits; the full node reads that genesis on boot.
+# Ongoing moderation uses the thin RPC console bopwire-modclient. Its source
+# lives in tools/admin/ (.gitignored — copied to the operator's host, never
+# committed). Built only when that private source is present.
 # --------------------------------------------------------------------
-if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/admin_tui.cpp")
-  message(STATUS "bopwire-admin: private admin source found — ENABLED")
+if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/admin_main.cpp")
+  message(STATUS "bopwire-admin: genesis-writer source found — ENABLED")
   add_executable(bopwire-admin
-      tools/node_main.cpp
-      tools/admin/admin_tui.cpp
-      tools/net_check.cpp
+      tools/admin/admin_main.cpp
+      tools/admin/genesis_writer.cpp
       tools/node_wallet.cpp)
   target_include_directories(bopwire-admin PRIVATE ${MC_INCLUDE_DIRS})
-  target_link_libraries(bopwire-admin PRIVATE bopwire_static)
-  target_compile_definitions(bopwire-admin PRIVATE BOPWIRE_ADMIN=1)
-  if(MC_WITH_ART)
-    add_dependencies(bopwire-admin sacad_ffi_build)
-    target_sources(bopwire-admin PRIVATE src/art/art_scraper.cpp)
-    target_compile_definitions(bopwire-admin PRIVATE MC_WITH_ART=1)
-    target_link_libraries(bopwire-admin PRIVATE ${SACAD_FFI_LIB} pthread dl m rt)
-  endif()
+  target_link_libraries(bopwire-admin PRIVATE bopwire_static)  # chain code to write block 1
   if (WIN32)
     find_package(unofficial-pdcurses CONFIG REQUIRED)
     target_link_libraries(bopwire-admin PRIVATE unofficial::pdcurses::pdcurses)
@@ -505,7 +497,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/admin_tui.cpp")
     target_link_libraries(bopwire-admin PRIVATE ${CURSES_LIBRARIES})
   endif()
 else()
-  message(STATUS "bopwire-admin: private source absent — public node only")
+  message(STATUS "bopwire-admin: genesis-writer source absent — public node only")
 endif()
 
 endif() # NOT MC_MINI_NODE_ONLY
