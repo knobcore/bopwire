@@ -414,6 +414,13 @@ else()
     target_link_libraries(bopwire-node PRIVATE ${CURSES_LIBRARIES})
 endif()
 
+# test_sequencer — focused single-sequencer consensus regression test (block
+# v4): proves genesis is signature-exempt and that ONLY sequencer-signed
+# blocks connect (rogue/unsigned are rejected → the chain cannot fork).
+add_executable(test_sequencer tools/test_sequencer.cpp)
+target_include_directories(test_sequencer PRIVATE ${MC_INCLUDE_DIRS})
+target_link_libraries(test_sequencer PRIVATE bopwire_static)
+
 # --------------------------------------------------------------------
 # bopwire-admin (PRIVATE, optional). The founder/moderator program: a full
 # founder BOOTSTRAP tool (genesis writer) — NOT a full node. It opens the

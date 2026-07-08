@@ -481,6 +481,34 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     std::cerr << "[dbg] network started\n";
     std::cout << "[node] P2P listening on port " << cfg.p2p_port << "\n";
 
+    // Single-sequencer authority (v4): if this data dir holds sequencer.key
+    // (written by the founder bootstrap), THIS node is the sequencer and will
+    // be the ONLY node that mints + signs blocks — which is what keeps the
+    // chain fork-free. Absent → validating replica (never produces).
+    {
+        std::ifstream sf(cfg.data_dir + "/sequencer.key");
+        if (sf) {
+            try {
+                nlohmann::json sj; sf >> sj;
+                auto priv = mc::crypto::from_hex(sj.at("priv").get<std::string>());
+                if (priv.size() == 32) {
+                    auto seq_kp = mc::crypto::keypair_from_priv_bytes(priv.data());
+                    candidates.set_sequencer_key(seq_kp);
+                    std::cout << "[node] sequencer.key loaded — this node is THE "
+                                 "block sequencer (fork-free authority)\n";
+                } else {
+                    std::cerr << "[node] sequencer.key: bad priv length — not producing\n";
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[node] sequencer.key parse error: " << e.what()
+                          << " — not producing\n";
+            }
+        } else {
+            std::cout << "[node] no sequencer.key — validating replica "
+                         "(does not mint blocks)\n";
+        }
+    }
+
     // Start upload worker thread
     std::cerr << "[dbg] starting upload worker\n";
     candidates.start(chain, db, network, cfg, keypair);

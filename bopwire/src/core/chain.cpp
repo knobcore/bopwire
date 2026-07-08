@@ -112,6 +112,17 @@ bool Chain::connect_block(const Block& block) {
     db_.put_batch(batch, "k:" + std::to_string(new_height),
                   std::vector<uint8_t>(fh.begin(), fh.end()));
 
+    // Single-sequencer authority (v4): the genesis block commits the
+    // sequencer pubkey in its header. Persist it into chain state (`seq:`)
+    // so every later block's sequencer_sig is verifiable — and so a node
+    // that SYNCED the chain (rather than writing genesis locally) learns the
+    // sequencer straight from block 1.
+    if (new_height == 1) {
+        const auto& spk = block.header.sequencer_pubkey;
+        db_.put_batch(batch, "seq:",
+                      std::vector<uint8_t>(spk.begin(), spk.end()));
+    }
+
     // Update tip
     std::vector<uint8_t> tip_val(36);
     std::memcpy(tip_val.data(), hash.data(), 32);
@@ -981,6 +992,27 @@ bool Chain::validate_block(const Block& block, std::string& error) const {
     if (block.header.prev_hash != tip_.hash) {
         error = "prev_hash mismatch";
         return false;
+    }
+    // Single-sequencer authority (v4): every block AFTER genesis must be
+    // signed by the sequencer key whose pubkey was committed in the genesis
+    // header (persisted as `seq:`). Only that one key can produce an
+    // acceptable block, so no competing height-N block can exist → no forks,
+    // no chain splits, no reorg → a confirmed tx is final (no double-spend
+    // window). Genesis (connected onto an empty chain, tip_.height == 0) is
+    // the trusted origin and is sig-exempt; it DECLARES the sequencer in its
+    // header instead.
+    if (tip_.height >= 1) {
+        auto seq_pub = db_.get("seq:");
+        if (!seq_pub || seq_pub->size() != 33) {
+            error = "no sequencer pubkey in chain state (seq:)";
+            return false;
+        }
+        PubKey33 spk{};
+        std::memcpy(spk.data(), seq_pub->data(), 33);
+        if (!crypto::verify_ecdsa(block.hash(), block.sequencer_sig, spk)) {
+            error = "invalid sequencer signature";
+            return false;
+        }
     }
     // Reject duplicate songs (same content hash already in chain). Only
     // meaningful for song-bearing blocks; heartbeats carry zero hashes

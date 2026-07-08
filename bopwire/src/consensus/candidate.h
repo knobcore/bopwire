@@ -2,6 +2,7 @@
 #include <cstdint>
 #include "../core/block.h"
 #include "../core/transaction.h"
+#include "../crypto/keys.h"   // full KeyPair type (std::optional member below)
 #include <chrono>
 #include <functional>
 #include <optional>
@@ -73,6 +74,12 @@ public:
                const crypto::KeyPair& keypair);
     void stop();
 
+    /// Single-sequencer authority: give this producer the sequencer private
+    /// key. Only a node holding it will mint (+ sign) blocks; every other
+    /// node is a validating replica whose heartbeat_loop returns immediately.
+    /// Must be called BEFORE start(). Absent → this node never produces.
+    void set_sequencer_key(const crypto::KeyPair& kp) { sequencer_key_ = kp; }
+
     /// Player fingerprinted a song the chain doesn't know yet. Queue it
     /// for inclusion in the next block the heartbeat producer mints.
     /// Returns true if the registration was accepted (i.e. the
@@ -98,6 +105,11 @@ public:
 
 private:
     BlockAnnouncer announcer_;
+
+    // Single-sequencer authority (v4). Set → this node is THE sequencer and
+    // produces + signs blocks; unset → validating replica (never mints), so
+    // no competing height-N block can exist and the chain cannot fork.
+    std::optional<crypto::KeyPair> sequencer_key_;
 
     // Heartbeat producer state. last_block_at_ms_ guarded by producer_mu_.
     mutable std::mutex                               producer_mu_;
