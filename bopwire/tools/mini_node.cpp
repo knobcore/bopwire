@@ -21,6 +21,7 @@
 #include "../src/crypto/bip39.h"   // bip39_generate_12 / bip39_mnemonic_to_keypair
 #include "../src/crypto/keystore.h" // wallet keystore (export/import, headless load)
 #include "monitor_tui.h"
+#include "node_wallet.h"
 #include <array>                    // DeliveryAccum delivery_id (#10)
 #include <fstream>
 #include <memory>
@@ -3233,15 +3234,11 @@ int main(int argc, char** argv) {
     // resulting address is portable — an operator can import the
     // mnemonic into MetaMask, ethers.js, the player's wallet flow, etc.
     // and see the same address.
-    // Resolve the seed path once (shared by headless import, wallet setup, TUI).
-    std::string mini_seed_path = "mini-node.seed";
-    if (const char* env = std::getenv("BOPWIRE_MINI_SEED")) {
-        if (*env) mini_seed_path = env;
-    }
-    // Headless wallet import: decrypt a keystore into the seed file BEFORE it is
-    // read. Password precedence: --wallet-password > --wallet-password-file >
-    // $BOPWIRE_WALLET_PASSWORD.
-    if (!wallet_file.empty()) {
+    // Node identity = a PASSWORD-PROTECTED PORTABLE wallet (encrypted keystore).
+    // First run with --tui -> a wizard creates/imports it; headless -> loaded
+    // with --wallet-file/--wallet-password (or config/env). This replaces the
+    // old plaintext mini-node.seed auto-gen.
+    {
         if (wallet_password.empty() && !wallet_password_file.empty()) {
             std::ifstream pf(wallet_password_file);
             if (pf) {
@@ -3254,73 +3251,14 @@ int main(int argc, char** argv) {
         if (wallet_password.empty()) {
             if (const char* e = std::getenv("BOPWIRE_WALLET_PASSWORD")) wallet_password = e;
         }
-        if (wallet_password.empty()) {
-            std::cerr << "[mini-node] --wallet-file given but no password "
-                         "(--wallet-password / --wallet-password-file / env)\n";
-        } else {
-            std::ifstream inf(wallet_file, std::ios::binary);
-            if (!inf) {
-                std::cerr << "[mini-node] --wallet-file: cannot read " << wallet_file << "\n";
-            } else {
-                std::stringstream wss;
-                wss << inf.rdbuf();
-                inf.close();
-                std::string wm;
-                if (!mc::crypto::keystore_decrypt(wss.str(), wallet_password, wm)) {
-                    std::cerr << "[mini-node] --wallet-file: wrong password or corrupt keystore\n";
-                } else if (!mc::crypto::bip39_mnemonic_to_keypair(wm, "")) {
-                    std::cerr << "[mini-node] --wallet-file: not a valid wallet mnemonic\n";
-                } else {
-                    std::ofstream osf(mini_seed_path, std::ios::trunc);
-                    if (osf) {
-                        osf << wm << "\n";
-                        std::cout << "[mini-node] imported wallet -> " << mini_seed_path << "\n";
-                    } else {
-                        std::cerr << "[mini-node] --wallet-file: cannot write " << mini_seed_path << "\n";
-                    }
-                }
-                std::fill(wm.begin(), wm.end(), '\0');
-            }
-        }
+        const std::string wf =
+            wallet_file.empty() ? std::string("mini-node-wallet.json") : wallet_file;
+        auto kp_opt = mc::load_or_setup_node_identity(
+            ".", wf, wallet_password, tui_enabled, "mini-node");
         std::fill(wallet_password.begin(), wallet_password.end(), '\0');
-    }
-
-    {
-        const std::string& seed_path = mini_seed_path;
-        std::string mnemonic;
-        {
-            std::ifstream f(seed_path);
-            if (f) std::getline(f, mnemonic);
-        }
-        while (!mnemonic.empty() &&
-               (mnemonic.back() == '\r' || mnemonic.back() == '\n' ||
-                mnemonic.back() == ' ')) {
-            mnemonic.pop_back();
-        }
-        if (mnemonic.empty()) {
-            mnemonic = mc::crypto::bip39_generate_12();
-            if (mnemonic.empty()) {
-                std::cerr << "[mini-node] FATAL: entropy source failed\n";
-                return 5;
-            }
-            std::ofstream out(seed_path, std::ios::trunc);
-            if (!out) {
-                std::cerr << "[mini-node] FATAL: cannot write "
-                          << seed_path << " — refusing to lose seed\n";
-                return 5;
-            }
-            out << mnemonic << "\n";
-            std::cout << "[mini-node] generated new wallet seed at "
-                      << seed_path << "\n";
-            std::cout << "[mini-node] FIRST-LAUNCH MNEMONIC: " << mnemonic
-                      << "\n";
-            std::cout << "[mini-node] WRITE THIS DOWN. After this run it's "
-                         "only on disk at the path above. Reward MC tokens "
-                         "earned via tunneled traffic go to this address.\n";
-        }
-        auto kp_opt = mc::crypto::bip39_mnemonic_to_keypair(mnemonic, "");
         if (!kp_opt) {
-            std::cerr << "[mini-node] FATAL: BIP32 derivation failed\n";
+            std::cerr << "[mini-node] FATAL: no usable wallet. Run once with --tui "
+                         "to create one, or pass --wallet-file/--wallet-password.\n";
             return 5;
         }
         g_wallet_address_hex = mc::crypto::to_checksum_hex(kp_opt->address);
@@ -3334,8 +3272,7 @@ int main(int argc, char** argv) {
                 << static_cast<int>(b);
         }
         g_wallet_address_raw = raw.str();
-        std::cout << "[mini-node] wallet address: " << g_wallet_address_hex
-                  << "\n";
+        std::cout << "[mini-node] wallet address: " << g_wallet_address_hex << "\n";
     }
 
     // In TUI mode librats' own console logger would scribble over our redraws,
@@ -3480,7 +3417,7 @@ int main(int argc, char** argv) {
         // this thread until Q / signal; never touches the librats io thread.
         mc::ui::MonitorState st;
         st.title          = "bopwire mini-node";
-        st.seed_path      = mini_seed_path;   // X/P export/import the mini's own seed
+        st.seed_path      = "";   // identity is a password-protected keystore (wizard-managed); no plaintext-seed X/P
         st.wallet_address = []() { return g_wallet_address_hex; };
         st.peers          = [client]() { return std::to_string(rats_get_peer_count(client)); };
         st.routes         = []() {

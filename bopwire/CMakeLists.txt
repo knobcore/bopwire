@@ -438,7 +438,8 @@ add_executable(bopwire-node
     tools/node_main.cpp
     tools/node_tui_adapter.cpp
     tools/monitor_tui.cpp
-    tools/net_check.cpp)
+    tools/net_check.cpp
+    tools/node_wallet.cpp)
 target_include_directories(bopwire-node PRIVATE ${MC_INCLUDE_DIRS})
 target_link_libraries(bopwire-node PRIVATE bopwire_static)
 
@@ -482,7 +483,8 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/admin_tui.cpp")
   add_executable(bopwire-admin
       tools/node_main.cpp
       tools/admin/admin_tui.cpp
-      tools/net_check.cpp)
+      tools/net_check.cpp
+      tools/node_wallet.cpp)
   target_include_directories(bopwire-admin PRIVATE ${MC_INCLUDE_DIRS})
   target_link_libraries(bopwire-admin PRIVATE bopwire_static)
   target_compile_definitions(bopwire-admin PRIVATE BOPWIRE_ADMIN=1)
@@ -518,6 +520,7 @@ endif() # NOT MC_MINI_NODE_ONLY
 add_executable(bopwire-mini-node
   tools/mini_node.cpp
   tools/monitor_tui.cpp
+  tools/node_wallet.cpp
   src/net/load_monitor.cpp
   src/crypto/hash.cpp
   src/crypto/keys.cpp

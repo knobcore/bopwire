@@ -40,6 +40,7 @@
 #include <unordered_set>
 #include "node_tui.h"
 #include "net_check.h"
+#include "node_wallet.h"
 
 #include "../deps/librats/src/librats_c.h"
 
@@ -369,32 +370,23 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     fs::create_directories(cfg.data_dir + "/keys");
     fs::create_directories(cfg.data_dir + "/logs");
 
-    // Headless wallet import (before the founder identity is read). Password
-    // precedence: --wallet-password > --wallet-password-file > env > config.
+    // Resolve the node identity wallet's password (used to unlock the keystore
+    // below). Precedence: --wallet-password > --wallet-password-file > env >
+    // config. The wallet itself is loaded/created after the DB opens.
     if (wallet_file.empty()) wallet_file = g_wallet_file_cfg;
-    if (!wallet_file.empty()) {
-        if (wallet_password.empty() && !wallet_password_file.empty()) {
-            std::ifstream pf(wallet_password_file);
-            if (pf) {
-                std::getline(pf, wallet_password);
-                while (!wallet_password.empty() &&
-                       (wallet_password.back() == '\r' || wallet_password.back() == '\n'))
-                    wallet_password.pop_back();
-            }
-        }
-        if (wallet_password.empty()) {
-            if (const char* e = std::getenv("BOPWIRE_WALLET_PASSWORD")) wallet_password = e;
-        }
-        if (wallet_password.empty()) wallet_password = g_wallet_password_cfg;
-        if (wallet_password.empty()) {
-            std::cerr << "[wallet] --wallet-file given but no password "
-                         "(--wallet-password / --wallet-password-file / "
-                         "$BOPWIRE_WALLET_PASSWORD / config wallet_password)\n";
-        } else {
-            import_wallet_keystore(cfg.data_dir, wallet_file, wallet_password);
-            std::fill(wallet_password.begin(), wallet_password.end(), '\0');
+    if (wallet_password.empty() && !wallet_password_file.empty()) {
+        std::ifstream pf(wallet_password_file);
+        if (pf) {
+            std::getline(pf, wallet_password);
+            while (!wallet_password.empty() &&
+                   (wallet_password.back() == '\r' || wallet_password.back() == '\n'))
+                wallet_password.pop_back();
         }
     }
+    if (wallet_password.empty()) {
+        if (const char* e = std::getenv("BOPWIRE_WALLET_PASSWORD")) wallet_password = e;
+    }
+    if (wallet_password.empty()) wallet_password = g_wallet_password_cfg;
 
     std::cout << "[node] data_dir : " << cfg.data_dir << "\n";
     std::cout << "[node] rats port: " << cfg.rats_port
@@ -406,10 +398,23 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     std::cerr << "[dbg] database opened\n";
     std::cout << "[node] database opened\n";
 
-    // Load or generate keypair
-    std::cerr << "[dbg] loading keypair\n";
-    auto keypair = mc::crypto::load_or_generate_node_keypair(cfg.data_dir + "/keys");
-    std::cerr << "[dbg] keypair loaded\n";
+    // Node identity = a PASSWORD-PROTECTED PORTABLE wallet (encrypted keystore).
+    // First run interactively -> a TUI wizard creates/imports it; headless ->
+    // loaded from the keystore with the wallet password (--wallet-password /
+    // config). Replaces the old auto-generated node.key.
+    std::cerr << "[dbg] loading node identity wallet\n";
+    auto kp_opt = mc::load_or_setup_node_identity(
+        cfg.data_dir, wallet_file, wallet_password, tui_mode, "full node");
+    std::fill(wallet_password.begin(), wallet_password.end(), '\0');
+    if (!kp_opt) {
+        std::cerr << "[node] FATAL: no usable node wallet. Run once interactively "
+                     "to create one,\n           or set wallet_file + "
+                     "wallet_password in config.json.\n";
+        return 1;
+    }
+    auto keypair = *kp_opt;
+    std::cerr << "[dbg] node identity: "
+              << mc::crypto::to_checksum_hex(keypair.address) << "\n";
     cfg.node_id = mc::crypto::sha256(keypair.public_key.data(), 33);
     std::cout << "[node] node_id: " << mc::crypto::to_hex(cfg.node_id) << "\n";
     std::cout << "[node] address: " << mc::crypto::to_checksum_hex(keypair.address) << "\n";
