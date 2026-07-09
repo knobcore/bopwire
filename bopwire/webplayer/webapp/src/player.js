@@ -12,6 +12,7 @@
 //    on a genuine listen — same lifecycle as the native player.
 import { apiPost, streamUrl } from './api'
 import { GATEWAY } from './config'
+import { listenerWallet } from './wallet'   // Phase 3c: stable browser identity
 
 class Player {
   constructor() {
@@ -189,7 +190,8 @@ class Player {
   async startPlay(song) {
     this.stopHeartbeat(); this.playId = null
     try {
-      const r = await apiPost('/api/play/start', { contentHash: song.contentHash })
+      const r = await apiPost('/api/play/start',
+        { contentHash: song.contentHash, playerAddress: listenerWallet.address })
       if (this.song?.contentHash === song.contentHash) {
         this.playId = r.playId
         this.hbTimer = setInterval(() => {

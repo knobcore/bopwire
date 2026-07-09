@@ -10,7 +10,9 @@
   },
   "dependencies": {
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "@noble/secp256k1": "^2.1.0",
+    "@noble/hashes": "^1.4.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.8",

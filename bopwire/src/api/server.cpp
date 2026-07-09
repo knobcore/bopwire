@@ -633,7 +633,18 @@ std::pair<int, std::string> HttpServer::post_session_start(const std::string& bo
         static AcceptAllVerifier g_verifier;
         AttestationResult att = g_verifier.verify(
             j.value("attestation", json::object()), std::string(), std::string());
-        const std::string dev = att.device_id;   // "" => unidentifiable client
+        std::string dev = att.device_id;   // "" => unidentifiable client
+        // Phase 3c (attribution-only): a browser has no hardware attestation, so
+        // fall back to its PERSISTENT listener wallet (arrives as tracking_address)
+        // as the per-device cap key. This turns the previously uncapped web-play
+        // identity into a stable, per-browser-wallet capped one — closing the
+        // 0x000 seeder/mini farming hole (combined with the gateway per-IP layer
+        // to bound sybil). It is a CAP KEY ONLY, never a payout: the gateway keeps
+        // player_address = 0x000, so the web listener still earns nothing.
+        if (dev.empty()) {
+            const std::string track = j.value("tracking_address", std::string());
+            if (track.size() >= 8) dev = "web:" + track;
+        }
 
         // UTC day bucket, bound ONCE here and carried on the session; clamped
         // non-decreasing per device so a backward server clock step can't reset
