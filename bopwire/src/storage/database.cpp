@@ -474,6 +474,24 @@ std::optional<SongSection> Database::get_song_section(const Hash256& ch) const {
     return blk.song;
 }
 
+std::array<uint16_t, 1024> Database::scan_state_accumulator() const {
+    std::array<uint16_t, 1024> vec{};
+    auto fold = [&](const std::string& k, const std::vector<uint8_t>& v) {
+        const auto add = StateAccumulator::leaf(k, v);
+        for (int i = 0; i < 1024; ++i) vec[i] = static_cast<uint16_t>(vec[i] + add[i]);
+    };
+    for (const char* p : kStatePrefixes) {
+        auto* it = db_->NewIterator(leveldb::ReadOptions());
+        for (it->Seek(p); it->Valid() && it->key().starts_with(p); it->Next())
+            fold(it->key().ToString(),
+                 std::vector<uint8_t>(it->value().data(),
+                                      it->value().data() + it->value().size()));
+        delete it;
+    }
+    if (auto v = get("c:total_supply")) fold("c:total_supply", *v);
+    return vec;
+}
+
 std::vector<Hash256> Database::get_all_song_hashes() const {
     std::vector<Hash256> result;
     leveldb::ReadOptions opts;

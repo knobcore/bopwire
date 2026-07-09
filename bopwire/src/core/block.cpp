@@ -74,7 +74,8 @@ std::vector<uint8_t> BlockHeader::serialize() const {
     write_bytes(buf, fingerprint_hash.data(), 32);
     write_bytes(buf, content_hash.data(),     32);
     write_u64le(buf, timestamp_ms);
-    // Model 1 / format v3: no confirmations vector in the header.
+    // v4+: state_root folded into the block-hash preimage (P4).
+    if (version >= 4) write_bytes(buf, state_root.data(), 32);
     return buf;
 }
 
@@ -138,7 +139,10 @@ bool Block::deserialize(const uint8_t* data, size_t len, Block& out) {
     if (!read_bytes(p, end, out.header.fingerprint_hash.data(), 32)) return false;
     if (!read_bytes(p, end, out.header.content_hash.data(),     32)) return false;
     if (!read_u64le(p, end, out.header.timestamp_ms))               return false;
-    // Model 1 / format v3: no confirmations vector to read.
+    // v4+: read state_root (left zero for legacy v3, though the clean-slate
+    // fork means every block on the fresh chain is v4).
+    if (out.header.version >= 4 &&
+        !read_bytes(p, end, out.header.state_root.data(), 32))      return false;
 
     // --- Optional song record ---
     if (p >= end) return false;

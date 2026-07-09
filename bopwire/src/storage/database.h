@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <array>
 
 namespace mc {
 
@@ -159,6 +160,12 @@ public:
     // carry artist_address or royalty_splits). Returns nullopt if the song is
     // not on chain or its block carries no song section.
     std::optional<SongSection> get_song_section(const Hash256& ch) const;
+
+    // P4: fold every live STATE leaf (kStatePrefixes + c:total_supply) into a
+    // fresh LtHash accumulator vector. Used to (re)derive committed_acc_ after a
+    // rebuild/reorg or a boot without sr:vec. O(state); order-independent so it
+    // byte-matches the incremental accumulator.
+    std::array<uint16_t, 1024> scan_state_accumulator() const;
 
     // ---- Moderator / deleted songs (m:, d:) --------------------------
     bool is_moderator(const Address& addr) const;

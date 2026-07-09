@@ -33,6 +33,11 @@ Chain::Chain(Database& db) : db_(db), ledger_(db_) {
         } catch (...) { /* skip malformed cp: key */ }
         return true;
     });
+    // P4: restore the committed state_root accumulator (empty on a fresh chain;
+    // rebuild_derived_state re-scans it after a reorg/replay).
+    working_acc_.db = &db_;
+    if (auto v = db_.get("sr:vec"))
+        committed_acc_ = StateAccumulator::deserialize_vec(*v);
 }
 
 bool Chain::checkpoint_ok(uint32_t height, const Hash256& hash) const {
@@ -151,6 +156,13 @@ bool Chain::connect_block(const Block& block) {
     for (int i = 0; i < 4; ++i) tip_val[32+i] = (new_height >> (8*i)) & 0xFF;
     db_.put_batch(batch, "t:tip", tip_val);
 
+    // P4: from here on, STATE writes (song index + apply_transactions) feed the
+    // working accumulator seeded from the tip's committed root. Set AFTER the
+    // early-return checkpoint check so a rejected block never leaves acc_ dangling.
+    working_acc_.copy_from(committed_acc_);
+    working_acc_.db = &db_;
+    db_.set_accumulator(&working_acc_);
+
     // Only song blocks populate the fingerprint / metadata / search
     // indexes. Heartbeat blocks (block.has_song == false) carry an
     // all-zero content_hash + empty fields; writing those would
@@ -170,12 +182,22 @@ bool Chain::connect_block(const Block& block) {
     }
 
     // Apply transactions
-    if (!apply_transactions(block, new_height, batch)) {
+    const bool tx_ok = apply_transactions(block, new_height, batch);
+    db_.set_accumulator(nullptr);   // P4: stop feeding — root now reflects post-apply state
+    if (!tx_ok) {
         std::cerr << "[chain] connect_block: apply_transactions failed at height "
                   << new_height << " with " << block.transactions.size()
                   << " tx\n";
         return false;
     }
+    // P4: gate the committed state_root, then persist the accumulator in the SAME
+    // batch so it falls or commits atomically with the block.
+    if (block.header.version >= 4 && working_acc_.root() != block.header.state_root) {
+        std::cerr << "[chain] connect_block: state_root mismatch at height "
+                  << new_height << "\n";
+        return false;
+    }
+    db_.put_batch(batch, "sr:vec", StateAccumulator::serialize_vec(working_acc_.vec));
 
     // Bug fix #6: drain the same txs from the mempool in the SAME batch
     // as the block-state writes. Used to be a separate
@@ -192,6 +214,7 @@ bool Chain::connect_block(const Block& block) {
     }
 
     if (!db_.write(batch)) return false;
+    committed_acc_ = working_acc_.vec;   // P4: promote the block's committed state_root
 
     // M2: the batch committed — now (and only now) promote any checkpoint pins
     // this block carried into the live set the fork-choice reads.
@@ -203,6 +226,34 @@ bool Chain::connect_block(const Block& block) {
     tip_.timestamp_ms = block.header.timestamp_ms;
     tip_.weight       = new_weight;
     return true;
+}
+
+Hash256 Chain::compute_candidate_state_root(const Block& block) {
+    std::lock_guard<std::mutex> lk(mu_);
+    // Trial-apply this block's STATE writes against a COPY of the committed
+    // accumulator, into a THROWAWAY batch, and return the resulting root. Mirrors
+    // exactly the state writes connect_block performs (song index + txs); the
+    // accumulator hook filters non-state keys. This is the committed root the
+    // producer stamps into the header, which connect_block then re-derives and
+    // asserts. The trial mutates ledger_/staging, but connect_block's
+    // apply_transactions resets them before the real apply.
+    StateAccumulator acc;
+    acc.copy_from(committed_acc_);
+    acc.db = &db_;
+    db_.set_accumulator(&acc);
+    leveldb::WriteBatch throwaway;
+    const uint32_t h = tip_.height + 1;
+    if (block.has_song) {
+        db_.put_fingerprint(throwaway, block.song);
+        db_.put_song_meta(throwaway, block.song.content_hash, block.song);
+        db_.add_to_artist_index(throwaway, block.song.artist, block.song.content_hash);
+        db_.add_to_genre_index(throwaway, block.song.genre, block.song.content_hash);
+        db_.set_content_height(throwaway, block.song.content_hash, h);
+    }
+    apply_transactions(block, h, throwaway);
+    const Hash256 root = acc.root();
+    db_.set_accumulator(nullptr);
+    return root;
 }
 
 bool Chain::apply_transfer(const TransferTx& tx, leveldb::WriteBatch& batch) {
@@ -1729,6 +1780,10 @@ bool Chain::rebuild_derived_state() {
         } catch (...) {}
         return true;
     });
+    // P4: re-derive committed_acc_ from the rebuilt state so the next
+    // connect_block's state_root gate uses the correct baseline, and persist it.
+    committed_acc_ = db_.scan_state_accumulator();
+    db_.put("sr:vec", StateAccumulator::serialize_vec(committed_acc_));
     return true;
 }
 

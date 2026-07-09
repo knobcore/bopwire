@@ -26,7 +26,7 @@ namespace mc {
 // Heartbeat blocks (no fingerprint submissions in 5 minutes) ship with
 // has_song == 0; the SongSection is empty and only the tx pool is
 // carried.
-static constexpr uint32_t BLOCK_VERSION      = 3;
+static constexpr uint32_t BLOCK_VERSION      = 4;   // v4: header carries state_root (P4)
 static constexpr uint8_t  SEPARATOR_BYTE     = 0xFF;
 static constexpr size_t   SEPARATOR_LENGTH   = 8;
 
@@ -40,7 +40,7 @@ static constexpr uint64_t MAX_BLOCK_SIZE     = 2097152;   // 2 MiB
 // rollback. A bopwire signature is NEVER replayable on Ethereum,
 // BSC, Base, etc. because their chain_id contributes to the sign-hash
 // preimage and ours doesn't match any of theirs.
-static constexpr uint32_t MC_CHAIN_ID        = 19779;
+static constexpr uint32_t MC_CHAIN_ID        = 19780;   // bumped with the v4 clean-slate fork (P4)
 
 // ---- Basic types -----------------------------------------------------
 
@@ -169,6 +169,10 @@ struct BlockHeader {
     Hash256                    fingerprint_hash{}; // zero on heartbeat
     Hash256                    content_hash{};     // zero on heartbeat
     uint64_t                   timestamp_ms     = 0;
+    // P4 (v4+): committed LtHash root of the whole ledger state AFTER this block
+    // applies. The producer stamps it; every node recomputes and rejects on
+    // mismatch. Folded into the block-hash preimage (serialize below).
+    Hash256                    state_root{};
     // Model 1 (vote-free deterministic consensus): the header carries NO
     // validator confirmations. Canonicality is re-derived by every node
     // from content + history (fingerprint_hash, merkle_root, prev_hash,

@@ -4,6 +4,7 @@
 #include "transaction.h"
 #include "../storage/database.h"
 #include "../tokens/ledger.h"   // block-scoped Ledger member (C2 overlay)
+#include "../storage/accumulator.h"   // block-scoped state_root accumulator (P4)
 #include <optional>
 #include <string>
 #include <map>
@@ -165,6 +166,12 @@ public:
     // Updates tip, balances, song state, fingerprint index atomically.
     bool connect_block(const Block& block);
 
+    // P4: trial-apply `block` against a copy of committed_acc_ (no commit) and
+    // return the resulting committed state_root. The producer calls this to stamp
+    // block.header.state_root BEFORE the header is hashed; connect_block then
+    // re-derives + asserts equality. Holds mu_.
+    Hash256 compute_candidate_state_root(const Block& block);
+
     // Disconnect the most recent block (for reorg support).
     bool disconnect_block();
 
@@ -318,6 +325,11 @@ private:
     // writes through it, so two txs in one block see each other's staged effects
     // (no double-spend / supply clobber). Block-apply is serialized under mu_.
     Ledger    ledger_;
+    // P4 committed state_root accumulator (LtHash of the whole state at the tip)
+    // + the block-scoped working copy used during apply. committed_acc_ is loaded
+    // from sr:vec at construction; working_acc_ is reset from it at each block.
+    std::array<uint16_t, 1024> committed_acc_{};
+    StateAccumulator           working_acc_;
     ChainTip  tip_{};
 
     // Effective checkpoint set (#7): seeded from hardcoded_checkpoints()

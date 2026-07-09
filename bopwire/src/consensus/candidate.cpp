@@ -158,6 +158,12 @@ bool CandidateManager::commit_block(
     (void)keypair;
     (void)consumed_txs;
 
+    // P4: stamp the committed state_root this block will yield BEFORE connect_block
+    // re-derives + asserts it, and BEFORE the header is hashed (state_root is
+    // folded into the block-hash preimage). Producer path only; peers recompute.
+    if (block.header.version >= 4)
+        block.header.state_root = chain.compute_candidate_state_root(block);
+
     if (!chain.connect_block(block)) {
         err = "Chain connect_block rejected";
         return false;
