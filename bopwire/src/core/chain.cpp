@@ -636,7 +636,7 @@ bool Chain::apply_relay_reward(const RelayRewardTx& tx,
     // Hard supply cap — Ledger::credit bumps total_supply, so relay rewards
     // inflate supply; reject rather than overshoot SUPPLY_CAP.
     {
-        uint64_t current_supply = ledger.total_supply();   // C2: overlay-aware
+        uint64_t current_supply = ledger_.total_supply();   // C2: overlay-aware
         if (current_supply + amount > SUPPLY_CAP) {
             std::cerr << "[chain] relay_reward reject: would exceed SUPPLY_CAP\n";
             return false;
@@ -1023,7 +1023,7 @@ bool Chain::execute_proposal(const ProposalTx& prop,
             // overruns the balance just transfers what's there
             // instead of failing the whole tx.
             const Address escrow = crypto::escrow_address_for(prop.target_addr);
-            uint64_t balance     = ledger.balance(escrow);   // C2: overlay-aware
+            uint64_t balance     = ledger_.balance(escrow);   // C2: overlay-aware
             uint64_t to_send     = std::min(balance, prop.amount);
             if (to_send == 0) {
                 // Nothing to release — still flip status so the
