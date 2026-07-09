@@ -193,6 +193,11 @@ bool Chain::connect_block(const Block& block) {
 
     if (!db_.write(batch)) return false;
 
+    // M2: the batch committed — now (and only now) promote any checkpoint pins
+    // this block carried into the live set the fork-choice reads.
+    for (const auto& [h, hh] : pending_checkpoints_) checkpoints_[h] = hh;
+    pending_checkpoints_.clear();
+
     tip_.hash         = hash;
     tip_.height       = new_height;
     tip_.timestamp_ms = block.header.timestamp_ms;
@@ -236,6 +241,7 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
     proposal_votes_in_block_.clear();
     applied_nonce_in_block_.clear();
     sessions_used_in_block_.clear();
+    pending_checkpoints_.clear();   // M2: staged pins, merged only post-commit
     ledger_.reset();   // C2: fresh block-scoped balance/supply overlay
 
     for (const auto& raw_tx : block.transactions) {
@@ -714,7 +720,7 @@ bool Chain::apply_checkpoint(const CheckpointTx& tx, leveldb::WriteBatch& batch)
     // until restart re-derives checkpoints_ from cp:; harmless for the founder-
     // only, producer-pre-validated checkpoint path — flagged for the adversarial
     // pass.)
-    checkpoints_[tx.height] = tx.block_hash;
+    pending_checkpoints_[tx.height] = tx.block_hash;   // M2: merged post-commit
     db_.put_batch(batch, "cp:" + std::to_string(tx.height),
                   std::vector<uint8_t>(tx.block_hash.begin(), tx.block_hash.end()));
     db_.set_nonce(batch, tx.issuer_address, expected + 1);
@@ -1710,6 +1716,19 @@ bool Chain::rebuild_derived_state() {
             v[32 + i] = static_cast<uint8_t>((tip_.height >> (8*i)) & 0xff);
         db_.put("t:tip", v);
     }
+    // M2: re-derive the live checkpoint set from the persisted cp: after a
+    // replay (a reorg may have adopted a branch that pinned a new checkpoint;
+    // the in-memory set is otherwise only refreshed at construction).
+    db_.for_each_with_prefix("cp:", [this](const std::string& key,
+                                           const std::string& val) {
+        if (val.size() != 32) return true;
+        try {
+            uint32_t h = static_cast<uint32_t>(std::stoul(key.substr(3)));
+            Hash256 hh{}; std::memcpy(hh.data(), val.data(), 32);
+            checkpoints_[h] = hh;
+        } catch (...) {}
+        return true;
+    });
     return true;
 }
 

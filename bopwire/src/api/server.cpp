@@ -242,6 +242,17 @@ void HttpServer::settle_epoch_sweep() {
     });
     for (auto& [epoch, proofs] : by_epoch) {
         if (proofs.empty()) continue;
+        // M3: drop the accrual scratch ONLY once the settlement is durable on
+        // chain (us: marker written by apply_settlement_mint). Until then we
+        // (re-)emit idempotently (tx_hash dedup) and KEEP the scratch, so a
+        // settlement that failed at block-build (missing v:/body/underfunded) is
+        // never silently lost with its accrued plays.
+        const std::string us_key =
+            "us:" + db_.hex(config_.node_id) + ":" + std::to_string(epoch);
+        if (db_.get(us_key).has_value()) {
+            for (const auto& k : keys_by_epoch[epoch]) db_.del(k);
+            continue;
+        }
         std::sort(proofs.begin(), proofs.end(),
                   [](const PlayProof& a, const PlayProof& b) {
             int c = std::memcmp(a.content_hash.data(), b.content_hash.data(), 32);
@@ -270,10 +281,10 @@ void HttpServer::settle_epoch_sweep() {
                                   + "\",\"submit_ms\":" + std::to_string(now) + "}";
             ingest_tx_cb_(env);
         }
-        // Drop the accrual scratch for this settled epoch.
-        for (const auto& k : keys_by_epoch[epoch]) db_.del(k);
+        // NOTE: scratch is NOT dropped here (M3) — it is kept until the us:
+        // durability marker appears (checked at the top of the next sweep).
         std::cout << "[settle] emitted SETTLEMENT_MINT epoch " << epoch
-                  << " with " << proofs.size() << " plays\n";
+                  << " with " << proofs.size() << " plays (scratch kept until durable)\n";
     }
 }
 

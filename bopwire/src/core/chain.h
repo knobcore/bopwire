@@ -325,6 +325,11 @@ private:
     // height so checkpoint_ok() is an O(log n) lookup. Empty today (no
     // audited mainnet height yet) → the gate is a no-op until populated.
     std::map<uint32_t, Hash256> checkpoints_;
+    // M2: a CheckpointTx stages its pin here during apply_transactions and it is
+    // merged into checkpoints_ ONLY after the block's batch commits — so a block
+    // that fails a later tx can't leave a phantom (restart-only) checkpoint pin
+    // that makes block acceptance restart-dependent. Cleared per block.
+    std::map<uint32_t, Hash256> pending_checkpoints_;
 
     // Returns true unless `height` is a checkpoint AND `hash` differs from
     // the pinned value. A height with no checkpoint always passes. This is
