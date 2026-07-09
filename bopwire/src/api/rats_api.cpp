@@ -3349,6 +3349,16 @@ bool tx_preflight_ok(const std::vector<uint8_t>& raw, const Database& db) {
             return RelayRewardTx::deserialize(raw.data(), raw.size(), tx)
                 && tx.verify_signature();
         }
+        case TxType::NODE_AUTH: {
+            NodeAuthTx tx;
+            return NodeAuthTx::deserialize(raw.data(), raw.size(), tx)
+                && tx.verify_signature();   // founder-ness re-checked at apply
+        }
+        case TxType::CHECKPOINT: {
+            CheckpointTx tx;
+            return CheckpointTx::deserialize(raw.data(), raw.size(), tx)
+                && tx.verify_signature();   // founder-ness re-checked at apply
+        }
         default:
             return false;
     }

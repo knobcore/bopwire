@@ -19,6 +19,19 @@ Chain::Chain(Database& db) : db_(db) {
     // Seed the effective checkpoint set from the baked-in list (#7).
     for (const auto& c : hardcoded_checkpoints())
         checkpoints_[c.height] = c.hash;
+    // Phase 2: restore founder-signed checkpoints persisted under cp:<height>
+    // by apply_checkpoint, so the finality pins survive a restart.
+    db_.for_each_with_prefix("cp:", [this](const std::string& key,
+                                           const std::string& val) {
+        if (val.size() != 32) return true;
+        try {
+            uint32_t h = static_cast<uint32_t>(std::stoul(key.substr(3)));
+            Hash256 hash{};
+            std::memcpy(hash.data(), val.data(), 32);
+            checkpoints_[h] = hash;
+        } catch (...) { /* skip malformed cp: key */ }
+        return true;
+    });
 }
 
 bool Chain::checkpoint_ok(uint32_t height, const Hash256& hash) const {
@@ -279,6 +292,22 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
             }
             if (!apply_relay_reward(rr, batch)) {
                 std::cerr << "[chain] apply: RELAY_REWARD apply failed\n"; return false;
+            }
+        } else if (type == TxType::NODE_AUTH) {
+            NodeAuthTx na;
+            if (!NodeAuthTx::deserialize(raw_tx.data(), raw_tx.size(), na)) {
+                std::cerr << "[chain] apply: NODE_AUTH deserialize failed\n"; return false;
+            }
+            if (!apply_node_auth(na, batch)) {
+                std::cerr << "[chain] apply: NODE_AUTH apply failed\n"; return false;
+            }
+        } else if (type == TxType::CHECKPOINT) {
+            CheckpointTx cp;
+            if (!CheckpointTx::deserialize(raw_tx.data(), raw_tx.size(), cp)) {
+                std::cerr << "[chain] apply: CHECKPOINT deserialize failed\n"; return false;
+            }
+            if (!apply_checkpoint(cp, batch)) {
+                std::cerr << "[chain] apply: CHECKPOINT apply failed\n"; return false;
             }
         } else {
             std::cerr << "[chain] apply: unknown TxType " << static_cast<int>(type) << "\n";
@@ -585,6 +614,74 @@ bool Chain::apply_relay_reward(const RelayRewardTx& tx,
     std::cout << "[chain] RELAY_REWARD: +" << amount << " units ("
               << (amount / 100'000'000ull) << "." << ((amount / 1'000'000ull) % 100)
               << " MC) to " << db_.hex(tx.target_address).substr(0, 12) << "…\n";
+    return true;
+}
+
+// ---- Node authorization (Phase 2: permissioned v: registry) ---------
+
+bool Chain::apply_node_auth(const NodeAuthTx& tx, leveldb::WriteBatch& batch) {
+    if (!tx.verify_signature()) {
+        std::cerr << "[chain] node_auth reject: issuer signature invalid\n"; return false;
+    }
+    // Only the founder may grant/revoke validators (Phase 2). Later a
+    // moderator-quorum path can widen this — same shape as escrow release.
+    auto founder = db_.get_founder();
+    if (!founder.has_value() ||
+        std::memcmp(founder->data(), tx.issuer_address.data(), 20) != 0) {
+        std::cerr << "[chain] node_auth reject: issuer is not the founder\n"; return false;
+    }
+    uint64_t expected = next_expected_nonce(tx.issuer_address);
+    if (tx.nonce != expected) {
+        std::cerr << "[chain] node_auth reject: nonce mismatch\n"; return false;
+    }
+    // node_id MUST equal sha256(node_pubkey) — the identity is derived from the
+    // key, so a grant can't bind an attacker key to a victim's node_id, and
+    // check_play's v:[serving_node_id] lookup gets exactly the signing key.
+    Hash256 derived_id = crypto::sha256(tx.node_pubkey.data(), 33);
+    if (std::memcmp(derived_id.data(), tx.node_id.data(), 32) != 0) {
+        std::cerr << "[chain] node_auth reject: node_id != sha256(pubkey)\n"; return false;
+    }
+    const std::string key = "v:" + db_.hex(tx.node_id);
+    if (tx.authorize)
+        db_.put_batch(batch, key,
+                      std::vector<uint8_t>(tx.node_pubkey.begin(), tx.node_pubkey.end()));
+    else
+        batch.Delete(key);
+    db_.set_nonce(batch, tx.issuer_address, expected + 1);
+    record_applied_nonce(tx.issuer_address, expected + 1);
+    std::cout << "[chain] NODE_AUTH: " << (tx.authorize ? "grant" : "revoke")
+              << " v:" << db_.hex(tx.node_id).substr(0, 12) << "…\n";
+    return true;
+}
+
+// ---- Signed checkpoint (Phase 2: finality pin) ----------------------
+
+bool Chain::apply_checkpoint(const CheckpointTx& tx, leveldb::WriteBatch& batch) {
+    if (!tx.verify_signature()) {
+        std::cerr << "[chain] checkpoint reject: issuer signature invalid\n"; return false;
+    }
+    auto founder = db_.get_founder();
+    if (!founder.has_value() ||
+        std::memcmp(founder->data(), tx.issuer_address.data(), 20) != 0) {
+        std::cerr << "[chain] checkpoint reject: issuer is not the founder\n"; return false;
+    }
+    uint64_t expected = next_expected_nonce(tx.issuer_address);
+    if (tx.nonce != expected) {
+        std::cerr << "[chain] checkpoint reject: nonce mismatch\n"; return false;
+    }
+    // Pin the checkpoint. Persisted (cp:) so it survives restart, and mirrored
+    // into the in-memory map that checkpoint_ok()/reorg_to_branch read. (A block
+    // that fails to fully apply after this point leaves a stale in-memory pin
+    // until restart re-derives checkpoints_ from cp:; harmless for the founder-
+    // only, producer-pre-validated checkpoint path — flagged for the adversarial
+    // pass.)
+    checkpoints_[tx.height] = tx.block_hash;
+    db_.put_batch(batch, "cp:" + std::to_string(tx.height),
+                  std::vector<uint8_t>(tx.block_hash.begin(), tx.block_hash.end()));
+    db_.set_nonce(batch, tx.issuer_address, expected + 1);
+    record_applied_nonce(tx.issuer_address, expected + 1);
+    std::cout << "[chain] CHECKPOINT: pinned height " << tx.height << " = "
+              << db_.hex(tx.block_hash).substr(0, 12) << "…\n";
     return true;
 }
 

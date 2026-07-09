@@ -460,6 +460,111 @@ bool RelayRewardTx::verify_signature() const {
     return crypto::verify_ecdsa(hash, signature, issuer_pubkey);
 }
 
+// ---- NodeAuthTx (Phase 2) -------------------------------------------
+
+std::vector<uint8_t> NodeAuthTx::sign_message() const {
+    std::vector<uint8_t> msg;
+    write_u32le(msg, MC_CHAIN_ID);
+    write_bytes(msg, node_id.data(),        32);
+    write_bytes(msg, node_pubkey.data(),    33);
+    msg.push_back(authorize);
+    write_bytes(msg, issuer_address.data(), 20);
+    write_bytes(msg, issuer_pubkey.data(),  33);
+    write_u64le(msg, nonce);
+    return msg;
+}
+
+std::vector<uint8_t> NodeAuthTx::serialize() const {
+    std::vector<uint8_t> buf;
+    buf.push_back(static_cast<uint8_t>(TxType::NODE_AUTH));
+    write_bytes(buf, node_id.data(),        32);
+    write_bytes(buf, node_pubkey.data(),    33);
+    buf.push_back(authorize);
+    write_bytes(buf, issuer_address.data(), 20);
+    write_bytes(buf, issuer_pubkey.data(),  33);
+    write_u64le(buf, nonce);
+    write_bytes(buf, signature.data(),      64);
+    return buf;
+}
+
+bool NodeAuthTx::deserialize(const uint8_t* data, size_t len, NodeAuthTx& out) {
+    const uint8_t* p   = data;
+    const uint8_t* end = data + len;
+    if (p >= end || *p++ != static_cast<uint8_t>(TxType::NODE_AUTH)) return false;
+    if (!read_bytes(p, end, out.node_id.data(),        32)) return false;
+    if (!read_bytes(p, end, out.node_pubkey.data(),    33)) return false;
+    if (p >= end) return false; out.authorize = *p++;
+    if (!read_bytes(p, end, out.issuer_address.data(), 20)) return false;
+    if (!read_bytes(p, end, out.issuer_pubkey.data(),  33)) return false;
+    if (!read_u64le(p, end, out.nonce))                    return false;
+    if (!read_bytes(p, end, out.signature.data(),      64)) return false;
+    return true;
+}
+
+Hash256 NodeAuthTx::tx_hash() const {
+    auto raw = serialize();
+    return crypto::sha256(raw.data(), raw.size());
+}
+
+bool NodeAuthTx::verify_signature() const {
+    auto msg  = sign_message();
+    auto hash = crypto::sha256(msg.data(), msg.size());
+    Address derived = crypto::address_from_pubkey(issuer_pubkey);
+    if (std::memcmp(derived.data(), issuer_address.data(), 20) != 0) return false;
+    return crypto::verify_ecdsa(hash, signature, issuer_pubkey);
+}
+
+// ---- CheckpointTx (Phase 2) -----------------------------------------
+
+std::vector<uint8_t> CheckpointTx::sign_message() const {
+    std::vector<uint8_t> msg;
+    write_u32le(msg, MC_CHAIN_ID);
+    write_u32le(msg, height);
+    write_bytes(msg, block_hash.data(),     32);
+    write_bytes(msg, issuer_address.data(), 20);
+    write_bytes(msg, issuer_pubkey.data(),  33);
+    write_u64le(msg, nonce);
+    return msg;
+}
+
+std::vector<uint8_t> CheckpointTx::serialize() const {
+    std::vector<uint8_t> buf;
+    buf.push_back(static_cast<uint8_t>(TxType::CHECKPOINT));
+    write_u32le(buf, height);
+    write_bytes(buf, block_hash.data(),     32);
+    write_bytes(buf, issuer_address.data(), 20);
+    write_bytes(buf, issuer_pubkey.data(),  33);
+    write_u64le(buf, nonce);
+    write_bytes(buf, signature.data(),      64);
+    return buf;
+}
+
+bool CheckpointTx::deserialize(const uint8_t* data, size_t len, CheckpointTx& out) {
+    const uint8_t* p   = data;
+    const uint8_t* end = data + len;
+    if (p >= end || *p++ != static_cast<uint8_t>(TxType::CHECKPOINT)) return false;
+    if (!read_u32le(p, end, out.height))                   return false;
+    if (!read_bytes(p, end, out.block_hash.data(),     32)) return false;
+    if (!read_bytes(p, end, out.issuer_address.data(), 20)) return false;
+    if (!read_bytes(p, end, out.issuer_pubkey.data(),  33)) return false;
+    if (!read_u64le(p, end, out.nonce))                    return false;
+    if (!read_bytes(p, end, out.signature.data(),      64)) return false;
+    return true;
+}
+
+Hash256 CheckpointTx::tx_hash() const {
+    auto raw = serialize();
+    return crypto::sha256(raw.data(), raw.size());
+}
+
+bool CheckpointTx::verify_signature() const {
+    auto msg  = sign_message();
+    auto hash = crypto::sha256(msg.data(), msg.size());
+    Address derived = crypto::address_from_pubkey(issuer_pubkey);
+    if (std::memcmp(derived.data(), issuer_address.data(), 20) != 0) return false;
+    return crypto::verify_ecdsa(hash, signature, issuer_pubkey);
+}
+
 // ---- SlashTx --------------------------------------------------------
 
 std::vector<uint8_t> SlashTx::sign_message() const {

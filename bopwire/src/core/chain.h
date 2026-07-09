@@ -276,6 +276,17 @@ public:
     bool apply_relay_reward(const RelayRewardTx& tx,
                             leveldb::WriteBatch& batch);
 
+    // Node authorization (Phase 2) — founder grants/revokes a validator in the
+    // on-chain v: registry that check_play/validate_mint read. Founder-signed,
+    // nonce-protected; node_id must equal sha256(node_pubkey).
+    bool apply_node_auth(const NodeAuthTx& tx, leveldb::WriteBatch& batch);
+
+    // Signed checkpoint (Phase 2) — founder pins {height, block_hash} into the
+    // checkpoint set (persisted cp: + in-memory checkpoints_) so a costless
+    // heavier fork can't rewrite history across it. Founder-signed, nonce-
+    // protected.
+    bool apply_checkpoint(const CheckpointTx& tx, leveldb::WriteBatch& batch);
+
     // Has this address been slashed? Used by the consensus path that
     // tallies confirmations — slashed addresses' votes return zero
     // weight. Reads the "slashed:" prefix in the DB.

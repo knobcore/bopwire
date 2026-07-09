@@ -14,6 +14,9 @@ enum class TxType : uint8_t {
     USERNAME_REGISTER    = 0x40,
     SLASH                = 0x50,
     RELAY_REWARD         = 0x60,
+    NODE_AUTH            = 0x70,   // founder authorizes/revokes a validator in v: (Phase 2)
+    CHECKPOINT           = 0x71,   // founder-signed {height, block_hash} finality pin (Phase 2)
+    SETTLEMENT_MINT      = 0x72,   // batched, recompute-authoritative play settlement (Phase 3)
 };
 
 // Sub-kinds of evidence carried inside a SlashTx. Two payload shapes for
@@ -292,6 +295,59 @@ struct RelayRewardTx {
     std::vector<uint8_t> serialize() const;
     static bool deserialize(const uint8_t* data, size_t len, RelayRewardTx& out);
 
+    std::vector<uint8_t> sign_message() const;
+    Hash256              tx_hash() const;
+    bool                 verify_signature() const;
+};
+
+// ---- Node authorization (permissioned v: registry) — Phase 2 --------
+//
+// Founder-signed grant/revoke of a node's right to sign play proofs (and thus
+// mint). On apply, authorize=1 writes v:<node_id> = node_pubkey(33); authorize=0
+// deletes it. This makes the validator set an on-chain, replicated, founder-
+// controlled fact instead of the Phase-1 node-local self-registration, so a
+// forged play from an unauthorized node fails validate_mint on EVERY node.
+//
+// Wire (little-endian):
+//   u8 NODE_AUTH | Hash256 node_id | PubKey33 node_pubkey | u8 authorize |
+//   Address(20) issuer_address | PubKey33 issuer_pubkey | u64 nonce | Sig64 sig
+struct NodeAuthTx {
+    Hash256  node_id{};
+    PubKey33 node_pubkey{};
+    uint8_t  authorize = 1;        // 1 = grant, 0 = revoke
+    Address  issuer_address{};
+    PubKey33 issuer_pubkey{};
+    uint64_t nonce = 0;
+    Sig64    signature{};
+
+    std::vector<uint8_t> serialize() const;
+    static bool deserialize(const uint8_t* data, size_t len, NodeAuthTx& out);
+    std::vector<uint8_t> sign_message() const;
+    Hash256              tx_hash() const;
+    bool                 verify_signature() const;   // pubkey→address bind only
+};
+
+// ---- Signed checkpoint (finality pin) — Phase 2 ---------------------
+//
+// Founder-signed {height, block_hash}. On apply it pins checkpoints_[height];
+// reorg_to_branch and the replay both already refuse any branch whose block at
+// a pinned height mismatches, so a costless heavier fork can't rewrite history
+// across a checkpoint. Combined with the Phase-0 FINALITY_DEPTH cap this is the
+// finality half of the sybil defense.
+//
+// Wire (little-endian):
+//   u8 CHECKPOINT | u32 height | Hash256 block_hash | Address(20) issuer_address
+//   | PubKey33 issuer_pubkey | u64 nonce | Sig64 sig
+struct CheckpointTx {
+    uint32_t height = 0;
+    Hash256  block_hash{};
+    Address  issuer_address{};
+    PubKey33 issuer_pubkey{};
+    uint64_t nonce = 0;
+    Sig64    signature{};
+
+    std::vector<uint8_t> serialize() const;
+    static bool deserialize(const uint8_t* data, size_t len, CheckpointTx& out);
     std::vector<uint8_t> sign_message() const;
     Hash256              tx_hash() const;
     bool                 verify_signature() const;
