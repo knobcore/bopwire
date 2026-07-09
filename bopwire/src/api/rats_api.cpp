@@ -10,6 +10,7 @@
 #include "../net/relay_credit_tracker.h"
 #include "../curation/collection_curator.h"
 #include "../core/transaction.h"
+#include "../core/merkle.h"     // merkle_root_bytes (settlement body root, Phase 3)
 #include "../tokens/ledger.h"   // Ledger::parse_balance for wallet.transfer flood
 #include "../tokens/mint.h"     // validate_mint (Phase 1 MINT preflight forge gate)
 
@@ -57,6 +58,7 @@ constexpr const char* MC_LIBRARY_TYPE = "bopwire.library";  // DB2 delta gossip
 constexpr const char* MC_PLAYLIST_TYPE = "bopwire.playlist"; // DB2 playlist gossip
 constexpr const char* MC_FPSUBMIT_TYPE = "bopwire.fpsubmit"; // shared song mempool flood
 constexpr const char* MC_TX_TYPE       = "bopwire.tx";       // shared tx mempool flood
+constexpr const char* MC_SETTLE_BODY   = "bopwire.settlebody"; // settlement companion-body flood (Phase 3)
 
 namespace {
 // Load the Shared Moderation Key recipient — (address, pubkey) — from
@@ -144,6 +146,8 @@ void RatsApi::start(rats_client_t client) {
                     &RatsApi::on_fpsubmit_cb, this);
     rats_on_message(client_, MC_TX_TYPE,
                     &RatsApi::on_tx_cb, this);
+    rats_on_message(client_, MC_SETTLE_BODY,
+                    &RatsApi::on_settle_body_cb, this);
     // Rebuild the producer's song buffer from the persisted sp: mempool so a
     // restart re-derives the identical build set.
     load_pending_songs_from_db_();
@@ -3422,6 +3426,50 @@ void RatsApi::on_tx_cb(void* user_data, const char* peer_id,
         self->ingest_tx(message_data, /*broadcast_if_new=*/true);
     } catch (const std::exception& e) {
         std::cerr << "[rats-api] tx handler threw: " << e.what() << "\n";
+    }
+    rats_string_free(peer_id);
+    rats_string_free(message_data);
+}
+
+bool RatsApi::ingest_settle_body(const std::string& body_hex, bool broadcast_if_new) {
+    const auto raw = crypto::from_hex(body_hex);
+    if (raw.empty()) return false;
+    std::vector<PlayProof> proofs;
+    if (!deserialize_settle_body(raw.data(), raw.size(), proofs)) return false;
+    if (proofs.empty()) return false;
+    // Canonical (content_hash, session_id) order → the Merkle root the
+    // SettlementMintTx commits to. Every node stores the SAME canonical bytes.
+    std::sort(proofs.begin(), proofs.end(), [](const PlayProof& a, const PlayProof& b) {
+        int c = std::memcmp(a.content_hash.data(), b.content_hash.data(), 32);
+        if (c != 0) return c < 0;
+        return std::memcmp(a.session_id.data(), b.session_id.data(), 32) < 0;
+    });
+    std::vector<std::vector<uint8_t>> leaves;
+    leaves.reserve(proofs.size());
+    for (const auto& pr : proofs) leaves.push_back(pr.serialize());
+    const Hash256 root = merkle_root_bytes(leaves);
+    const std::string key = "sb:" + crypto::to_hex(root);
+    if (db_.get(key).has_value()) return false;   // content-addressed dedup
+    const auto canon = serialize_settle_body(proofs);
+    db_.put(key, canon);
+    candidates_.wake();
+    if (broadcast_if_new && client_)
+        rats_broadcast_message(client_, MC_SETTLE_BODY, crypto::to_hex(canon).c_str());
+    return true;
+}
+
+void RatsApi::on_settle_body_cb(void* user_data, const char* peer_id,
+                                const char* message_data) {
+    auto* self = static_cast<RatsApi*>(user_data);
+    if (!self || !message_data) {
+        if (peer_id)      rats_string_free(peer_id);
+        if (message_data) rats_string_free(message_data);
+        return;
+    }
+    try {
+        self->ingest_settle_body(message_data, /*broadcast_if_new=*/true);
+    } catch (const std::exception& e) {
+        std::cerr << "[rats-api] settle-body handler threw: " << e.what() << "\n";
     }
     rats_string_free(peer_id);
     rats_string_free(message_data);

@@ -250,11 +250,21 @@ private:
     /// producer, and re-broadcasts on a new / lowered entry (invariant I1).
     static void on_tx_cb(void* user_data, const char* peer_id,
                          const char* message_data);
+    // Settlement companion-body flood (Phase 3): the fat PlayProof list a
+    // SETTLEMENT_MINT commits to by Merkle root. Verified against its root and
+    // stored under sb:<root> so apply_settlement_mint can recompute; re-flooded
+    // once (content-addressed dedup) and matured in the same window as the tx.
+    static void on_settle_body_cb(void* user_data, const char* peer_id,
+                                  const char* message_data);
 public:
     // Public: node_main's relay-reward sweep flows RelayRewardTx through the
     // same replicated mempool path (stamp pt: + flood) as wallet.transfer, so
     // the reward tx is consensus-eligible + identical across all full nodes.
     bool ingest_tx(const std::string& payload_json, bool broadcast_if_new);
+    // Public: the epoch-close worker (HttpServer) publishes a settlement's
+    // companion body through here (store sb:<root> + flood). Returns true if
+    // newly stored. body_hex = hex(serialize_settle_body(sorted proofs)).
+    bool ingest_settle_body(const std::string& body_hex, bool broadcast_if_new);
 private:
 
     /// Receive a moderation envelope from a peer (broadcast or sync push)
