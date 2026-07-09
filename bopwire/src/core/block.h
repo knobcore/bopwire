@@ -30,9 +30,25 @@ static constexpr uint32_t BLOCK_VERSION      = 4;   // v4: header carries state_
 static constexpr uint8_t  SEPARATOR_BYTE     = 0xFF;
 static constexpr size_t   SEPARATOR_LENGTH   = 8;
 
-// Maximum block size now that audio is off-chain — ~2 MiB easily covers
-// a full Dejavu constellation (~400 KB) plus thousands of transactions.
-static constexpr uint64_t MAX_BLOCK_SIZE     = 2097152;   // 2 MiB
+// ---- Consensus caps (Phase 5, pinned into the v4 clean-slate fork) ----
+//
+// These bound a block's size + tx count so the network can sustain the
+// 300M-tx/day / ~15k-tx/s target without any single block growing without
+// limit. They are HARD consensus rules: Block::validate() rejects an over-
+// cap block, and that check runs on both connect_block AND rebuild, so no
+// node — honest or malicious — can get an over-cap block accepted. Adding
+// them here (not later) keeps them inside the one v4 fork; introducing a
+// cap on a live chain would itself be a second consensus fork.
+//
+// MAX_BLOCK_SIZE doubles as the byte cap (bumped 2→8 MiB: 20k txs · ~200 B
+// ≈ 4 MiB leaves headroom for the song constellation + mint/settlement
+// bodies). MAX_TXS_PER_BLOCK is the count cap. MAX_TXS_PER_SENDER_PER_BLOCK
+// is the producer-side anti-starvation fairness cap (see candidate.cpp) —
+// it is NOT re-checked in validate() (a block that merely over-packs one
+// user is still valid, just unfair), so it never forks honest producers.
+static constexpr uint64_t MAX_BLOCK_SIZE     = 8u * 1024 * 1024;   // 8 MiB (byte cap)
+static constexpr uint32_t MAX_TXS_PER_BLOCK  = 20000;             // count cap
+static constexpr uint32_t MAX_TXS_PER_SENDER_PER_BLOCK = 256;     // producer fairness cap
 
 // Chain identifier mixed into every signed transaction (EIP-155 style).
 // Picked so it can't collide with any existing well-known EVM chain id:

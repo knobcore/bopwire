@@ -474,6 +474,68 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
             }
         }
 
+        // ---- Phase 5 step 4: per-sender anti-starvation cap --------------
+        //
+        // A funded address could otherwise pack a whole block with one long
+        // nonce run and starve everyone else — there are no fees to price
+        // that out. Meter only USER-authored txs; MINT / SETTLEMENT_MINT /
+        // RELAY_REWARD / NODE_AUTH / CHECKPOINT are system/privileged
+        // issuance (the reward throughput) and are exempt — they are bounded
+        // instead by the global count cap below. `included` is already sorted
+        // by (sender, nonce, hash), so a sender's txs are contiguous and the
+        // survivors are its lowest-nonce prefix ⇒ nonce-contiguous ⇒ the
+        // applicability gate directly below still sees a clean body. This is
+        // a producer-side fairness rule (deterministic across honest
+        // producers), not re-checked by Block::validate, so it never forks.
+        {
+            std::vector<TxSlot> capped;
+            capped.reserve(included.size());
+            Address  cur_sender{};
+            bool     have_cur = false;
+            uint32_t cur_count = 0;
+            for (auto& s : included) {
+                const TxType t = s.raw.empty() ? TxType::MINT
+                                               : static_cast<TxType>(s.raw[0]);
+                const bool metered = (t == TxType::TRANSFER ||
+                                      t == TxType::USERNAME_REGISTER ||
+                                      t == TxType::MODERATOR_PROPOSAL ||
+                                      t == TxType::MODERATOR_OP);
+                if (metered) {
+                    if (!have_cur || s.sender != cur_sender) {
+                        cur_sender = s.sender; have_cur = true; cur_count = 0;
+                    }
+                    if (++cur_count > MAX_TXS_PER_SENDER_PER_BLOCK) continue;
+                }
+                capped.push_back(std::move(s));
+            }
+            included = std::move(capped);
+        }
+
+        // ---- Phase 5 step 5: global count + byte take-prefix -------------
+        //
+        // Keep the canonical sorted prefix up to the count cap and a
+        // conservative byte budget (MAX_BLOCK_SIZE minus a fixed reserve for
+        // the song constellation + this block's mint/settlement bodies +
+        // header). Overflow stays in the mempool and is carried by the next
+        // block, which continues the same total-ordered prefix. The hard
+        // limit is Block::validate(); this keeps an honest producer's block
+        // under it in the first place.
+        {
+            constexpr uint64_t kReservedBytes = 1u * 1024 * 1024;
+            const uint64_t byte_budget =
+                MAX_BLOCK_SIZE > kReservedBytes ? MAX_BLOCK_SIZE - kReservedBytes : 0;
+            uint64_t cum = 0;
+            std::vector<TxSlot> capped;
+            capped.reserve(std::min<size_t>(included.size(), MAX_TXS_PER_BLOCK));
+            for (auto& s : included) {
+                if (capped.size() >= MAX_TXS_PER_BLOCK) break;
+                cum += s.raw.size();
+                if (cum > byte_budget) break;
+                capped.push_back(std::move(s));
+            }
+            included = std::move(capped);
+        }
+
         // ---- Applicability gate (LIVENESS bug-fix) -----------------------
         //
         // The pre-flight above only checks structure + signature, so a well-

@@ -222,6 +222,15 @@ Hash256 Block::full_hash(const std::vector<uint8_t>& serialized) {
 }
 
 bool Block::validate() const {
+    // ---- Phase 5 consensus caps (v4) ---------------------------------
+    // Reject an over-cap block before any other work. Enforced identically
+    // on connect_block AND rebuild, so an over-cap block is unacceptable
+    // network-wide, forever. transactions.size() is O(1); serialize() is
+    // O(block) but validate() already implies we're about to apply the
+    // whole block, so the extra pass is negligible.
+    if (transactions.size() > MAX_TXS_PER_BLOCK) return false;
+    if (serialize().size()  > MAX_BLOCK_SIZE)    return false;
+
     // Heartbeat blocks: no song record, header.fingerprint_hash and
     // header.content_hash must both be zero.
     if (!has_song) {
