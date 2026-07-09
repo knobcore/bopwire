@@ -37,17 +37,27 @@ PATH="$(echo "$PATH" | tr ':' '\n' | grep -vE '^/mnt/c/' | paste -sd: -)"
 export PATH
 unset CMAKE_PREFIX_PATH
 
+# Rust/cargo is REQUIRED here: the node's real album-art scraper (vendored sacad)
+# is a cargo-built static lib. Put ~/.cargo on PATH so cmake's find_program(cargo)
+# succeeds. Combined with -DMC_REQUIRE_ART=ON below, a shell without cargo now
+# FAILS the configure loudly instead of silently producing a node with no covers
+# (which is exactly how the live node once shipped art-less).
+if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+
 if [ "$CLEAN" = "1" ]; then
     echo "[clean] removing $BUILD_DIR"
     rm -rf "$BUILD_DIR"
 fi
 
-if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
-    echo "[configure] $CMAKE -S . -B $BUILD_DIR"
-    "$CMAKE" -S . -B "$BUILD_DIR" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_IGNORE_PATH=/mnt/c/msys64
-fi
+# Always (re)configure with album art REQUIRED. Re-running configure on an
+# existing build dir is cheap and idempotent, and it guarantees that a stale
+# cache once generated without cargo (art silently OFF) is corrected here — an
+# incremental `cmake --build` alone would keep shipping an art-less node.
+echo "[configure] $CMAKE -S . -B $BUILD_DIR (album art required)"
+"$CMAKE" -S . -B "$BUILD_DIR" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DMC_REQUIRE_ART=ON \
+    -DCMAKE_IGNORE_PATH=/mnt/c/msys64
 
 echo "[build] $CMAKE --build $BUILD_DIR -j$JOBS"
 "$CMAKE" --build "$BUILD_DIR" --config Release -j"$JOBS"

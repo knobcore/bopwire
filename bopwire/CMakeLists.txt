@@ -324,12 +324,32 @@ if(MC_WITH_ART AND WIN32)
   message(STATUS "MC_WITH_ART: disabled on Windows (node is deployed on Linux only)")
   set(MC_WITH_ART OFF)
 endif()
+# Fail loud instead of silently shipping a node with no real covers. The node
+# build scripts pass -DMC_REQUIRE_ART=ON: a live node once lost ALL its album
+# art because a build shell simply didn't have cargo on PATH and this check
+# quietly downgraded MC_WITH_ART to OFF. Player / non-node builds leave
+# MC_REQUIRE_ART OFF and keep the lenient behaviour (their shared lib carries
+# no scraper anyway, so a missing Rust toolchain there is harmless).
+option(MC_REQUIRE_ART
+  "Treat a missing Rust/cargo toolchain as a hard error instead of silently building bopwire-node without album art (set ON by the node build scripts)"
+  OFF)
 if(MC_WITH_ART AND NOT MC_MINI_NODE_ONLY)
   find_program(CARGO_EXECUTABLE cargo)
   if(NOT CARGO_EXECUTABLE)
-    message(WARNING "MC_WITH_ART=ON but 'cargo' (Rust) not found — building node "
-                    "WITHOUT album art. Install rustup to enable real covers.")
-    set(MC_WITH_ART OFF)
+    if(MC_REQUIRE_ART)
+      message(FATAL_ERROR
+        "MC_WITH_ART is ON but 'cargo' (Rust) was not found on PATH, so bopwire-node "
+        "would be built WITHOUT real album art. A node that silently drops covers is "
+        "how the live network once lost its art -- so for a node build this is a hard "
+        "error, not a warning. Fix it:\n"
+        "  * install Rust:  https://rustup.rs    (then re-run cmake), or\n"
+        "  * source it:     source \"$ENV{HOME}/.cargo/env\"   before configuring, or\n"
+        "  * deliberately build a node with generated covers only:  -DMC_WITH_ART=OFF")
+    else()
+      message(WARNING "MC_WITH_ART=ON but 'cargo' (Rust) not found — building node "
+                      "WITHOUT album art. Install rustup to enable real covers.")
+      set(MC_WITH_ART OFF)
+    endif()
   endif()
 endif()
 if(MC_WITH_ART AND NOT MC_MINI_NODE_ONLY)
