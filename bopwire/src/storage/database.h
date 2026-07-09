@@ -12,6 +12,8 @@
 
 namespace mc {
 
+struct StateAccumulator;   // P4 state_root hook
+
 struct SongState {
     uint64_t play_count          = 0;
     Address  discoverer_address  = {};
@@ -28,6 +30,11 @@ public:
     ~Database();
 
     bool is_open() const { return db_ != nullptr; }
+
+    // P4: while set, put_batch/del_batch on a STATE-prefixed key feed the LtHash
+    // state_root accumulator (block-scoped; set at block-apply start, cleared at
+    // the end). Only ONE thread applies a block at a time (Chain::mu_).
+    void set_accumulator(StateAccumulator* a) { acc_ = a; }
 
     // ---- Generic get/put/del ----------------------------------------
     std::optional<std::vector<uint8_t>> get(const std::string& key) const;
@@ -349,6 +356,7 @@ public:
 
 private:
     leveldb::DB* db_ = nullptr;
+    StateAccumulator* acc_ = nullptr;   // P4 state_root hook (block-scoped)
     std::string  path_;
 
     std::string bucket_key(uint16_t bucket_id) const;

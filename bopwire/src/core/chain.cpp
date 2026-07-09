@@ -689,8 +689,8 @@ bool Chain::apply_node_auth(const NodeAuthTx& tx, leveldb::WriteBatch& batch) {
                       std::vector<uint8_t>(tx.node_pubkey.begin(), tx.node_pubkey.end()));
         db_.put_batch(batch, akey, {});   // lets the founder emitter stop re-issuing (C3)
     } else {
-        batch.Delete(key);
-        batch.Delete(akey);
+        db_.del_batch(batch, key);    // via del_batch so the state_root accumulator sees it
+        db_.del_batch(batch, akey);
     }
     db_.set_nonce(batch, tx.issuer_address, expected + 1);
     record_applied_nonce(tx.issuer_address, expected + 1);

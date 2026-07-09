@@ -272,6 +272,7 @@ set(MC_SOURCES
   src/network/rats_link.cpp
   src/network/upnp.cpp          # UpnpMapper (miniupnpc) for first-launch port opening
   src/storage/database.cpp
+  src/storage/accumulator.cpp
   src/store/swarm.cpp
   src/store/library_store.cpp
   src/api/server.cpp

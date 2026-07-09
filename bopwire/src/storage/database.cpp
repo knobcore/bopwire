@@ -1,4 +1,6 @@
 #include "database.h"
+#include "accumulator.h"       // P4 state_root hook (on_put/on_del)
+#include "state_prefixes.h"    // P4 kStatePrefixes / has_state_prefix
 #include "../crypto/hash.h"
 #include "../audio/fingerprint.h"
 #include <leveldb/cache.h>
@@ -80,10 +82,12 @@ bool Database::write(leveldb::WriteBatch& batch) {
 
 void Database::put_batch(leveldb::WriteBatch& b, const std::string& key,
                          const std::vector<uint8_t>& value) {
+    if (acc_ && has_state_prefix(key)) acc_->on_put(key, value);   // P4 state_root
     b.Put(key, leveldb::Slice(reinterpret_cast<const char*>(value.data()), value.size()));
 }
 
 void Database::del_batch(leveldb::WriteBatch& b, const std::string& key) {
+    if (acc_ && has_state_prefix(key)) acc_->on_del(key);          // P4 state_root
     b.Delete(key);
 }
 
@@ -560,8 +564,8 @@ uint8_t Database::get_mod_level(const Address& addr) const {
 void Database::set_mod_level(leveldb::WriteBatch& b,
                              const Address& addr, uint8_t level) {
     if (level == 0) {
-        b.Delete("mlvl:" + hex(addr));
-        // Mirror into legacy `m:` table.
+        del_batch(b, "mlvl:" + hex(addr));   // P4: via del_batch so state_root sees it
+        // Mirror into legacy `m:` table (not in the state_root set).
         b.Delete("m:" + hex(addr));
         return;
     }
@@ -1026,17 +1030,15 @@ void Database::clear_derived_state() {
     // fingerprints (f:/i:), nonces (nv:), song meta + indexes (sm:/ia:/ig:),
     // governance (founder:/mlvl:/mpub:/mact:/slashed:), usernames (un:/addrun:),
     // proposals (prop:/propstatus:/propvote:), on-chain validator marker (va:).
-    // EXCLUDED (not cleared): history (b:/k:/h:/n:/cw:/t:tip), mempool
-    // (p:/pt:/pv:/pm:/sp:), node-local (ddur:/ddaymax:/accplay:/sb:/cp:), the v:
-    // registry (has a node-local self-register component), and moderation/label
-    // prefixes whose write path isn't purely block-tx (kept until their apply is
-    // audited — a partial state_root simply omits them).
-    const std::vector<std::string> prefixes{
-        "a:", "s:", "f:", "i:", "u:", "us:", "va:", "bh:",
-        "nv:", "sm:", "ia:", "ig:",
-        "founder:", "mlvl:", "mpub:", "mact:", "slashed:",
-        "un:", "addrun:",
-        "prop:", "propstatus:", "propvote:"};
+    // The cleared set is EXACTLY the committed-state set (kStatePrefixes, the
+    // single source of truth shared with the state_root accumulator hook + the
+    // snapshot dumper — they can never drift) PLUS "fph:" which is cleared but
+    // NOT in the root (derivable from "f:"; clearing it fixes a fuzzy-dup false-
+    // positive leak across reorg branches). EXCLUDED: history (b:/k:/h:/n:/cw:/
+    // t:tip), mempool (p:/pt:/pv:/pm:/sp:), node-local (ddur:/ddaymax:/accplay:/
+    // sb:/cp:/sr:vec/sr:height).
+    std::vector<std::string> prefixes(std::begin(kStatePrefixes), std::end(kStatePrefixes));
+    prefixes.push_back("fph:");
     for (const auto& prefix : prefixes) {
         auto* it = db_->NewIterator(leveldb::ReadOptions());
         for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next())
