@@ -2037,6 +2037,16 @@ void RatsApi::handle_request(const std::string& peer_id,
                         };
                         const bool queued =
                             ingest_fpsubmit(fps.dump(), /*broadcast_if_new=*/true);
+                        // The submission SUCCEEDED if the song is now in the
+                        // pipeline: freshly queued, OR already queued (the
+                        // min-merge dedup returns queued=false), OR already on
+                        // chain. Only a malformed payload leaves it in none of
+                        // those. Reporting the raw ingest bool made a duplicate
+                        // / re-submit / flood-echo look like a failure to the
+                        // player (the "about half failing" report).
+                        const bool registered = queued
+                            || db_.get_pending_song(ch).has_value()
+                            || db_.get_content_height(ch).has_value();
                         // Pre-emptively announce so swarm.locate already
                         // returns the announcing peer before block lands.
                         store::SwarmMember self_member;
@@ -2054,7 +2064,8 @@ void RatsApi::handle_request(const std::string& peer_id,
                                  {"status", "ok"},
                                  {"body", {
                                      {"matched",          false},
-                                     {"registered",       queued},
+                                     {"registered",       registered},
+                                     {"queued_new",       queued},
                                      {"content_hash",     crypto::to_hex(ch)},
                                      {"fingerprint_hash", crypto::to_hex(fph)},
                                      {"swarm_size",       swarm_.members(ch).size()},
