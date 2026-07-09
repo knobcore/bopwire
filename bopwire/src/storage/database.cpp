@@ -1020,7 +1020,23 @@ void Database::clear_derived_state() {
     // NodeAuthTx) is cleared so replay re-derives it; "v:" itself is NOT cleared
     // (it is also written node-locally at boot for the node's own preflight and
     // is re-derived idempotently by NodeAuthTx replay).
-    const std::vector<std::string> prefixes{"a:", "s:", "f:", "i:", "u:", "us:", "va:", "bh:"};
+    // Full block-derived state set (Phase 4 audit): everything a block replay
+    // reconstructs must be cleared so rebuild_derived_state is exact (and so it
+    // can back a committed state_root). Economic (a:/c:total_supply/s:/bh:/u:/us:),
+    // fingerprints (f:/i:), nonces (nv:), song meta + indexes (sm:/ia:/ig:),
+    // governance (founder:/mlvl:/mpub:/mact:/slashed:), usernames (un:/addrun:),
+    // proposals (prop:/propstatus:/propvote:), on-chain validator marker (va:).
+    // EXCLUDED (not cleared): history (b:/k:/h:/n:/cw:/t:tip), mempool
+    // (p:/pt:/pv:/pm:/sp:), node-local (ddur:/ddaymax:/accplay:/sb:/cp:), the v:
+    // registry (has a node-local self-register component), and moderation/label
+    // prefixes whose write path isn't purely block-tx (kept until their apply is
+    // audited — a partial state_root simply omits them).
+    const std::vector<std::string> prefixes{
+        "a:", "s:", "f:", "i:", "u:", "us:", "va:", "bh:",
+        "nv:", "sm:", "ia:", "ig:",
+        "founder:", "mlvl:", "mpub:", "mact:", "slashed:",
+        "un:", "addrun:",
+        "prop:", "propstatus:", "propvote:"};
     for (const auto& prefix : prefixes) {
         auto* it = db_->NewIterator(leveldb::ReadOptions());
         for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next())
