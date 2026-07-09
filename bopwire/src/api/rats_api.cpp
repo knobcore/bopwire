@@ -3359,6 +3359,16 @@ bool tx_preflight_ok(const std::vector<uint8_t>& raw, const Database& db) {
             return CheckpointTx::deserialize(raw.data(), raw.size(), tx)
                 && tx.verify_signature();   // founder-ness re-checked at apply
         }
+        case TxType::SETTLEMENT_MINT: {
+            SettlementMintTx tx;
+            if (!SettlementMintTx::deserialize(raw.data(), raw.size(), tx)) return false;
+            if (tx.constituent_count == 0 ||
+                tx.constituent_count > MAX_CONSTITUENTS_PER_SETTLEMENT) return false;
+            // Node sig + merkle + recompute run at apply (they need the companion
+            // body). Require the body present here so a settlement can't flood
+            // ahead of the plays it commits to.
+            return db.get("sb:" + db.hex(tx.constituents_merkle_root)).has_value();
+        }
         default:
             return false;
     }

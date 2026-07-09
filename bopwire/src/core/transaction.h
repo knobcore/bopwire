@@ -353,6 +353,46 @@ struct CheckpointTx {
     bool                 verify_signature() const;
 };
 
+// ---- Batched settlement mint (Phase 3) ------------------------------
+//
+// One tx settles a whole epoch of plays a serving node accrued — ~100-1000x
+// fewer on-chain txs than per-play MINT. RECOMPUTE-AUTHORITATIVE: the tx carries
+// only the Merkle root of its constituent signed PlayProofs (the fat proof list
+// floods separately as the MC_SETTLE_BODY companion blob, keyed by that root).
+// Every node re-derives the per-recipient amounts from committed state in a
+// fixed canonical order and credits THAT; the tx declares no amounts, so there
+// is nothing to inflate (deletes the unsatisfiable declared-aggregate gate, C4).
+//
+// Wire (little-endian):
+//   u8 SETTLEMENT_MINT | Hash256 serving_node_id | Address(20) serving_node_wallet
+//   | u64 epoch_id | Hash256 constituents_merkle_root | u32 constituent_count
+//   | Sig64 node_signature   (node signs everything above the signature)
+struct SettlementMintTx {
+    Hash256  serving_node_id{};
+    Address  serving_node_wallet{};        // == address(v:[serving_node_id]) (H6)
+    uint64_t epoch_id = 0;
+    Hash256  constituents_merkle_root{};
+    uint32_t constituent_count = 0;
+    Sig64    node_signature{};
+
+    std::vector<uint8_t> serialize() const;
+    static bool deserialize(const uint8_t* data, size_t len, SettlementMintTx& out);
+    std::vector<uint8_t> sign_message() const;   // everything above the signature
+    Hash256              tx_hash() const;
+    // Node-sig verification needs the v: pubkey (db lookup), so it lives in the
+    // chain apply path (apply_settlement_mint) rather than a self-contained
+    // verify_signature() — mirrors how MINT validation reaches into state.
+};
+
+// Settlement companion body (flooded as MC_SETTLE_BODY, stored under sb:<root>):
+//   u32 count | (u32 proof_len | PlayProof bytes)*count
+// The SettlementMintTx commits merkle_root_bytes over each proof's serialize()
+// taken in the canonical (content_hash, session_id) order, so the root is a pure
+// function of the constituent SET regardless of transmission order.
+std::vector<uint8_t> serialize_settle_body(const std::vector<PlayProof>& proofs);
+bool deserialize_settle_body(const uint8_t* data, size_t len,
+                             std::vector<PlayProof>& out);
+
 // ---- Slash transaction ----------------------------------------------
 //
 // Carries cryptographic evidence that some validator (target_address)

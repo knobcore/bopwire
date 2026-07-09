@@ -37,6 +37,12 @@ struct ChainTip {
 // Tunable pre-mainnet; must exceed the deepest realistic honest partition heal.
 static constexpr uint32_t FINALITY_DEPTH = 1000;
 
+// Hard cap on how many play constituents a single SETTLEMENT_MINT may carry
+// (Phase 3). Bounds both the companion-body size (DoS) and, since fork weight
+// counts VERIFIED constituents, the weight a single settlement can contribute —
+// so an attacker can't declare a huge count for cheap fork weight.
+static constexpr uint32_t MAX_CONSTITUENTS_PER_SETTLEMENT = 4096;
+
 // Clock-skew allowance for a flooded tx's origin submit_ms relative to the
 // current tip's block timestamp. Together with the lower bound
 // (tip_ts - PROPAGATION_WINDOW_MS) this lets ingest reject both future-dated and
@@ -286,6 +292,13 @@ public:
     // heavier fork can't rewrite history across it. Founder-signed, nonce-
     // protected.
     bool apply_checkpoint(const CheckpointTx& tx, leveldb::WriteBatch& batch);
+
+    // Batched settlement mint (Phase 3) — recompute-authoritative. Authenticates
+    // the serving validator, binds the committed Merkle root to the flooded
+    // companion body (sb:), then walks constituents in canonical order and
+    // credits exactly what committed state justifies (per-leaf skip on
+    // used/underfunded/over-cap). Declares no amounts, so nothing can inflate.
+    bool apply_settlement_mint(const SettlementMintTx& tx, leveldb::WriteBatch& batch);
 
     // Has this address been slashed? Used by the consensus path that
     // tallies confirmations — slashed addresses' votes return zero

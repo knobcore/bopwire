@@ -565,6 +565,81 @@ bool CheckpointTx::verify_signature() const {
     return crypto::verify_ecdsa(hash, signature, issuer_pubkey);
 }
 
+// ---- SettlementMintTx (Phase 3) -------------------------------------
+
+std::vector<uint8_t> SettlementMintTx::sign_message() const {
+    std::vector<uint8_t> msg;
+    write_u32le(msg, MC_CHAIN_ID);
+    write_bytes(msg, serving_node_id.data(),          32);
+    write_bytes(msg, serving_node_wallet.data(),      20);
+    write_u64le(msg, epoch_id);
+    write_bytes(msg, constituents_merkle_root.data(), 32);
+    write_u32le(msg, constituent_count);
+    return msg;
+}
+
+std::vector<uint8_t> SettlementMintTx::serialize() const {
+    std::vector<uint8_t> buf;
+    buf.push_back(static_cast<uint8_t>(TxType::SETTLEMENT_MINT));
+    write_bytes(buf, serving_node_id.data(),          32);
+    write_bytes(buf, serving_node_wallet.data(),      20);
+    write_u64le(buf, epoch_id);
+    write_bytes(buf, constituents_merkle_root.data(), 32);
+    write_u32le(buf, constituent_count);
+    write_bytes(buf, node_signature.data(),           64);
+    return buf;
+}
+
+bool SettlementMintTx::deserialize(const uint8_t* data, size_t len, SettlementMintTx& out) {
+    const uint8_t* p   = data;
+    const uint8_t* end = data + len;
+    if (p >= end || *p++ != static_cast<uint8_t>(TxType::SETTLEMENT_MINT)) return false;
+    if (!read_bytes(p, end, out.serving_node_id.data(),          32)) return false;
+    if (!read_bytes(p, end, out.serving_node_wallet.data(),      20)) return false;
+    if (!read_u64le(p, end, out.epoch_id))                           return false;
+    if (!read_bytes(p, end, out.constituents_merkle_root.data(), 32)) return false;
+    if (!read_u32le(p, end, out.constituent_count))                  return false;
+    if (!read_bytes(p, end, out.node_signature.data(),           64)) return false;
+    return true;
+}
+
+Hash256 SettlementMintTx::tx_hash() const {
+    auto raw = serialize();
+    return crypto::sha256(raw.data(), raw.size());
+}
+
+std::vector<uint8_t> serialize_settle_body(const std::vector<PlayProof>& proofs) {
+    std::vector<uint8_t> buf;
+    write_u32le(buf, static_cast<uint32_t>(proofs.size()));
+    for (const auto& pr : proofs) {
+        auto s = pr.serialize();
+        write_u32le(buf, static_cast<uint32_t>(s.size()));
+        buf.insert(buf.end(), s.begin(), s.end());
+    }
+    return buf;
+}
+
+bool deserialize_settle_body(const uint8_t* data, size_t len,
+                             std::vector<PlayProof>& out) {
+    const uint8_t* p   = data;
+    const uint8_t* end = data + len;
+    uint32_t n = 0;
+    if (!read_u32le(p, end, n)) return false;
+    if (n > 4096) return false;   // MAX_CONSTITUENTS_PER_SETTLEMENT ceiling (DoS bound)
+    out.clear();
+    out.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t l = 0;
+        if (!read_u32le(p, end, l)) return false;
+        if (static_cast<size_t>(end - p) < l) return false;
+        PlayProof pr;
+        if (!PlayProof::deserialize(p, l, pr)) return false;
+        p += l;
+        out.push_back(pr);
+    }
+    return true;
+}
+
 // ---- SlashTx --------------------------------------------------------
 
 std::vector<uint8_t> SlashTx::sign_message() const {

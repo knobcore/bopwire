@@ -3,6 +3,7 @@
 #include "../audio/fingerprint.h"     // chromaprint similarity on replay
 #include "../tokens/ledger.h"
 #include "../tokens/mint.h"
+#include "merkle.h"                    // merkle_root_bytes (settlement body root)
 #include "../crypto/hash.h"
 #include "../crypto/signature.h"
 #include "../crypto/keys.h"
@@ -53,8 +54,27 @@ namespace {
 // audited plays." Heartbeat / registration-only blocks contribute 0.
 uint64_t count_plays(const Block& block) {
     uint64_t n = 0;
-    for (const auto& tx : block.transactions)
-        if (!tx.empty() && static_cast<TxType>(tx[0]) == TxType::MINT) ++n;
+    for (const auto& tx : block.transactions) {
+        if (tx.empty()) continue;
+        const TxType t = static_cast<TxType>(tx[0]);
+        if (t == TxType::MINT) {
+            ++n;                                   // one play
+        } else if (t == TxType::SETTLEMENT_MINT) {
+            // A batched settlement contributes its constituent count, HARD-CAPPED
+            // so a padded settlement can't buy cheap fork weight; combined with
+            // the Phase-2 signed checkpoints + Phase-0 FINALITY_DEPTH this bounds
+            // the costless-fork attack. (Counting DECLARED constituents rather
+            // than re-verified ones is a documented simplification — the block
+            // only connects if apply_settlement_mint matched the body/merkle.)
+            SettlementMintTx sm;
+            if (SettlementMintTx::deserialize(tx.data(), tx.size(), sm)) {
+                uint32_t c = sm.constituent_count;
+                if (c > MAX_CONSTITUENTS_PER_SETTLEMENT)
+                    c = MAX_CONSTITUENTS_PER_SETTLEMENT;
+                n += c;
+            }
+        }
+    }
     return n;
 }
 } // namespace
@@ -308,6 +328,14 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
             }
             if (!apply_checkpoint(cp, batch)) {
                 std::cerr << "[chain] apply: CHECKPOINT apply failed\n"; return false;
+            }
+        } else if (type == TxType::SETTLEMENT_MINT) {
+            SettlementMintTx sm;
+            if (!SettlementMintTx::deserialize(raw_tx.data(), raw_tx.size(), sm)) {
+                std::cerr << "[chain] apply: SETTLEMENT_MINT deserialize failed\n"; return false;
+            }
+            if (!apply_settlement_mint(sm, batch)) {
+                std::cerr << "[chain] apply: SETTLEMENT_MINT apply failed\n"; return false;
             }
         } else {
             std::cerr << "[chain] apply: unknown TxType " << static_cast<int>(type) << "\n";
@@ -682,6 +710,118 @@ bool Chain::apply_checkpoint(const CheckpointTx& tx, leveldb::WriteBatch& batch)
     record_applied_nonce(tx.issuer_address, expected + 1);
     std::cout << "[chain] CHECKPOINT: pinned height " << tx.height << " = "
               << db_.hex(tx.block_hash).substr(0, 12) << "…\n";
+    return true;
+}
+
+// ---- Batched settlement mint (Phase 3) ------------------------------
+//
+// Recompute-authoritative: the tx declares NO amounts. We authenticate the
+// serving node, bind the committed Merkle root to the flooded companion body,
+// then walk the constituents in a fixed canonical order and credit exactly what
+// committed state justifies. Every honest node computes the identical credited
+// map from replicated inputs, so no vote is needed and nothing can be inflated.
+bool Chain::apply_settlement_mint(const SettlementMintTx& tx,
+                                  leveldb::WriteBatch& batch) {
+    // 1) Serving node must be a registered validator; recover its pubkey.
+    auto ventry = db_.get("v:" + db_.hex(tx.serving_node_id));
+    if (!ventry || ventry->size() < 33) {
+        std::cerr << "[chain] settlement reject: serving node not in v:\n"; return false;
+    }
+    PubKey33 pubkey;
+    std::copy(ventry->begin(), ventry->begin() + 33, pubkey.begin());
+    {
+        auto msg = tx.sign_message();
+        auto h   = crypto::sha256(msg.data(), msg.size());
+        if (!crypto::verify_ecdsa(h, tx.node_signature, pubkey)) {
+            std::cerr << "[chain] settlement reject: node signature invalid\n"; return false;
+        }
+    }
+    // H6: declared serving wallet is bound to the registered key.
+    const Address node_wallet = crypto::address_from_pubkey(pubkey);
+    if (std::memcmp(node_wallet.data(), tx.serving_node_wallet.data(), 20) != 0) {
+        std::cerr << "[chain] settlement reject: wallet != v: key\n"; return false;
+    }
+    if (tx.constituent_count == 0 ||
+        tx.constituent_count > MAX_CONSTITUENTS_PER_SETTLEMENT) {
+        std::cerr << "[chain] settlement reject: constituent_count out of range\n"; return false;
+    }
+    // Epoch replay guard (a node can't settle the same epoch twice).
+    const std::string us_key =
+        "us:" + db_.hex(tx.serving_node_id) + ":" + std::to_string(tx.epoch_id);
+    if (db_.get(us_key).has_value()) {
+        std::cerr << "[chain] settlement reject: epoch already settled\n"; return false;
+    }
+    // 2) Load the companion body (candidate.cpp keeps a settlement whose body is
+    //    absent out of the block, so this only fails on a genuinely bad tx).
+    auto braw = db_.get("sb:" + db_.hex(tx.constituents_merkle_root));
+    if (!braw) { std::cerr << "[chain] settlement reject: body missing\n"; return false; }
+    std::vector<PlayProof> proofs;
+    if (!deserialize_settle_body(braw->data(), braw->size(), proofs)) {
+        std::cerr << "[chain] settlement reject: body malformed\n"; return false;
+    }
+    if (proofs.size() != tx.constituent_count) {
+        std::cerr << "[chain] settlement reject: count != body size\n"; return false;
+    }
+    // 3) Canonical order (content_hash, session_id); the root is over THIS order.
+    std::sort(proofs.begin(), proofs.end(),
+              [](const PlayProof& a, const PlayProof& b) {
+        int c = std::memcmp(a.content_hash.data(), b.content_hash.data(), 32);
+        if (c != 0) return c < 0;
+        return std::memcmp(a.session_id.data(), b.session_id.data(), 32) < 0;
+    });
+    {
+        std::vector<std::vector<uint8_t>> leaves;
+        leaves.reserve(proofs.size());
+        for (const auto& pr : proofs) leaves.push_back(pr.serialize());
+        Hash256 root = merkle_root_bytes(leaves);
+        if (std::memcmp(root.data(), tx.constituents_merkle_root.data(), 32) != 0) {
+            std::cerr << "[chain] settlement reject: merkle root mismatch\n"; return false;
+        }
+    }
+    // 4) Recompute-authoritative walk with deterministic per-leaf skip.
+    Ledger ledger(db_);
+    std::map<Hash256, uint64_t> song_ord;       // stepped play_count per song
+    std::map<Address, uint64_t> credits;        // recipient -> amount
+    std::unordered_set<std::string> used_in_batch;
+    const uint64_t base_supply = db_.get_total_supply();
+    uint64_t running_supply = base_supply;
+    for (const auto& pr : proofs) {
+        std::string cperr;
+        if (!check_play(pr, db_, cperr)) continue;                 // invalid proof -> skip
+        const std::string sid = db_.hex(pr.session_id);
+        if (used_in_batch.count(sid)) continue;                    // dup within this batch
+        auto song = db_.get_song_section(pr.content_hash);
+        if (!song) continue;                                       // song not on chain -> skip
+        auto it = song_ord.find(pr.content_hash);
+        const uint64_t pc = (it == song_ord.end())
+            ? db_.get_play_count(pr.content_hash) : it->second;
+        // Burn uses the COMMITTED base supply for cross-node determinism (pre-10k
+        // it is 0; a running-delta refinement is a documented post-10k follow-up).
+        const uint64_t burn =
+            (pc >= FULL_REWARD_THRESHOLD) ? compute_burn_rate(base_supply) : 0;
+        auto outs = compute_mint_outputs(pr, *song, pc,
+                                         pr.serving_node_id, node_wallet);
+        uint64_t out_sum = 0;
+        for (const auto& o : outs) out_sum += o.amount;
+        if (out_sum > 0 && running_supply + out_sum > SUPPLY_CAP) continue;   // skip
+        if (burn > 0 && db_.get_balance(pr.player_address) < burn)  continue;   // skip
+        // Accept.
+        for (const auto& o : outs) credits[o.recipient] += o.amount;
+        running_supply += out_sum;
+        song_ord[pr.content_hash] = pc + 1;
+        used_in_batch.insert(sid);
+        db_.put_batch(batch, "u:" + sid, {});          // per-play replay marker
+        db_.update_song_state(batch, pr, pc);           // play_count++ (+ discoverer)
+    }
+    // 5) Apply the aggregated credits. (Post-10k listener burn debit is a
+    //    documented follow-up; pre-10k total_burn is 0.)
+    std::vector<std::pair<Address, uint64_t>> outs_vec(credits.begin(), credits.end());
+    ledger.credit_many(batch, outs_vec);
+    db_.put_batch(batch, us_key, {});                   // epoch-settled marker
+    std::cout << "[chain] SETTLEMENT_MINT: node "
+              << db_.hex(tx.serving_node_id).substr(0, 12) << " epoch "
+              << tx.epoch_id << " credited " << credits.size()
+              << " recipients from " << proofs.size() << " plays\n";
     return true;
 }
 
