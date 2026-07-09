@@ -11,10 +11,10 @@
 #include "../curation/collection_curator.h"
 #include "../core/transaction.h"
 #include "../tokens/ledger.h"   // Ledger::parse_balance for wallet.transfer flood
+#include "../tokens/mint.h"     // validate_mint (Phase 1 MINT preflight forge gate)
 
-// mc_rats_quic.h was the old stub. We now link the real librats and
-// consume its C bindings header so functions like rats_get_peer_info_json
-// (used by the stun.observe verb below) are visible.
+// librats C bindings header — functions like rats_get_peer_info_json (used by
+// the stun.observe verb below) are declared here.
 #include "librats_c.h"
 #include "../crypto/hash.h"
 #include "../crypto/signature.h"
@@ -95,6 +95,13 @@ RatsApi::RatsApi(HttpServer& http,
     // DB2 — wallet-keyed library store. Slurps persisted libraries + rebuilds
     // the reverse (song → wallets) index from the same leveldb.
     library_.attach(db_);
+    // Phase 1: let HttpServer::post_session_complete publish play rewards as
+    // on-chain MINT txs through our flood + mempool path instead of writing them
+    // to local state. The lambda is only invoked later (at a session complete),
+    // by which time `this` is fully constructed.
+    http_.set_ingest_tx([this](const std::string& env) {
+        return ingest_tx(env, /*broadcast_if_new=*/true);
+    });
 }
 
 void RatsApi::start(rats_client_t client) {
@@ -3295,7 +3302,7 @@ namespace {
 // in candidate.cpp before a tx can enter a block, so a malformed / unsigned tx
 // never floods the mesh. This is only the floor; the authoritative rules
 // (nonce, balance, authority) run in Chain::apply_transactions at block-connect.
-bool tx_preflight_ok(const std::vector<uint8_t>& raw) {
+bool tx_preflight_ok(const std::vector<uint8_t>& raw, const Database& db) {
     if (raw.empty()) return false;
     switch (static_cast<TxType>(raw[0])) {
         case TxType::TRANSFER: {
@@ -3330,7 +3337,12 @@ bool tx_preflight_ok(const std::vector<uint8_t>& raw) {
         }
         case TxType::MINT: {
             MintTx tx;
-            return MintTx::deserialize(raw.data(), raw.size(), tx);
+            if (!MintTx::deserialize(raw.data(), raw.size(), tx)) return false;
+            // Phase 1 forge gate: node sig vs v: registry, session unused, and
+            // declared outputs+burn == recompute from on-chain song/supply. A
+            // forged/inflated mint never enters the mempool or floods.
+            std::string err;
+            return validate_mint(tx, db, err);
         }
         case TxType::RELAY_REWARD: {
             RelayRewardTx tx;
@@ -3354,7 +3366,7 @@ bool RatsApi::ingest_tx(const std::string& payload_json, bool broadcast_if_new) 
     const Hash256  tx_hash   = crypto::sha256(raw.data(), raw.size());
 
     // Same pre-flight the producer applies, so a bad tx never floods.
-    if (!tx_preflight_ok(raw)) return false;
+    if (!tx_preflight_ok(raw, db_)) return false;
 
     // Dedup + min-merge on tx_hash (the content-addressed p: row is free
     // loop-safe dedup, exactly like mod_log_has_sig). Keep the smaller

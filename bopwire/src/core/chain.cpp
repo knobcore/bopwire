@@ -219,6 +219,19 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
             if (!MintTx::deserialize(raw_tx.data(), raw_tx.size(), mint)) {
                 std::cerr << "[chain] apply: MINT deserialize failed\n"; return false;
             }
+            // Forge gate (Phase 1): a MINT carried in a block must pass the SAME
+            // validation the mempool preflight runs — serving-node signature vs
+            // the v: registry, session unused, and declared outputs+burn ==
+            // recompute_mint from on-chain song/supply — or the whole block
+            // fails to connect. Without this a peer could inject a MINT crediting
+            // arbitrary tokens to itself and every node would apply it.
+            {
+                std::string mint_err;
+                if (!validate_mint(mint, db_, mint_err)) {
+                    std::cerr << "[chain] apply: MINT validation failed: " << mint_err << "\n";
+                    return false;
+                }
+            }
             uint64_t play_count = db_.get_play_count(mint.proof.content_hash);
             if (!apply_mint(mint, play_count, batch)) {
                 std::cerr << "[chain] apply: MINT apply failed\n"; return false;
@@ -1139,6 +1152,16 @@ bool Chain::reorg_to_branch(const Hash256& fork_hash, uint32_t fork_height,
     {
         auto fh = get_block_height(fork_hash);
         if (!fh || *fh != fork_height) { err = "fork point not on chain"; return false; }
+    }
+    // Finality cap (Phase 0): refuse to rewrite history deeper than
+    // FINALITY_DEPTH below the tip. Fork weight is costless without stake/PoW,
+    // so an unbounded reorg is a cheap chain-takeover; capping the depth turns
+    // deep history irreversible and makes pruning below this depth safe. (The
+    // signed-checkpoint gate below is the other half of finality.)
+    if (tip_.height > FINALITY_DEPTH && fork_height < tip_.height - FINALITY_DEPTH) {
+        err = "reorg beyond finality depth (fork_height " + std::to_string(fork_height)
+            + " < tip " + std::to_string(tip_.height) + " - " + std::to_string(FINALITY_DEPTH) + ")";
+        return false;
     }
     // Branch must chain-link from fork_hash and be intrinsically valid.
     {

@@ -4,20 +4,51 @@
 #include <stdexcept>
 #include <limits>
 #include <map>
+#if defined(_MSC_VER) && defined(_M_X64)
+#  include <intrin.h>   // _umul128 / _udiv128 for the deterministic integer cubic
+#endif
 
 namespace mc {
+
+namespace {
+// Deterministic (a*b)/c with a full 128-bit intermediate and NO floating point,
+// so the result is bit-identical on every compiler / arch / -O level. A float
+// cubic (the old implementation) rounds differently across x86 vs ARM and under
+// -ffast-math; once a burn amount is committed into block state that divergence
+// is a chain split. Every call site below guarantees the true quotient fits in
+// u64 and (on the MSVC path) that the product high word is < c, so _udiv128
+// cannot fault.
+inline uint64_t muldiv_u128(uint64_t a, uint64_t b, uint64_t c) {
+#if defined(__SIZEOF_INT128__)
+    return static_cast<uint64_t>(static_cast<unsigned __int128>(a) * b / c);
+#elif defined(_MSC_VER) && defined(_M_X64)
+    unsigned long long hi;
+    unsigned long long lo = _umul128(a, b, &hi);
+    unsigned long long rem;
+    return _udiv128(hi, lo, c, &rem);
+#else
+#  error "compute_burn_rate needs __int128 or MSVC x64 intrinsics for a deterministic integer cubic"
+#endif
+}
+} // namespace
 
 uint64_t compute_burn_rate(uint64_t total_supply) {
     if (total_supply < SUPPLY_FLOOR) return 0;
     if (total_supply >= SUPPLY_CAP)
         return std::numeric_limits<uint64_t>::max();
-    const double range = static_cast<double>(SUPPLY_CAP - SUPPLY_FLOOR);
-    const double pct   = static_cast<double>(total_supply - SUPPLY_FLOOR) / range;
-    // Cubic ramp; multiplier 1000 tokens at pct=1.0 (which never gets
-    // reached — the cap branch above intercepts first).
-    const double burn  = pct * pct * pct
-                       * 1000.0 * static_cast<double>(TOKEN_DECIMALS);
-    return static_cast<uint64_t>(burn);
+    // Integer fixed-point cubic ramp identical to the old model
+    //   pct  = (supply - FLOOR) / (CAP - FLOOR)  in [0,1)
+    //   burn = pct^3 * 1000 tokens
+    // computed as num^3 * (1000 * TOKEN_DECIMALS) / den^3 via chained 128-bit
+    // muldiv (num^3 overflows even 128 bits, so we divide as we go). den = 1e17
+    // < 2^63 and num < den, so each product's high word stays < den. This is a
+    // pure function of u64 inputs -> bit-identical on every node (consensus-safe),
+    // unlike the previous double cubic.
+    const uint64_t num = total_supply - SUPPLY_FLOOR;
+    const uint64_t den = SUPPLY_CAP  - SUPPLY_FLOOR;
+    const uint64_t m1  = muldiv_u128(num, num, den);          // num^2 / den
+    const uint64_t m2  = muldiv_u128(m1,  num, den);          // num^3 / den^2
+    return muldiv_u128(m2, 1000ULL * TOKEN_DECIMALS, den);    // * 1000 tokens / den
 }
 
 

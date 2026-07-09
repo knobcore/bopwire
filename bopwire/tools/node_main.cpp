@@ -419,6 +419,17 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     std::cout << "[node] node_id: " << mc::crypto::to_hex(cfg.node_id) << "\n";
     std::cout << "[node] address: " << mc::crypto::to_checksum_hex(keypair.address) << "\n";
 
+    // Phase 1: self-register this node in the "v:" validator registry so its own
+    // play mints pass the forge gate. check_play verifies each proof's node
+    // signature against v:[serving_node_id], and recompute_mint binds the
+    // node-reward wallet to address_from_pubkey(that same key). Stored as the
+    // 33-byte compressed pubkey. Node-LOCAL for now (single founder node) —
+    // Phase 2 replaces this with a founder-authorized, on-chain NodeAuthTx that
+    // replicates the registry to every validating node. Idempotent (rewritten
+    // each boot) and survives a derived-state rebuild (v: is not cleared).
+    db.put("v:" + db.hex(cfg.node_id),
+           std::vector<uint8_t>(keypair.public_key.begin(), keypair.public_key.end()));
+
     // Bootstrap first moderator wallet (runs once, guarded by sentinel key)
     std::cerr << "[dbg] moderator bootstrap\n";
     {

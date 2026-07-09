@@ -1048,40 +1048,47 @@ std::pair<int, std::string> HttpServer::post_session_complete(
         ? compute_burn_rate(db_.get_total_supply())
         : 0;
 
-    // Apply mint directly to chain state. Hold the per-device shard lock across
-    // the ENTIRE read->apply->write so two concurrent completes for the same
-    // device can't both read the old daily counter and both mint past the cap
-    // (apply_mint only BUILDS the batch; db_.write below commits it).
+    // Phase 1: publish the play reward as an ON-CHAIN MINT tx (flood + mempool)
+    // rather than a direct local write. The producer mines it and EVERY node
+    // applies it through the block-apply forge gate (validate_mint), so the
+    // credit replicates and survives resync — the old direct apply_mint credited
+    // only THIS node's LevelDB, which is exactly why balances weren't reaching
+    // players across the mesh. The node-local per-device coverage counter
+    // (ddur:/ddaymax:) is NOT consensus, so it goes to its OWN batch and never
+    // rides a consensus write. Replay is handled downstream: the MintTx is
+    // content-addressed (tx_hash dedups a re-submitted session in the mempool)
+    // and apply_mint writes the "u:"+session_id marker at block-apply.
     {
         std::unique_lock<std::mutex> dev_lk;
         if (!sess.device_id.empty())
             dev_lk = std::unique_lock<std::mutex>(device_shard(sess.device_id));
 
-        leveldb::WriteBatch batch;
-        if (!chain_.apply_mint(mint, play_count, batch)) {
-            std::cout << "[session.complete] APPLY-MINT-FAIL sid="
-                      << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
-            return {500, R"({"error":"failed to apply mint"})"};
-        }
-
-        // Time-based daily coverage counter (node-local, non-consensus): add
-        // THIS session's covered listen-time. A session that crossed the cap
-        // mid-listen is still honored (bounded overshoot) rather than voiding a
-        // completed genuine listen. Folded into the mint batch so counter + mint
-        // commit atomically; is_session_used blocks true replays.
         if (!sess.device_id.empty()) {
+            leveldb::WriteBatch local;
             const std::string dk =
                 "ddur:" + sess.device_id + ":" + std::to_string(sess.day_bucket);
             const uint64_t cum = db_.get_u64(dk).value_or(0);
-            db_.put_batch_u64(batch, dk, cum + effective_ms);
+            db_.put_batch_u64(local, dk, cum + effective_ms);
             if (db_.get_u64("ddaymax:" + sess.device_id).value_or(0) < sess.day_bucket)
-                db_.put_batch_u64(batch, "ddaymax:" + sess.device_id, sess.day_bucket);
+                db_.put_batch_u64(local, "ddaymax:" + sess.device_id, sess.day_bucket);
+            db_.write(local);
         }
 
-        if (!db_.write(batch)) {
-            std::cout << "[session.complete] DB-WRITE-FAIL sid="
+        if (ingest_tx_cb_) {
+            Transaction txw = Transaction::from_mint(mint);
+            const std::string tx_hex = crypto::to_hex(txw.raw);
+            const std::string env =
+                "{\"tx\":\"" + tx_hex + "\",\"submit_ms\":" + std::to_string(now) + "}";
+            if (!ingest_tx_cb_(env)) {
+                // Duplicate (already in mempool) is idempotent + fine; a genuine
+                // reject means the mint failed its own forge gate (should never
+                // happen for a proof we just built + signed) — log, don't 500.
+                std::cout << "[session.complete] mint not newly queued sid="
+                          << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
+            }
+        } else {
+            std::cout << "[session.complete] NO-INGEST-CB sid="
                       << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
-            return {500, R"({"error":"db write failed"})"};
         }
     }
     // Mint actually landed. NOW flip the in-memory completed flag so

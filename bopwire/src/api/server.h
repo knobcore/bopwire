@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <thread>
+#include <functional>
 
 namespace mc::api {
 
@@ -92,6 +93,13 @@ public:
     bool start();
     void stop();
 
+    // Phase 1 wiring: RatsApi injects its ingest_tx here so post_session_complete
+    // publishes the play reward as an on-chain (flooded + mempooled) MINT tx
+    // instead of a local DB write — the producer mines it and every node applies
+    // it through the block-apply forge gate, so balances replicate + survive
+    // resync. Set once at construction, before any session can complete.
+    void set_ingest_tx(std::function<bool(const std::string&)> cb) { ingest_tx_cb_ = std::move(cb); }
+
     // ---- Verb handlers -----------------------------------------------
     std::pair<int, std::string> verb_status()                                { return get_status(); }
     std::pair<int, std::string> verb_dht_peers()                             { return get_dht_peers(); }
@@ -132,6 +140,10 @@ private:
     Database&             db_;
     net::NodeConfig       config_;
     mc::crypto::KeyPair   node_keypair_;
+    // -> RatsApi::ingest_tx (Phase 1). Null until wired; post_session_complete
+    // falls back to a direct apply only if this is unset (should never happen in
+    // the node, which always wires RatsApi).
+    std::function<bool(const std::string&)> ingest_tx_cb_;
 
     mutable std::mutex                            sessions_mutex_;
     std::unordered_map<std::string, PlaySession>  sessions_;

@@ -454,6 +454,22 @@ std::optional<uint32_t> Database::get_content_height(const Hash256& ch) const {
     return get_u32("bh:" + hex(ch));
 }
 
+std::optional<SongSection> Database::get_song_section(const Hash256& ch) const {
+    // bh:<ch> -> height -> n:<height> -> block hash -> b:<hash> -> block -> song.
+    auto h = get_content_height(ch);
+    if (!h) return std::nullopt;
+    auto hraw = get("n:" + std::to_string(*h));
+    if (!hraw || hraw->size() != 32) return std::nullopt;
+    Hash256 bhash{};
+    std::copy(hraw->begin(), hraw->end(), bhash.begin());
+    auto braw = get("b:" + hex(bhash));
+    if (!braw) return std::nullopt;
+    Block blk;
+    if (!Block::deserialize(braw->data(), braw->size(), blk)) return std::nullopt;
+    if (!blk.has_song) return std::nullopt;
+    return blk.song;
+}
+
 std::vector<Hash256> Database::get_all_song_hashes() const {
     std::vector<Hash256> result;
     leveldb::ReadOptions opts;
@@ -1003,6 +1019,18 @@ void Database::clear_derived_state() {
             batch.Delete(it->key());
         delete it;
     }
+    // total_supply is block-derived state (running sum of mint credits minus
+    // burns), NOT a config value — it MUST be reset here or rebuild_derived_state
+    // replays every mint ON TOP of the stale total and doubles the supply on
+    // each reorg, corrupting compute_burn_rate + the SUPPLY_CAP gate. It is a
+    // single key (not a prefix), so clear it explicitly. (The remaining
+    // block-derived prefixes — nv: nonces, v: validators, founder:/mlvl:/mpub:/
+    // mact:/m:/slashed: governance, un:/addrun:/label:/art_label: names,
+    // prop:/propstatus:/propvote: proposals, ha:/hb:/ht:/d:/fr:/ml:/ms:
+    // moderation — are audited + added in the state_root phase, where each
+    // prefix's reconstruction-by-replay is verified end-to-end before it becomes
+    // load-bearing for the committed state root.)
+    batch.Delete("c:total_supply");
     db_->Write(leveldb::WriteOptions(), &batch);
 }
 

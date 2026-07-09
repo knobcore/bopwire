@@ -1,6 +1,7 @@
 #include "mint.h"
 #include "../crypto/hash.h"
 #include "../crypto/signature.h"
+#include "../crypto/keys.h"   // address_from_pubkey (H6 serving-node wallet bind)
 
 namespace mc {
 
@@ -126,51 +127,97 @@ std::vector<MintOutput> compute_mint_outputs(const PlayProof& proof,
     return outputs;
 }
 
-bool validate_mint(const MintTx& mint, const Database& db, std::string& error) {
-    const auto& proof = mint.proof;
-
-    // Check session not already used
+bool check_play(const PlayProof& proof, const Database& db, std::string& error) {
+    // Session not already used on chain (replay/double-credit guard).
     if (db.is_session_used(proof.session_id)) {
         error = "session_id already used";
         return false;
     }
-
-    // Check minimum duration
+    // Minimum duration.
     if (proof.total_duration_ms < 30000) {
         error = "play duration under 30 seconds";
         return false;
     }
-
-    // Check heartbeat count plausibility: at least 1 heartbeat per 35 seconds
+    // Heartbeat count plausibility: at least 1 heartbeat per 35 seconds.
     uint32_t expected_min = proof.total_duration_ms / 35000;
     if (proof.heartbeat_count < expected_min) {
         error = "insufficient heartbeat count";
         return false;
     }
-
-    // Verify node signature over proof data
-    auto sign_msg = proof.sign_message();
-    auto hash     = crypto::sha256(sign_msg.data(), sign_msg.size());
-
-    // Look up validator public key from registry
+    // Serving-node signature over the proof, verified against the "v:" registry.
+    // node_entry format: 33-byte pubkey + endpoint.
     auto node_entry = db.get("v:" + db.hex(proof.serving_node_id));
     if (!node_entry) {
         error = "serving node not registered";
         return false;
     }
-    // node_entry format: 33 bytes pubkey + 4 bytes endpoint length + endpoint string
     if (node_entry->size() < 33) {
         error = "invalid validator entry";
         return false;
     }
     PubKey33 pubkey;
     std::copy(node_entry->begin(), node_entry->begin() + 33, pubkey.begin());
-
+    auto sign_msg = proof.sign_message();
+    auto hash     = crypto::sha256(sign_msg.data(), sign_msg.size());
     if (!crypto::verify_ecdsa(hash, proof.node_signature, pubkey)) {
         error = "invalid node signature";
         return false;
     }
+    return true;
+}
 
+bool recompute_mint(const PlayProof& proof, const Database& db,
+                    std::vector<MintOutput>& outputs, uint64_t& burn,
+                    std::string& error) {
+    // Serving-node wallet is BOUND to the registered pubkey (H6): the node that
+    // signed the proof is the node that earns the node lane — a mint can't
+    // redirect the node reward to an arbitrary address.
+    auto node_entry = db.get("v:" + db.hex(proof.serving_node_id));
+    if (!node_entry || node_entry->size() < 33) {
+        error = "serving node not registered";
+        return false;
+    }
+    PubKey33 pubkey;
+    std::copy(node_entry->begin(), node_entry->begin() + 33, pubkey.begin());
+    const Address serving_node_address = crypto::address_from_pubkey(pubkey);
+
+    // Authoritative SongSection from the block store (artist_address +
+    // royalty_splits). SongMeta/sm: does not carry these, so we read the block.
+    auto song = db.get_song_section(proof.content_hash);
+    if (!song) {
+        error = "song not on chain";
+        return false;
+    }
+    const uint64_t play_count = db.get_play_count(proof.content_hash);
+    outputs = compute_mint_outputs(proof, *song, play_count,
+                                   proof.serving_node_id, serving_node_address);
+    burn = (play_count >= FULL_REWARD_THRESHOLD)
+        ? compute_burn_rate(db.get_total_supply())
+        : 0;
+    return true;
+}
+
+bool validate_mint(const MintTx& mint, const Database& db, std::string& error) {
+    if (!check_play(mint.proof, db, error)) return false;
+
+    // Forge gate: the declared outputs + burn MUST equal the recomputation from
+    // committed state. A registered node can attest that a play happened, but it
+    // cannot inflate the amounts or redirect them to other wallets — every
+    // number is a pure function of the signed proof + on-chain song/supply,
+    // recomputed identically on every validating node.
+    std::vector<MintOutput> outs;
+    uint64_t                exp_burn = 0;
+    if (!recompute_mint(mint.proof, db, outs, exp_burn, error)) return false;
+
+    if (mint.burn_amount != exp_burn) { error = "mint burn mismatch"; return false; }
+    if (mint.outputs.size() != outs.size()) { error = "mint output count mismatch"; return false; }
+    for (size_t i = 0; i < outs.size(); ++i) {
+        if (mint.outputs[i].recipient != outs[i].recipient ||
+            mint.outputs[i].amount    != outs[i].amount) {
+            error = "mint output mismatch";
+            return false;
+        }
+    }
     return true;
 }
 

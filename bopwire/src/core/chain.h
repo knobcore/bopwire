@@ -28,6 +28,21 @@ struct ChainTip {
     uint64_t weight = 0;
 };
 
+// Reorg finality cap (Phase 0). No fork may rewrite history deeper than this
+// many blocks below the current tip: reorg_to_branch rejects a branch whose
+// fork point is older than tip.height - FINALITY_DEPTH. This bounds the depth a
+// costless heavier fork can rewrite (fork weight is cheap without stake/PoW —
+// hardened in the sybil/finality phase) and, symmetrically, makes it SAFE to
+// prune tx bodies below this depth: nothing valid will ever reorg past it.
+// Tunable pre-mainnet; must exceed the deepest realistic honest partition heal.
+static constexpr uint32_t FINALITY_DEPTH = 1000;
+
+// Clock-skew allowance for a flooded tx's origin submit_ms relative to the
+// current tip's block timestamp. Together with the lower bound
+// (tip_ts - PROPAGATION_WINDOW_MS) this lets ingest reject both future-dated and
+// backdated-"instantly-mature" txs, so a peer can't manufacture maturity.
+static constexpr uint64_t MAX_SUBMIT_SKEW_MS = 5'000;
+
 // Hardcoded checkpoint baked into the binary. Any chain we sync from a
 // peer MUST contain this exact block hash at this exact height — if not,
 // the peer is feeding us a fork that branches before the checkpoint,

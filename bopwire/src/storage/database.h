@@ -145,6 +145,14 @@ public:
     void                    set_content_height(leveldb::WriteBatch& b, const Hash256& ch, uint32_t height);
     std::optional<uint32_t> get_content_height(const Hash256& ch) const;
 
+    // Resolve the full on-chain SongSection (artist_address + royalty_splits +
+    // duration) for a content hash from the canonical block store, via
+    // bh:<ch> -> n:<height> -> b:<hash> -> deserialize -> song. This is the
+    // authoritative source mint recomputation reads (SongMeta / sm: does not
+    // carry artist_address or royalty_splits). Returns nullopt if the song is
+    // not on chain or its block carries no song section.
+    std::optional<SongSection> get_song_section(const Hash256& ch) const;
+
     // ---- Moderator / deleted songs (m:, d:) --------------------------
     bool is_moderator(const Address& addr) const;
     void add_moderator(leveldb::WriteBatch& b, const Address& addr);

@@ -13,7 +13,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# When set, only the mini-node + mc_rats_quic targets are configured. Skips
+# When set, only the mini-node + rats (librats) targets are configured. Skips
 # the heavy media/chain deps (ffmpeg, chromaprint, leveldb, ...) that the
 # full home-node needs but the VPS rendezvous binary does not. Used by the
 # Linux mini-node cross-build in WSL.
@@ -200,15 +200,11 @@ if(MINIUPNPC_FOUND)
   list(APPEND MC_LINK_LIBS ${MINIUPNPC_LIBRARIES})
 endif()
 
-list(APPEND MC_LINK_LIBS mc_rats_quic)
+list(APPEND MC_LINK_LIBS rats)
 
-# NOTE (historical): src/transport/mc_rats_quic.cpp was a custom msquic-based
-# reimplementation of the librats C API. That QUIC bridge was removed; the
-# real transport is now librats (frozen v0.2.0), and `mc_rats_quic` is just a
-# CMake ALIAS for the `rats` target (see the add_library(mc_rats_quic ALIAS
-# rats) below) so older link references keep resolving. The include dir is
-# retained for the few headers (e.g. cert_util.h) still shared with the
-# opt-in HTTP/3 surface.
+# Transport is librats (frozen v0.2.0), linked directly as the `rats` target.
+# The src/transport include dir is retained for the few headers (e.g.
+# cert_util.h) still shared with the opt-in HTTP/3 surface.
 list(APPEND MC_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/src/transport")
 
 # ---- Windows: socket libs needed by rats_link / peer code ----
@@ -308,11 +304,8 @@ add_subdirectory(deps/librats EXCLUDE_FROM_ALL)
 # Rename the output so it lands next to the Dart FFI loader as mc_rats.dll /
 # libmc_rats.so.
 set_target_properties(rats PROPERTIES OUTPUT_NAME mc_rats)
-# `mc_rats` alias for the rest of the project — code that used to link against
-# our old mc_rats_quic STATIC target now links the librats shared library.
+# `mc_rats` alias for the rest of the project (the librats shared library).
 add_library(mc_rats ALIAS rats)
-# Older code paths may still reference mc_rats_quic by name — alias too.
-add_library(mc_rats_quic ALIAS rats)
 
 # ---- sacad album-art static library (bopwire-node only) ----
 #
@@ -480,7 +473,7 @@ add_executable(bopwire-mini-node
   src/core/block.cpp
   src/core/transaction.cpp)
 target_link_libraries(bopwire-mini-node PRIVATE
-  mc_rats_quic
+  rats
   wallycore
   secp256k1
   ${MC_OPENSSL_SSL}
@@ -519,7 +512,7 @@ endif()
 # Dart/Flutter, so we can adb push to the phone and run from `adb shell` on
 # cellular to validate the live network end-to-end.
 add_executable(library_smoke_cli tools/library_smoke_cli.cpp)
-target_link_libraries(library_smoke_cli PRIVATE mc_rats_quic)
+target_link_libraries(library_smoke_cli PRIVATE rats)
 if(WIN32)
   target_link_libraries(library_smoke_cli PRIVATE ws2_32 iphlpapi bcrypt)
 endif()
@@ -553,7 +546,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/modclient_main.cpp")
     src/core/block.cpp
     src/core/transaction.cpp)
   target_link_libraries(bopwire-modclient PRIVATE
-    mc_rats_quic
+    rats
     wallycore
     secp256k1
     ${MC_OPENSSL_SSL}
@@ -579,7 +572,7 @@ endif()
 # (h3_smoke removed — HTTP/3 surface gone)
 
 # bopwire-web-gateway — browser-facing HTTPS/JSON gateway for the web player
-# (webplayer/). A headless librats peer (mc_rats_quic) that joins the mini mesh,
+# (webplayer/). A headless librats peer that joins the mini mesh,
 # serves the Discover feed + audio over plain HTTP (Caddy terminates TLS), and
 # runs play sessions so web plays mint the artist/seeder/mini reward. Source
 # lives under webplayer/gateway/ so the web player is self-contained.
@@ -591,8 +584,7 @@ target_compile_features(bopwire-web-gateway PRIVATE cxx_std_17)
 target_include_directories(bopwire-web-gateway PRIVATE
   ${CMAKE_SOURCE_DIR}/deps/librats/src      # librats_c.h, json.hpp
   ${CMAKE_SOURCE_DIR}/deps/cpp-httplib)      # httplib.h (header-only, plain HTTP)
-# Link the real librats target directly (NOT the mc_rats_quic alias — QUIC was
-# scrapped and that alias is going away). `rats` is what deps/librats defines.
+# Link the librats target directly. `rats` is what deps/librats defines.
 target_link_libraries(bopwire-web-gateway PRIVATE rats)
 if(WIN32)
   target_link_libraries(bopwire-web-gateway PRIVATE ws2_32 iphlpapi bcrypt)
