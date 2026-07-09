@@ -256,6 +256,9 @@ private:
     // once (content-addressed dedup) and matured in the same window as the tx.
     static void on_settle_body_cb(void* user_data, const char* peer_id,
                                   const char* message_data);
+    // H1: serve a settlement body by merkle root to a peer that requests it.
+    static void on_settle_body_get_cb(void* user_data, const char* peer_id,
+                                      const char* message_data);
 public:
     // Public: node_main's relay-reward sweep flows RelayRewardTx through the
     // same replicated mempool path (stamp pt: + flood) as wallet.transfer, so
@@ -265,6 +268,8 @@ public:
     // companion body through here (store sb:<root> + flood). Returns true if
     // newly stored. body_hex = hex(serialize_settle_body(sorted proofs)).
     bool ingest_settle_body(const std::string& body_hex, bool broadcast_if_new);
+    // H1: broadcast a request for a settlement body we're missing (by merkle root).
+    void request_settle_body(const Hash256& root);
 private:
 
     /// Receive a moderation envelope from a peer (broadcast or sync push)

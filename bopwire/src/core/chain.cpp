@@ -16,7 +16,7 @@
 
 namespace mc {
 
-Chain::Chain(Database& db) : db_(db) {
+Chain::Chain(Database& db) : db_(db), ledger_(db_) {
     // Seed the effective checkpoint set from the baked-in list (#7).
     for (const auto& c : hardcoded_checkpoints())
         checkpoints_[c.height] = c.hash;
@@ -204,7 +204,7 @@ bool Chain::apply_transfer(const TransferTx& tx, leveldb::WriteBatch& batch) {
     if (!tx.verify_signature()) return false;
     uint64_t expected = next_expected_nonce(tx.from_address);
     if (tx.nonce != expected) return false;
-    Ledger ledger(db_);
+    Ledger& ledger = ledger_;   // C2: shared block-scoped overlay
     if (!ledger.transfer(batch, tx.from_address, tx.to_address, tx.amount)) return false;
     db_.set_nonce(batch, tx.from_address, expected + 1);
     record_applied_nonce(tx.from_address, expected + 1);
@@ -235,6 +235,8 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
     // votes from this block once they're explicitly recorded.
     proposal_votes_in_block_.clear();
     applied_nonce_in_block_.clear();
+    sessions_used_in_block_.clear();
+    ledger_.reset();   // C2: fresh block-scoped balance/supply overlay
 
     for (const auto& raw_tx : block.transactions) {
         if (raw_tx.empty()) continue;
@@ -264,6 +266,13 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
                     std::cerr << "[chain] apply: MINT validation failed: " << mint_err << "\n";
                     return false;
                 }
+            }
+            // C1: consume the session at most once per block. is_session_used
+            // (inside validate_mint) only sees COMMITTED u: markers, not this
+            // block's staged ones, so [MINT,MINT] for one signed proof would
+            // otherwise credit twice — deterministic supply inflation.
+            if (!sessions_used_in_block_.insert(mint.proof.session_id).second) {
+                std::cerr << "[chain] apply: duplicate session in block (MINT)\n"; return false;
             }
             uint64_t play_count = db_.get_play_count(mint.proof.content_hash);
             if (!apply_mint(mint, play_count, batch)) {
@@ -347,7 +356,7 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
 
 bool Chain::apply_mint(const MintTx& mint, uint64_t play_count_before,
                        leveldb::WriteBatch& batch) {
-    Ledger ledger(db_);
+    Ledger& ledger = ledger_;   // C2: shared block-scoped overlay
 
     // BUG FIX: reject mints where any output recipient is the zero
     // address. compute_mint_outputs already skips zero-recipient
@@ -366,7 +375,7 @@ bool Chain::apply_mint(const MintTx& mint, uint64_t play_count_before,
     {
         uint64_t mint_total = 0;
         for (const auto& out : mint.outputs) mint_total += out.amount;
-        uint64_t current_supply = db_.get_total_supply();
+        uint64_t current_supply = ledger.total_supply();   // C2: overlay-aware
         if (mint_total > 0 && current_supply + mint_total > SUPPLY_CAP) {
             return false;
         }
@@ -374,12 +383,10 @@ bool Chain::apply_mint(const MintTx& mint, uint64_t play_count_before,
     // Burn tokens from player if applicable (post-10k plays + non-zero
     // burn rate from the current supply).
     if (mint.burn_amount > 0) {
-        uint64_t bal = db_.get_balance(mint.proof.player_address);
+        uint64_t bal = ledger.balance(mint.proof.player_address);   // C2: overlay-aware
         if (bal < mint.burn_amount) return false; // safety net: session_start already checked
         ledger.debit(batch, mint.proof.player_address, mint.burn_amount);
-        uint64_t supply = db_.get_total_supply();
-        db_.set_total_supply(batch,
-            supply >= mint.burn_amount ? supply - mint.burn_amount : 0);
+        ledger.decrement_supply(batch, mint.burn_amount);          // C2: overlay-aware
     }
 
     // BUG FIX: replay protection moved BEFORE the credit so a tx
@@ -629,13 +636,13 @@ bool Chain::apply_relay_reward(const RelayRewardTx& tx,
     // Hard supply cap — Ledger::credit bumps total_supply, so relay rewards
     // inflate supply; reject rather than overshoot SUPPLY_CAP.
     {
-        uint64_t current_supply = db_.get_total_supply();
+        uint64_t current_supply = ledger.total_supply();   // C2: overlay-aware
         if (current_supply + amount > SUPPLY_CAP) {
             std::cerr << "[chain] relay_reward reject: would exceed SUPPLY_CAP\n";
             return false;
         }
     }
-    Ledger ledger(db_);
+    Ledger& ledger = ledger_;   // C2: shared block-scoped overlay
     ledger.credit(batch, tx.target_address, amount);
     db_.set_nonce(batch, tx.issuer_address, expected + 1);
     record_applied_nonce(tx.issuer_address, expected + 1);
@@ -669,12 +676,16 @@ bool Chain::apply_node_auth(const NodeAuthTx& tx, leveldb::WriteBatch& batch) {
     if (std::memcmp(derived_id.data(), tx.node_id.data(), 32) != 0) {
         std::cerr << "[chain] node_auth reject: node_id != sha256(pubkey)\n"; return false;
     }
-    const std::string key = "v:" + db_.hex(tx.node_id);
-    if (tx.authorize)
+    const std::string key  = "v:"  + db_.hex(tx.node_id);
+    const std::string akey = "va:" + db_.hex(tx.node_id);  // ON-CHAIN-authorized marker
+    if (tx.authorize) {
         db_.put_batch(batch, key,
                       std::vector<uint8_t>(tx.node_pubkey.begin(), tx.node_pubkey.end()));
-    else
+        db_.put_batch(batch, akey, {});   // lets the founder emitter stop re-issuing (C3)
+    } else {
         batch.Delete(key);
+        batch.Delete(akey);
+    }
     db_.set_nonce(batch, tx.issuer_address, expected + 1);
     record_applied_nonce(tx.issuer_address, expected + 1);
     std::cout << "[chain] NODE_AUTH: " << (tx.authorize ? "grant" : "revoke")
@@ -769,6 +780,18 @@ bool Chain::apply_settlement_mint(const SettlementMintTx& tx,
         if (c != 0) return c < 0;
         return std::memcmp(a.session_id.data(), b.session_id.data(), 32) < 0;
     });
+    // M1: a duplicate (content_hash, session_id) ties the sort key, leaving a
+    // platform-dependent leaf order and thus a divergent Merkle root -> fork.
+    // Reject deterministically (a dup is a dup regardless of the tied order).
+    for (size_t i = 1; i < proofs.size(); ++i) {
+        if (std::memcmp(proofs[i].content_hash.data(),
+                        proofs[i-1].content_hash.data(), 32) == 0 &&
+            std::memcmp(proofs[i].session_id.data(),
+                        proofs[i-1].session_id.data(), 32) == 0) {
+            std::cerr << "[chain] settlement reject: duplicate (content_hash,session_id)\n";
+            return false;
+        }
+    }
     {
         std::vector<std::vector<uint8_t>> leaves;
         leaves.reserve(proofs.size());
@@ -779,17 +802,21 @@ bool Chain::apply_settlement_mint(const SettlementMintTx& tx,
         }
     }
     // 4) Recompute-authoritative walk with deterministic per-leaf skip.
-    Ledger ledger(db_);
+    Ledger& ledger = ledger_;   // C2: shared block-scoped overlay
     std::map<Hash256, uint64_t> song_ord;       // stepped play_count per song
     std::map<Address, uint64_t> credits;        // recipient -> amount
     std::unordered_set<std::string> used_in_batch;
-    const uint64_t base_supply = db_.get_total_supply();
+    const uint64_t base_supply = ledger.total_supply();   // C2: overlay-aware
     uint64_t running_supply = base_supply;
     for (const auto& pr : proofs) {
         std::string cperr;
         if (!check_play(pr, db_, cperr)) continue;                 // invalid proof -> skip
         const std::string sid = db_.hex(pr.session_id);
-        if (used_in_batch.count(sid)) continue;                    // dup within this batch
+        // C1: skip a session already consumed within this body OR by any earlier
+        // tx in the SAME block (a MINT or another settlement) — is_session_used
+        // in check_play only sees committed u: markers.
+        if (used_in_batch.count(sid) ||
+            sessions_used_in_block_.count(pr.session_id)) continue;
         auto song = db_.get_song_section(pr.content_hash);
         if (!song) continue;                                       // song not on chain -> skip
         auto it = song_ord.find(pr.content_hash);
@@ -804,12 +831,13 @@ bool Chain::apply_settlement_mint(const SettlementMintTx& tx,
         uint64_t out_sum = 0;
         for (const auto& o : outs) out_sum += o.amount;
         if (out_sum > 0 && running_supply + out_sum > SUPPLY_CAP) continue;   // skip
-        if (burn > 0 && db_.get_balance(pr.player_address) < burn)  continue;   // skip
+        if (burn > 0 && ledger.balance(pr.player_address) < burn)   continue;   // skip (C2)
         // Accept.
         for (const auto& o : outs) credits[o.recipient] += o.amount;
         running_supply += out_sum;
         song_ord[pr.content_hash] = pc + 1;
         used_in_batch.insert(sid);
+        sessions_used_in_block_.insert(pr.session_id);  // C1: block-scoped consume
         db_.put_batch(batch, "u:" + sid, {});          // per-play replay marker
         db_.update_song_state(batch, pr, pc);           // play_count++ (+ discoverer)
     }
@@ -995,7 +1023,7 @@ bool Chain::execute_proposal(const ProposalTx& prop,
             // overruns the balance just transfers what's there
             // instead of failing the whole tx.
             const Address escrow = crypto::escrow_address_for(prop.target_addr);
-            uint64_t balance     = db_.get_balance(escrow);
+            uint64_t balance     = ledger.balance(escrow);   // C2: overlay-aware
             uint64_t to_send     = std::min(balance, prop.amount);
             if (to_send == 0) {
                 // Nothing to release — still flip status so the
@@ -1003,7 +1031,7 @@ bool Chain::execute_proposal(const ProposalTx& prop,
                 db_.set_proposal_status(batch, prop_hash, Database::PROP_EXECUTED);
                 return true;
             }
-            Ledger ledger(db_);
+            Ledger& ledger = ledger_;   // C2: shared block-scoped overlay
             // If the artist is assigned to a record label, route the
             // escrow through the label's wallet splits instead of
             // crediting the artist directly. Splits are in basis points
@@ -1648,6 +1676,7 @@ bool Chain::rebuild_derived_state() {
         }
         applied_nonce_in_block_.clear();
         proposal_votes_in_block_.clear();
+        sessions_used_in_block_.clear();
         if (!apply_transactions(*block, h, batch)) {
             std::cerr << "[chain] replay: block " << h
                       << " apply_transactions failed — stopping\n";

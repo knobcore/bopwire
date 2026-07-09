@@ -763,6 +763,51 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
                           << " tx_hash=" << mc::crypto::to_hex(h) << "\n";
             });
 
+        // ---- C3: put this node's v: entry ON-CHAIN via a founder-signed
+        // NodeAuthTx, so a SECOND validating node accepts this node's reward
+        // blocks (its local check_play looks up v:[node_id] in ITS own DB). The
+        // boot-time db.put("v:"...) is only a local producer hint; this makes it
+        // replicated. Retries every 30s until va:<node_id> confirms it landed,
+        // and only when this node holds the founder.seed that owns the chain
+        // founder (a relay/non-founder node never authorizes anyone).
+        std::thread node_auth_thread([&db, &cfg, &keypair, &rats_api]() {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(30));
+                if (db.get("va:" + db.hex(cfg.node_id)).has_value()) return;  // on chain
+                auto chain_founder = db.get_founder();
+                if (!chain_founder) continue;                                 // no founder yet
+                std::ifstream sf(cfg.data_dir + "/founder.seed");
+                if (!sf) continue;
+                std::string mnemonic; std::getline(sf, mnemonic);
+                while (!mnemonic.empty() && (mnemonic.back() == '\r' ||
+                       mnemonic.back() == '\n' || mnemonic.back() == ' '))
+                    mnemonic.pop_back();
+                auto kp = mc::crypto::bip39_mnemonic_to_keypair(mnemonic, "");
+                if (!kp || std::memcmp(chain_founder->data(),
+                                       kp->address.data(), 20) != 0) continue;
+                mc::NodeAuthTx na{};
+                na.node_id        = cfg.node_id;
+                na.node_pubkey    = keypair.public_key;   // node_id == sha256(this)
+                na.authorize      = 1;
+                na.issuer_address = kp->address;
+                na.issuer_pubkey  = kp->public_key;
+                na.nonce          = db.get_nonce(kp->address);
+                auto msg = na.sign_message();
+                auto hh  = mc::crypto::sha256(msg.data(), msg.size());
+                na.signature = mc::crypto::sign_ecdsa(hh, kp->private_key);
+                nlohmann::json txe = {
+                    {"tx", mc::crypto::to_hex(na.serialize())},
+                    {"submit_ms", static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count())},
+                };
+                if (rats_api.ingest_tx(txe.dump(), /*broadcast_if_new=*/true))
+                    std::cerr << "[nodeauth] emitted NodeAuthTx for v:"
+                              << db.hex(cfg.node_id).substr(0, 12) << "…\n";
+            }
+        });
+        node_auth_thread.detach();
+
         // ---- Deterministic Discover curation (collections.list) -----
         //
         // Pure read job: once per epoch the curator scans on-chain song

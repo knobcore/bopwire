@@ -3,6 +3,7 @@
 #include "block.h"
 #include "transaction.h"
 #include "../storage/database.h"
+#include "../tokens/ledger.h"   // block-scoped Ledger member (C2 overlay)
 #include <optional>
 #include <string>
 #include <map>
@@ -312,6 +313,11 @@ private:
     // updates and double-applying blocks.
     mutable std::mutex mu_;
     Database& db_;
+    // One Ledger reused for a whole block-apply (C2). apply_transactions resets
+    // its overlay at the top and every apply_* routes balance/supply reads +
+    // writes through it, so two txs in one block see each other's staged effects
+    // (no double-spend / supply clobber). Block-apply is serialized under mu_.
+    Ledger    ledger_;
     ChainTip  tip_{};
 
     // Effective checkpoint set (#7): seeded from hardcoded_checkpoints()
@@ -339,6 +345,16 @@ private:
     // case is bootstrap, which emits GRANT (nonce 0) + UsernameTx
     // (nonce 1) for the same founder address back-to-back.
     std::map<Address, uint64_t> applied_nonce_in_block_;
+
+    // Block-scoped session-consumption set (C1). is_session_used reads only
+    // COMMITTED "u:" markers, which are staged in the block's WriteBatch and not
+    // visible until the block commits — so without this, the SAME node-signed
+    // PlayProof could be credited multiple times in one block (as [MINT,MINT],
+    // MINT+SETTLEMENT, or two settlements), deterministically inflating supply.
+    // Every mint path consults + inserts here so a session is consumed at most
+    // once per block, matching the committed-marker semantics. Cleared per block
+    // beside the two staging maps above.
+    std::set<Hash256> sessions_used_in_block_;
 
     // Read the next-expected nonce for `addr` considering both the DB
     // and any nonces already advanced earlier in the current block.

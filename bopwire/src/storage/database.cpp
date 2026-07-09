@@ -1012,7 +1012,15 @@ void Database::clear_derived_state() {
     // bh: row is absent until its own replay step writes it, so replay never
     // false-positives on the block it is currently validating).
     leveldb::WriteBatch batch;
-    const std::vector<std::string> prefixes{"a:", "s:", "f:", "i:", "u:", "bh:"};
+    // NOTE "us:" is listed EXPLICITLY: the "u:" scan does not catch it (byte[1]
+    // 's' != ':'). us:<node>:<epoch> is the settlement epoch-replay guard — it is
+    // block-derived, so leaving it would make rebuild_derived_state's replay fail
+    // at the first SETTLEMENT_MINT (guard still set) and truncate the chain (C4).
+    // "va:" (settlement... no: on-chain node-authorized marker, block-derived by
+    // NodeAuthTx) is cleared so replay re-derives it; "v:" itself is NOT cleared
+    // (it is also written node-locally at boot for the node's own preflight and
+    // is re-derived idempotently by NodeAuthTx replay).
+    const std::vector<std::string> prefixes{"a:", "s:", "f:", "i:", "u:", "us:", "va:", "bh:"};
     for (const auto& prefix : prefixes) {
         auto* it = db_->NewIterator(leveldb::ReadOptions());
         for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next())

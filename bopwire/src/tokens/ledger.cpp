@@ -70,13 +70,33 @@ Ledger::Ledger(Database& db) : db_(db) {}
 // mint multiple outputs in one batch use credit_many() and pass them
 // in a single shot.
 
+// Overlay-aware primitives (C2). rd_* return the block-scoped staged value if
+// present, else seed it from committed state; wr_* update BOTH the overlay and
+// the WriteBatch, so later txs in the same block see earlier ones' effects.
+uint64_t Ledger::rd_bal(const Address& a) const {
+    auto it = bal_overlay_.find(a);
+    if (it != bal_overlay_.end()) return it->second;
+    uint64_t v = db_.get_balance(a);
+    bal_overlay_[a] = v;
+    return v;
+}
+uint64_t Ledger::rd_supply() const {
+    if (!supply_overlay_) supply_overlay_ = db_.get_total_supply();
+    return *supply_overlay_;
+}
+void Ledger::wr_bal(leveldb::WriteBatch& batch, const Address& a, uint64_t v) {
+    bal_overlay_[a] = v;
+    db_.set_balance(batch, a, v);
+}
+void Ledger::wr_supply(leveldb::WriteBatch& batch, uint64_t v) {
+    supply_overlay_ = v;
+    db_.set_total_supply(batch, v);
+}
+
 void Ledger::credit(leveldb::WriteBatch& batch, const Address& addr, uint64_t amount) {
     if (amount == 0) return;
-    uint64_t bal = db_.get_balance(addr);
-    bal += amount;
-    db_.set_balance(batch, addr, bal);
-    uint64_t supply = db_.get_total_supply();
-    db_.set_total_supply(batch, supply + amount);
+    wr_bal(batch, addr, rd_bal(addr) + amount);
+    wr_supply(batch, rd_supply() + amount);
 }
 
 void Ledger::credit_many(leveldb::WriteBatch& batch,
@@ -90,21 +110,17 @@ void Ledger::credit_many(leveldb::WriteBatch& batch,
         per_addr[addr] += amount;
         total_minted   += amount;
     }
-    for (const auto& [addr, amount] : per_addr) {
-        const uint64_t bal = db_.get_balance(addr) + amount;
-        db_.set_balance(batch, addr, bal);
-    }
-    if (total_minted > 0) {
-        const uint64_t supply = db_.get_total_supply();
-        db_.set_total_supply(batch, supply + total_minted);
-    }
+    for (const auto& [addr, amount] : per_addr)
+        wr_bal(batch, addr, rd_bal(addr) + amount);
+    if (total_minted > 0)
+        wr_supply(batch, rd_supply() + total_minted);
 }
 
 bool Ledger::debit(leveldb::WriteBatch& batch, const Address& addr, uint64_t amount) {
     if (amount == 0) return true;
-    uint64_t bal = db_.get_balance(addr);
+    uint64_t bal = rd_bal(addr);
     if (bal < amount) return false;
-    db_.set_balance(batch, addr, bal - amount);
+    wr_bal(batch, addr, bal - amount);
     return true;
 }
 
@@ -112,17 +128,16 @@ bool Ledger::transfer(leveldb::WriteBatch& batch,
                        const Address& from, const Address& to, uint64_t amount) {
     if (amount == 0) return true;
     if (from == to)  return true;
-    uint64_t from_bal = db_.get_balance(from);
+    uint64_t from_bal = rd_bal(from);
     if (from_bal < amount) return false;
-    uint64_t to_bal = db_.get_balance(to);
-    db_.set_balance(batch, from, from_bal - amount);
-    db_.set_balance(batch, to, to_bal + amount);
+    uint64_t to_bal = rd_bal(to);
+    wr_bal(batch, from, from_bal - amount);
+    wr_bal(batch, to, to_bal + amount);
     return true;
 }
 
-uint64_t Ledger::balance(const Address& addr) const {
-    return db_.get_balance(addr);
-}
+uint64_t Ledger::balance(const Address& addr) const { return rd_bal(addr); }
+uint64_t Ledger::total_supply() const { return rd_supply(); }
 
 std::string Ledger::format_balance(uint64_t internal_units) {
     uint64_t whole   = internal_units / TOKEN_DECIMALS;

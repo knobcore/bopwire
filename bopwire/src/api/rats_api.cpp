@@ -59,6 +59,7 @@ constexpr const char* MC_PLAYLIST_TYPE = "bopwire.playlist"; // DB2 playlist gos
 constexpr const char* MC_FPSUBMIT_TYPE = "bopwire.fpsubmit"; // shared song mempool flood
 constexpr const char* MC_TX_TYPE       = "bopwire.tx";       // shared tx mempool flood
 constexpr const char* MC_SETTLE_BODY   = "bopwire.settlebody"; // settlement companion-body flood (Phase 3)
+constexpr const char* MC_SETTLE_BODY_GET = "bopwire.settlebodyget"; // request a body by merkle root (H1)
 
 namespace {
 // Load the Shared Moderation Key recipient — (address, pubkey) — from
@@ -151,6 +152,8 @@ void RatsApi::start(rats_client_t client) {
                     &RatsApi::on_tx_cb, this);
     rats_on_message(client_, MC_SETTLE_BODY,
                     &RatsApi::on_settle_body_cb, this);
+    rats_on_message(client_, MC_SETTLE_BODY_GET,
+                    &RatsApi::on_settle_body_get_cb, this);
     // Rebuild the producer's song buffer from the persisted sp: mempool so a
     // restart re-derives the identical build set.
     load_pending_songs_from_db_();
@@ -3392,6 +3395,15 @@ bool RatsApi::ingest_tx(const std::string& payload_json, bool broadcast_if_new) 
     const uint64_t submit_ms = env.value("submit_ms", static_cast<uint64_t>(0));
     const Hash256  tx_hash   = crypto::sha256(raw.data(), raw.size());
 
+    // H1: a settlement whose companion body we lack fails the body-present
+    // preflight — request the body first so a re-flood / block-apply succeeds
+    // once it arrives (the missed-flood / IBD case).
+    if (static_cast<TxType>(raw[0]) == TxType::SETTLEMENT_MINT) {
+        SettlementMintTx sm;
+        if (SettlementMintTx::deserialize(raw.data(), raw.size(), sm) &&
+            !db_.get("sb:" + crypto::to_hex(sm.constituents_merkle_root)).has_value())
+            request_settle_body(sm.constituents_merkle_root);
+    }
     // Same pre-flight the producer applies, so a bad tx never floods.
     if (!tx_preflight_ok(raw, db_)) return false;
 
@@ -3447,6 +3459,14 @@ bool RatsApi::ingest_settle_body(const std::string& body_hex, bool broadcast_if_
         if (c != 0) return c < 0;
         return std::memcmp(a.session_id.data(), b.session_id.data(), 32) < 0;
     });
+    // M1: reject a body with a duplicate (content_hash, session_id) pair — it
+    // would tie the sort key and yield a platform-dependent root (fork).
+    for (size_t i = 1; i < proofs.size(); ++i)
+        if (std::memcmp(proofs[i].content_hash.data(),
+                        proofs[i-1].content_hash.data(), 32) == 0 &&
+            std::memcmp(proofs[i].session_id.data(),
+                        proofs[i-1].session_id.data(), 32) == 0)
+            return false;
     std::vector<std::vector<uint8_t>> leaves;
     leaves.reserve(proofs.size());
     for (const auto& pr : proofs) leaves.push_back(pr.serialize());
@@ -3474,6 +3494,34 @@ void RatsApi::on_settle_body_cb(void* user_data, const char* peer_id,
     } catch (const std::exception& e) {
         std::cerr << "[rats-api] settle-body handler threw: " << e.what() << "\n";
     }
+    rats_string_free(peer_id);
+    rats_string_free(message_data);
+}
+
+void RatsApi::request_settle_body(const Hash256& root) {
+    // H1: ask peers for a settlement body we're missing (merkle root -> sb:).
+    if (client_)
+        rats_broadcast_message(client_, MC_SETTLE_BODY_GET,
+                               crypto::to_hex(root).c_str());
+}
+
+void RatsApi::on_settle_body_get_cb(void* user_data, const char* peer_id,
+                                    const char* message_data) {
+    auto* self = static_cast<RatsApi*>(user_data);
+    if (!self || !message_data) {
+        if (peer_id)      rats_string_free(peer_id);
+        if (message_data) rats_string_free(message_data);
+        return;
+    }
+    try {
+        // message_data = hex(root). If we hold sb:<root>, flood it so the
+        // requester (e.g. a node doing IBD after the original one-shot flood)
+        // can obtain the body and apply the settlement block.
+        const std::string key = "sb:" + std::string(message_data);
+        if (auto body = self->db_.get(key); body && self->client_)
+            rats_broadcast_message(self->client_, MC_SETTLE_BODY,
+                                   crypto::to_hex(*body).c_str());
+    } catch (...) {}
     rats_string_free(peer_id);
     rats_string_free(message_data);
 }

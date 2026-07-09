@@ -3,6 +3,8 @@
 #include "../core/block.h"
 #include "../storage/database.h"
 #include <leveldb/write_batch.h>
+#include <map>
+#include <optional>
 
 namespace mc {
 
@@ -89,8 +91,21 @@ public:
     bool transfer(leveldb::WriteBatch& batch,
                   const Address& from, const Address& to, uint64_t amount);
 
-    // Query balance
+    // Query balance (overlay-aware: sees this block's staged credits/debits).
     uint64_t balance(const Address& addr) const;
+    // Query total supply (overlay-aware).
+    uint64_t total_supply() const;
+
+    // Drop the block-scoped overlay (call at the start of each block-apply when
+    // reusing one Ledger across a block).
+    void reset() { bal_overlay_.clear(); supply_overlay_.reset(); }
+
+    // Burn: reduce total_supply by `amount` (overlay-aware), floored at 0. Used
+    // by the post-10k listener burn so the burn is visible to later txs' cap math.
+    void decrement_supply(leveldb::WriteBatch& b, uint64_t amount) {
+        uint64_t s = rd_supply();
+        wr_supply(b, s >= amount ? s - amount : 0);
+    }
 
     // Format balance as decimal string with 8 decimal places
     static std::string format_balance(uint64_t internal_units);
@@ -100,6 +115,17 @@ public:
 
 private:
     Database& db_;
+    // Block-scoped overlay (C2). A leveldb WriteBatch is not readable, so when a
+    // SINGLE Ledger is used for a whole block-apply, every staged balance/supply
+    // write is mirrored here and reads go through it — otherwise two txs in one
+    // block both read the committed value and double-spend / clobber supply. A
+    // fresh Ledger (read-only queries) has an empty overlay == committed reads.
+    mutable std::map<Address, uint64_t> bal_overlay_;
+    mutable std::optional<uint64_t>     supply_overlay_;
+    uint64_t rd_bal(const Address& a) const;
+    uint64_t rd_supply() const;
+    void     wr_bal(leveldb::WriteBatch& b, const Address& a, uint64_t v);
+    void     wr_supply(leveldb::WriteBatch& b, uint64_t v);
 };
 
 } // namespace mc
