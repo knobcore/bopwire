@@ -487,24 +487,38 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
         // applicability gate directly below still sees a clean body. This is
         // a producer-side fairness rule (deterministic across honest
         // producers), not re-checked by Block::validate, so it never forks.
+        //
+        // Contiguity is load-bearing: once a sender exceeds its metered cap we
+        // must drop that sender's ENTIRE remaining tail — including exempt
+        // (RELAY_REWARD/etc.) txs at higher nonces — because every tx type from
+        // one address shares a single monotonic nonce table. Keeping an exempt
+        // tx after dropping a lower-nonce metered one would leave a nonce GAP,
+        // and the applicability gate below would then del_pending_tx the
+        // (perfectly valid) exempt tx, silently destroying e.g. a mini-node
+        // relay reward. Dropping the whole tail keeps survivors a contiguous
+        // nonce prefix; the overflow stays in the mempool and drains next block.
         {
             std::vector<TxSlot> capped;
             capped.reserve(included.size());
             Address  cur_sender{};
             bool     have_cur = false;
             uint32_t cur_count = 0;
+            bool     dropping_sender = false;
             for (auto& s : included) {
+                if (!have_cur || s.sender != cur_sender) {
+                    cur_sender = s.sender; have_cur = true;
+                    cur_count = 0; dropping_sender = false;
+                }
+                if (dropping_sender) continue;   // sender capped: drop its tail
                 const TxType t = s.raw.empty() ? TxType::MINT
                                                : static_cast<TxType>(s.raw[0]);
                 const bool metered = (t == TxType::TRANSFER ||
                                       t == TxType::USERNAME_REGISTER ||
                                       t == TxType::MODERATOR_PROPOSAL ||
                                       t == TxType::MODERATOR_OP);
-                if (metered) {
-                    if (!have_cur || s.sender != cur_sender) {
-                        cur_sender = s.sender; have_cur = true; cur_count = 0;
-                    }
-                    if (++cur_count > MAX_TXS_PER_SENDER_PER_BLOCK) continue;
+                if (metered && ++cur_count > MAX_TXS_PER_SENDER_PER_BLOCK) {
+                    dropping_sender = true;      // this tx + every later one for
+                    continue;                    // this sender are dropped
                 }
                 capped.push_back(std::move(s));
             }
@@ -513,23 +527,32 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
 
         // ---- Phase 5 step 5: global count + byte take-prefix -------------
         //
-        // Keep the canonical sorted prefix up to the count cap and a
-        // conservative byte budget (MAX_BLOCK_SIZE minus a fixed reserve for
-        // the song constellation + this block's mint/settlement bodies +
-        // header). Overflow stays in the mempool and is carried by the next
-        // block, which continues the same total-ordered prefix. The hard
-        // limit is Block::validate(); this keeps an honest producer's block
-        // under it in the first place.
+        // Keep the canonical sorted prefix up to the count cap and a byte
+        // budget derived from the ACTUAL non-tx overhead of THIS block, so the
+        // producer's own block provably serializes under MAX_BLOCK_SIZE (the
+        // hard Block::validate() gate — failing it would make the producer
+        // reject its own block and burn the song's retries). Overflow stays in
+        // the mempool and is carried by the next block along the same order.
+        // The reserve is computed from the song body's exact serialized size
+        // (all string16 fields are already bounded <=0xFFFF by Block::validate)
+        // plus per-tx length framing, not a magic constant.
         {
-            constexpr uint64_t kReservedBytes = 1u * 1024 * 1024;
+            uint64_t reserve = 512;   // header + separator + tx_count u32 + slack
+            if (reg) {
+                reserve += 1 + 32 + 2 + reg->compressed_fingerprint.size()
+                         + 4 + 2 + reg->title.size() + 2 + reg->artist.size()
+                         + 20 + 2 + reg->genre.size() + 2 + reg->album.size()
+                         + 2 + 2 + 1
+                         + static_cast<uint64_t>(reg->royalty_splits.size()) * 22ull;
+            }
             const uint64_t byte_budget =
-                MAX_BLOCK_SIZE > kReservedBytes ? MAX_BLOCK_SIZE - kReservedBytes : 0;
+                MAX_BLOCK_SIZE > reserve ? MAX_BLOCK_SIZE - reserve : 0;
             uint64_t cum = 0;
             std::vector<TxSlot> capped;
             capped.reserve(std::min<size_t>(included.size(), MAX_TXS_PER_BLOCK));
             for (auto& s : included) {
                 if (capped.size() >= MAX_TXS_PER_BLOCK) break;
-                cum += s.raw.size();
+                cum += s.raw.size() + 4;   // +4: this tx's length prefix framing
                 if (cum > byte_budget) break;
                 capped.push_back(std::move(s));
             }
@@ -637,9 +660,14 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
             block.header.fingerprint_hash   = crypto::sha256(
                 reinterpret_cast<const uint8_t*>(reg->compressed_fingerprint.data()),
                 reg->compressed_fingerprint.size());
+            // Bind the whole song body (artist_address, royalty_splits,
+            // audio_format, metadata) to the block id. Set BEFORE commit_block
+            // hashes/stamps the block so it is baked into the block-hash
+            // preimage; validate() re-checks it, so a malleated body is rejected.
+            block.header.song_body_hash     = block.compute_song_body_hash();
         }
-        // Heartbeat (no song): header.content_hash / fingerprint_hash
-        // stay zero — see Block::validate.
+        // Heartbeat (no song): header.content_hash / fingerprint_hash /
+        // song_body_hash stay zero — see Block::validate.
 
         std::string err;
         if (!commit_block(block, chain, db, network, cfg, keypair,

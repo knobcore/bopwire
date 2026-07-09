@@ -16,6 +16,22 @@
 
 namespace mc {
 
+namespace {
+// Byte length of a serialized accumulator vector (1024 lanes * 2 bytes).
+constexpr size_t kAccVecBytes = 1024 * 2;
+
+// RAII: activate a state accumulator for a scope and ALWAYS clear it on exit,
+// including on an exception thrown by a state writer — so Database::acc_ can
+// never be left dangling at a destroyed stack accumulator (audit #17).
+struct AccGuard {
+    Database& db;
+    AccGuard(Database& d, StateAccumulator* a) : db(d) { db.set_accumulator(a); }
+    ~AccGuard() { db.set_accumulator(nullptr); }
+    AccGuard(const AccGuard&) = delete;
+    AccGuard& operator=(const AccGuard&) = delete;
+};
+} // namespace
+
 Chain::Chain(Database& db) : db_(db), ledger_(db_) {
     // Seed the effective checkpoint set from the baked-in list (#7).
     for (const auto& c : hardcoded_checkpoints())
@@ -33,11 +49,24 @@ Chain::Chain(Database& db) : db_(db), ledger_(db_) {
         } catch (...) { /* skip malformed cp: key */ }
         return true;
     });
-    // P4: restore the committed state_root accumulator (empty on a fresh chain;
-    // rebuild_derived_state re-scans it after a reorg/replay).
+    // P4: restore the committed state_root accumulator. A valid sr:vec is
+    // EXACTLY kAccVecBytes; anything shorter (absent, truncated, torn write) is
+    // NOT silently treated as the zero/empty root — that would leave a non-empty
+    // ledger paired with a zero accumulator and permanently wedge every
+    // subsequent block at the state_root gate (audit #11). Instead re-derive it
+    // from the persisted state via an order-independent scan and persist it. On
+    // a genuinely fresh chain the scan sees no state leaves and returns the same
+    // zero vector, so this is correct in both cases. (A torn *reorg* — where the
+    // state itself is inconsistent — is separately caught by the sr:dirty marker
+    // in init(), which triggers a full replay-and-gate rebuild.)
     working_acc_.db = &db_;
-    if (auto v = db_.get("sr:vec"))
+    auto v = db_.get("sr:vec");
+    if (v && v->size() == kAccVecBytes) {
         committed_acc_ = StateAccumulator::deserialize_vec(*v);
+    } else {
+        committed_acc_ = db_.scan_state_accumulator();
+        db_.put("sr:vec", StateAccumulator::serialize_vec(committed_acc_));
+    }
 }
 
 bool Chain::checkpoint_ok(uint32_t height, const Hash256& hash) const {
@@ -85,7 +114,19 @@ uint64_t count_plays(const Block& block) {
 } // namespace
 
 bool Chain::init() {
-    return load_tip();
+    if (!load_tip()) return false;
+    // Self-heal an interrupted reorg/rebuild. The sr:dirty marker is set before
+    // the derived state is torn down and cleared only after the rebuild finishes
+    // and sr:vec is repersisted, so if it survives a restart the committed state,
+    // sr:vec, and the block store may be mutually inconsistent (a torn reorg that
+    // already moved t:tip). A full replay-and-gate rebuild is the only safe
+    // recovery; run it before serving or producing any block.
+    if (tip_.height > 0 && db_.get("sr:dirty")) {
+        std::cerr << "[chain] init: sr:dirty set — recovering from an interrupted "
+                     "reorg/rebuild by re-deriving state before serving\n";
+        rebuild_derived_state();
+    }
+    return true;
 }
 
 bool Chain::load_tip() {
@@ -157,33 +198,36 @@ bool Chain::connect_block(const Block& block) {
     db_.put_batch(batch, "t:tip", tip_val);
 
     // P4: from here on, STATE writes (song index + apply_transactions) feed the
-    // working accumulator seeded from the tip's committed root. Set AFTER the
-    // early-return checkpoint check so a rejected block never leaves acc_ dangling.
+    // working accumulator seeded from the tip's committed root. The AccGuard
+    // clears acc_ on every scope exit — including an exception thrown by a
+    // writer (#17). Seeded AFTER the early-return checkpoint check so a rejected
+    // block never leaves acc_ dangling.
     working_acc_.copy_from(committed_acc_);
     working_acc_.db = &db_;
-    db_.set_accumulator(&working_acc_);
+    bool tx_ok;
+    {
+        AccGuard g(db_, &working_acc_);
+        // Only song blocks populate the fingerprint / metadata / search
+        // indexes. Heartbeat blocks (block.has_song == false) carry an
+        // all-zero content_hash + empty fields; writing those would
+        // corrupt the indexes and the duplicate-song guard.
+        if (block.has_song) {
+            db_.put_fingerprint(batch, block.song);
+            db_.put_song_meta(batch, block.song.content_hash, block.song);
+            db_.add_to_artist_index(batch, block.song.artist, block.song.content_hash);
+            db_.add_to_genre_index(batch, block.song.genre, block.song.content_hash);
+            db_.set_content_height(batch, block.song.content_hash, new_height);
+            // The song has landed — drop its pending-song mempool row (sp:) in the
+            // SAME batch as the block writes, so a restart / rejoin never
+            // re-enqueues or re-floods a song that is already on chain. Runs for
+            // both self-minted and peer-adopted blocks (every node calls
+            // connect_block), so sp: converges to "not yet on chain" network-wide.
+            db_.del_batch(batch, "sp:" + db_.hex(block.song.content_hash));
+        }
 
-    // Only song blocks populate the fingerprint / metadata / search
-    // indexes. Heartbeat blocks (block.has_song == false) carry an
-    // all-zero content_hash + empty fields; writing those would
-    // corrupt the indexes and the duplicate-song guard.
-    if (block.has_song) {
-        db_.put_fingerprint(batch, block.song);
-        db_.put_song_meta(batch, block.song.content_hash, block.song);
-        db_.add_to_artist_index(batch, block.song.artist, block.song.content_hash);
-        db_.add_to_genre_index(batch, block.song.genre, block.song.content_hash);
-        db_.set_content_height(batch, block.song.content_hash, new_height);
-        // The song has landed — drop its pending-song mempool row (sp:) in the
-        // SAME batch as the block writes, so a restart / rejoin never
-        // re-enqueues or re-floods a song that is already on chain. Runs for
-        // both self-minted and peer-adopted blocks (every node calls
-        // connect_block), so sp: converges to "not yet on chain" network-wide.
-        db_.del_batch(batch, "sp:" + db_.hex(block.song.content_hash));
-    }
-
-    // Apply transactions
-    const bool tx_ok = apply_transactions(block, new_height, batch);
-    db_.set_accumulator(nullptr);   // P4: stop feeding — root now reflects post-apply state
+        // Apply transactions
+        tx_ok = apply_transactions(block, new_height, batch);
+    }   // P4: acc_ cleared here — root now reflects post-apply state
     if (!tx_ok) {
         std::cerr << "[chain] connect_block: apply_transactions failed at height "
                   << new_height << " with " << block.transactions.size()
@@ -240,20 +284,23 @@ Hash256 Chain::compute_candidate_state_root(const Block& block) {
     StateAccumulator acc;
     acc.copy_from(committed_acc_);
     acc.db = &db_;
-    db_.set_accumulator(&acc);
     leveldb::WriteBatch throwaway;
     const uint32_t h = tip_.height + 1;
-    if (block.has_song) {
-        db_.put_fingerprint(throwaway, block.song);
-        db_.put_song_meta(throwaway, block.song.content_hash, block.song);
-        db_.add_to_artist_index(throwaway, block.song.artist, block.song.content_hash);
-        db_.add_to_genre_index(throwaway, block.song.genre, block.song.content_hash);
-        db_.set_content_height(throwaway, block.song.content_hash, h);
+    {
+        // AccGuard clears acc_ on every exit; critical here because `acc` is a
+        // STACK local — a throw from a writer between set and reset would
+        // otherwise leave Database::acc_ pointing at freed stack memory (#17).
+        AccGuard g(db_, &acc);
+        if (block.has_song) {
+            db_.put_fingerprint(throwaway, block.song);
+            db_.put_song_meta(throwaway, block.song.content_hash, block.song);
+            db_.add_to_artist_index(throwaway, block.song.artist, block.song.content_hash);
+            db_.add_to_genre_index(throwaway, block.song.genre, block.song.content_hash);
+            db_.set_content_height(throwaway, block.song.content_hash, h);
+        }
+        apply_transactions(block, h, throwaway);
     }
-    apply_transactions(block, h, throwaway);
-    const Hash256 root = acc.root();
-    db_.set_accumulator(nullptr);
-    return root;
+    return acc.root();
 }
 
 bool Chain::apply_transfer(const TransferTx& tx, leveldb::WriteBatch& batch) {
@@ -545,7 +592,8 @@ bool Chain::apply_moderator_op(const ModeratorOpTx& tx,
             if (current == 0) return false; // nothing to revoke
             db_.set_mod_level(batch, tx.subject, 0);
             db_.set_nonce(batch, tx.proposer, expected + 1);
-            return true;
+            record_applied_nonce(tx.proposer, expected + 1);   // #18: match every
+            return true;                                       // other apply path
         }
         case ModOpCode::TAG_LABEL_EDIT: {
             // Founder-only metadata edit. The "action" field in the
@@ -602,7 +650,8 @@ bool Chain::apply_moderator_op(const ModeratorOpTx& tx,
                 return false;
             }
             db_.set_nonce(batch, tx.proposer, expected + 1);
-            return true;
+            record_applied_nonce(tx.proposer, expected + 1);   // #18: so a 2nd
+            return true;                                        // op/block applies
         }
     }
     return false;
@@ -1575,6 +1624,11 @@ bool Chain::reorg_to_branch(const Hash256& fork_hash, uint32_t fork_height,
         db_.write(b);
     };
 
+    // Crash-atomicity marker: set BEFORE write_branch moves t:tip, so any crash
+    // between the tip move and rebuild_derived_state finishing is detectable at
+    // next startup (init() re-runs the rebuild). rebuild clears it only after it
+    // repersists sr:vec. Covers both the adopt path and the restore path below.
+    db_.put("sr:dirty", std::vector<uint8_t>{1});
     if (!write_branch(branch, fork_height, fork_weight, new_tip_hash, new_height)) {
         err = "failed to write branch"; return false;
     }
@@ -1663,8 +1717,27 @@ bool Chain::rebuild_derived_state() {
     // If any block fails, we stop the replay and roll the chain back to
     // the last-known-good height. The DB tip pointer is rewritten so a
     // following startup picks up where we left off.
+    //
+    // P4: this path is ALSO where a reorg adopts a branch, so it must apply the
+    // SAME committed state_root gate as connect_block — otherwise a branch whose
+    // blocks carry a forged header.state_root would be accepted here yet rejected
+    // by a node that received the same blocks linearly (audit #2/#10). We keep a
+    // rolling committed accumulator (starts at the empty-state zero vector, since
+    // clear_derived_state just wiped everything) and, per block, seed a working
+    // copy, feed its state writes through the accumulator hook, and require
+    // working.root() == header.state_root before promoting — exactly mirroring
+    // connect_block. sr:vec is persisted in each block's own batch so it commits
+    // atomically with that block's derived state.
+    //
+    // Crash-atomicity (audit #3/#8): set sr:dirty BEFORE tearing down derived
+    // state and clear it only after the loop repersists a consistent sr:vec, so
+    // an interrupted rebuild is re-run by init() at the next startup instead of
+    // leaving t:tip/state/sr:vec mutually inconsistent.
+    db_.put("sr:dirty", std::vector<uint8_t>{1});
     db_.clear_derived_state();
 
+    StateAccumulator acc;      acc.db = &db_;          // rolling committed root
+    StateAccumulator working;  working.db = &db_;      // per-block working copy
     Hash256 prev_hash{};                             // genesis prev = zero
     uint32_t last_good_height = 0;
     uint64_t cum_weight = 0;                          // #8: cumulative plays
@@ -1714,37 +1787,56 @@ bool Chain::rebuild_derived_state() {
             break;
         }
 
-        // 4. Apply.
+        // 4. Apply — mirror connect_block's accumulator lifecycle + state_root
+        //    gate so a reorg-adopted block is accepted iff connect_block would.
         leveldb::WriteBatch batch;
-        if (block->has_song) {
-            db_.put_fingerprint(batch, block->song);
-            db_.put_song_meta(batch, block->song.content_hash, block->song);
-            db_.add_to_artist_index(batch, block->song.artist,
-                                     block->song.content_hash);
-            db_.add_to_genre_index(batch, block->song.genre,
-                                    block->song.content_hash);
-            // Rebuild the content-height marker (bh:) that song_on_chain's exact
-            // check consults. It is cleared in clear_derived_state, so replay
-            // MUST repopulate it here or the exact duplicate check goes blind on
-            // a restart / reorg. Written AFTER step 3's song_on_chain call above,
-            // so block h's own row is absent when h is checked (no self-hit),
-            // exactly like put_fingerprint. Mirrors connect_block.
-            db_.set_content_height(batch, block->song.content_hash, h);
-        }
-        applied_nonce_in_block_.clear();
-        proposal_votes_in_block_.clear();
-        sessions_used_in_block_.clear();
-        if (!apply_transactions(*block, h, batch)) {
+        working.copy_from(acc.vec);        // seed from the rolling committed root
+        bool apply_ok;
+        {
+            AccGuard g(db_, &working);     // feed this block's state writes to it
+            if (block->has_song) {
+                db_.put_fingerprint(batch, block->song);
+                db_.put_song_meta(batch, block->song.content_hash, block->song);
+                db_.add_to_artist_index(batch, block->song.artist,
+                                         block->song.content_hash);
+                db_.add_to_genre_index(batch, block->song.genre,
+                                        block->song.content_hash);
+                // Rebuild the content-height marker (bh:) that song_on_chain's
+                // exact check consults. It is cleared in clear_derived_state, so
+                // replay MUST repopulate it here or the exact duplicate check
+                // goes blind on a restart / reorg. Written AFTER step 3's
+                // song_on_chain call above, so block h's own row is absent when h
+                // is checked (no self-hit), exactly like put_fingerprint.
+                db_.set_content_height(batch, block->song.content_hash, h);
+            }
+            applied_nonce_in_block_.clear();
+            proposal_votes_in_block_.clear();
+            sessions_used_in_block_.clear();
+            apply_ok = apply_transactions(*block, h, batch);
+        }   // AccGuard clears acc_ here, even if a writer threw
+        if (!apply_ok) {
             std::cerr << "[chain] replay: block " << h
                       << " apply_transactions failed — stopping\n";
             break;
         }
-        // #8: accumulate fork weight and persist the per-block "cw:" index
-        // in the SAME batch as the rest of this block's derived state.
+        // P4 state_root gate: reject a block whose committed root doesn't match
+        // its header (identical to connect_block, so reorg == linear connect).
+        if (block->header.version >= 4 &&
+            working.root() != block->header.state_root) {
+            std::cerr << "[chain] replay: block " << h
+                      << " state_root mismatch — stopping\n";
+            break;
+        }
+        // #8: accumulate fork weight and persist the per-block "cw:" index +
+        // the committed sr:vec in the SAME batch as this block's derived state,
+        // so the accumulator commits atomically with the block it reflects.
         cum_weight += count_plays(*block);
         db_.put_batch_u64(batch, "cw:" + db_.hex(*bhash), cum_weight);
+        db_.put_batch(batch, "sr:vec",
+                      StateAccumulator::serialize_vec(working.vec));
         db_.write(batch);
 
+        acc.vec         = working.vec;   // promote this block's committed root
         prev_hash       = *bhash;
         last_good_height = h;
     }
@@ -1780,10 +1872,17 @@ bool Chain::rebuild_derived_state() {
         } catch (...) {}
         return true;
     });
-    // P4: re-derive committed_acc_ from the rebuilt state so the next
-    // connect_block's state_root gate uses the correct baseline, and persist it.
-    committed_acc_ = db_.scan_state_accumulator();
+    // P4: committed_acc_ is the rolling root promoted through the last good
+    // block (the gate above proved each equals its header.state_root); after a
+    // tip rollback it correctly reflects last_good_height. Persist it (covers the
+    // zero-block fresh-chain case where the loop never ran) so the next
+    // connect_block's gate uses the right baseline.
+    committed_acc_ = acc.vec;
     db_.put("sr:vec", StateAccumulator::serialize_vec(committed_acc_));
+    // Clear the crash-atomicity marker LAST: only now are t:tip, the derived
+    // state, and sr:vec mutually consistent. A crash before this point leaves
+    // sr:dirty set, so init() re-runs the rebuild at the next startup.
+    db_.del("sr:dirty");
     return true;
 }
 

@@ -3207,6 +3207,17 @@ bool pending_reg_from_fpsubmit(const json& env, PendingRegistration& reg) {
             }
         }
     }
+    // Reject a registration that could never serialize into a decodable v4 block
+    // (Block::validate enforces these SAME bounds as a consensus rule; rejecting
+    // at submission avoids queuing a song the producer would build, fail to
+    // commit, and only drop after burning 3 retries). string16 fields cap at a
+    // uint16 length prefix; royalty_splits at a uint8 count.
+    if (reg.compressed_fingerprint.size() > 0xFFFF) return false;
+    if (reg.title.size()  > 0xFFFF) return false;
+    if (reg.artist.size() > 0xFFFF) return false;
+    if (reg.genre.size()  > 0xFFFF) return false;
+    if (reg.album.size()  > 0xFFFF) return false;
+    if (reg.royalty_splits.size() > 255) return false;
     return true;
 }
 

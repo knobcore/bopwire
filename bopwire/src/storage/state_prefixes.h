@@ -16,7 +16,19 @@ inline constexpr const char* kStatePrefixes[] = {
     "nv:", "sm:", "ia:", "ig:",
     "founder:", "mlvl:", "mpub:", "mact:", "slashed:",
     "un:", "addrun:",
-    "prop:", "propstatus:", "propvote:"
+    "prop:", "propstatus:", "propvote:",
+    // Record-label state. Written ONLY by the consensus apply path
+    // (Chain::apply_moderator_op TAG_LABEL_EDIT -> set_label / assign_artist_label,
+    // chain.cpp:586/597) and load-bearing for consensus: execute_proposal
+    // RELEASE_ESCROW routes escrow into a: balances (which ARE rooted) via
+    // get_label / get_artist_label, so these MUST be in the root and cleared by
+    // rebuild — otherwise a reorg leaves stale label rows and two honest nodes
+    // credit escrow differently. ("art_label:" does not start with "label:", so
+    // both are listed explicitly.) NOTE: "d:" (song-hidden) is deliberately NOT
+    // here — it is written by non-consensus paths (API/DMCA/deep-audit) and read
+    // only for local display/serving, never in an apply/state_root path, so
+    // rooting it would fork on every local hide.
+    "label:", "art_label:"
 };
 
 // True iff `key` is part of the committed state: it matches one of

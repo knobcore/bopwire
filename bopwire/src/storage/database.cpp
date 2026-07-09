@@ -141,7 +141,13 @@ uint64_t Database::get_play_count(const Hash256& content_hash) const {
 void Database::update_song_state(leveldb::WriteBatch& b, const PlayProof& proof,
                                   uint64_t play_count_before) {
     SongState state = get_song_state(proof.content_hash);
-    state.play_count++;
+    // Step from the caller's EXPLICIT prior count, not committed++ (audit #12).
+    // A settlement crediting K plays of one song calls this K times with a
+    // stepped play_count_before (0,1,…,K-1); committed++ re-read the same
+    // committed P every time and last-write-wins persisted only P+1. Using
+    // play_count_before+1 makes the final (highest-pc) write land P+K. The
+    // single-MINT caller passes the committed count, so +1 == the old ++ there.
+    state.play_count = play_count_before + 1;
     if (play_count_before == 0) {
         state.discoverer_address  = proof.player_address;
         state.first_play_block    = 0; // will be set by chain
@@ -716,7 +722,10 @@ void Database::assign_artist_label(leveldb::WriteBatch& b,
                                    const Address& artist,
                                    const std::string& label_name) {
     if (label_name.empty()) {
-        b.Delete("art_label:" + hex(artist));
+        // Route through del_batch (not raw b.Delete): "art_label:" is a rooted
+        // state prefix, so the accumulator must see the deletion and subtract
+        // the old leaf — a raw Delete would leave a phantom leaf in the root.
+        del_batch(b, "art_label:" + hex(artist));
         return;
     }
     auto canonical = label_key_lower(label_name);

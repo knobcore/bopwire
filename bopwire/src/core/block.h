@@ -189,6 +189,14 @@ struct BlockHeader {
     // applies. The producer stamps it; every node recomputes and rejects on
     // mismatch. Folded into the block-hash preimage (serialize below).
     Hash256                    state_root{};
+    // v4+: SHA256 of the canonical SongSection body bytes (zero on heartbeat).
+    // Folded into the block-hash preimage so EVERY song field — artist_address,
+    // royalty_splits, audio_format, title/album/… — is bound to the block id.
+    // Without this the header committed only content_hash + fingerprint_hash, so
+    // a relaying peer could rewrite artist_address/royalty_splits without
+    // changing the block hash or the state_root (neither covers them), splitting
+    // honest nodes at settlement time and stealing royalties.
+    Hash256                    song_body_hash{};
     // Model 1 (vote-free deterministic consensus): the header carries NO
     // validator confirmations. Canonicality is re-derived by every node
     // from content + history (fingerprint_hash, merkle_root, prev_hash,
@@ -227,6 +235,11 @@ struct Block {
 
     // Compute merkle root over transactions
     static Hash256 compute_merkle_root(const std::vector<std::vector<uint8_t>>& txs);
+
+    // SHA256 of the canonical SongSection body bytes (zero when !has_song).
+    // Stamped into header.song_body_hash by the producer and re-checked in
+    // validate() so no song field can be malleated without changing the id.
+    Hash256 compute_song_body_hash() const;
 
     // Validate internal consistency (hashes, fingerprint/content match)
     bool validate() const;
