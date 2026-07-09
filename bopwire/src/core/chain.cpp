@@ -1624,10 +1624,12 @@ bool Chain::reorg_to_branch(const Hash256& fork_hash, uint32_t fork_height,
         db_.write(b);
     };
 
-    // Crash-atomicity marker: set BEFORE write_branch moves t:tip, so any crash
-    // between the tip move and rebuild_derived_state finishing is detectable at
-    // next startup (init() re-runs the rebuild). rebuild clears it only after it
-    // repersists sr:vec. Covers both the adopt path and the restore path below.
+    // Crash-atomicity marker for the ADOPT tip move: set BEFORE write_branch
+    // moves t:tip, so any crash between the tip move and rebuild_derived_state
+    // finishing is detectable at next startup (init() re-runs the rebuild).
+    // rebuild clears it once it repersists a consistent sr:vec. The RESTORE path
+    // below re-arms its own marker, because this one is cleared by the failed-
+    // adopt rebuild before restore moves the tip back.
     db_.put("sr:dirty", std::vector<uint8_t>{1});
     if (!write_branch(branch, fork_height, fork_weight, new_tip_hash, new_height)) {
         err = "failed to write branch"; return false;
@@ -1656,6 +1658,15 @@ bool Chain::reorg_to_branch(const Hash256& fork_hash, uint32_t fork_height,
     // A branch block failed re-validation → restore the previous chain.
     err = "branch failed re-validation; restored previous chain";
     std::cerr << "[chain] REORG aborted, restoring previous chain\n";
+    // Re-arm the crash-atomicity marker for the RESTORE tip move. The failed-
+    // adopt rebuild above already CLEARED sr:dirty at its end (it rolled back to
+    // a valid prefix and, from its own standalone view, reached consistency), so
+    // without this the restore's write_branch (below) would move t:tip back to
+    // the old chain with no dirty flag — a crash between that tip move and the
+    // restore rebuild would leave t:tip / derived state / sr:vec inconsistent and
+    // undetected. Set it here so init() re-derives on any crash through restore;
+    // the restore rebuild clears it again on success.
+    db_.put("sr:dirty", std::vector<uint8_t>{1});
     std::vector<Block> old_blocks;
     for (const auto& oh : old_hashes) {
         auto ob = get_block(oh);
