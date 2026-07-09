@@ -99,6 +99,9 @@ public:
     // it through the block-apply forge gate, so balances replicate + survive
     // resync. Set once at construction, before any session can complete.
     void set_ingest_tx(std::function<bool(const std::string&)> cb) { ingest_tx_cb_ = std::move(cb); }
+    // Phase 3: the epoch-close worker publishes a settlement's companion body
+    // through here (-> RatsApi::ingest_settle_body: store sb:<root> + flood).
+    void set_settle_body(std::function<bool(const std::string&)> cb) { settle_body_cb_ = std::move(cb); }
 
     // ---- Verb handlers -----------------------------------------------
     std::pair<int, std::string> verb_status()                                { return get_status(); }
@@ -144,6 +147,19 @@ private:
     // falls back to a direct apply only if this is unset (should never happen in
     // the node, which always wires RatsApi).
     std::function<bool(const std::string&)> ingest_tx_cb_;
+    // -> RatsApi::ingest_settle_body (Phase 3). Used by the epoch-close worker.
+    std::function<bool(const std::string&)> settle_body_cb_;
+    // Phase 3 batched settlement (opt-in via BOPWIRE_BATCH_SETTLE): when ON,
+    // session.complete ACCRUES the signed PlayProof to accplay:<epoch>:<session>
+    // instead of emitting a per-play MINT, and the reaper thread closes epochs
+    // into one SETTLEMENT_MINT (~100-1000x fewer txs). Default OFF keeps the
+    // low-volume deploy on the simpler Phase-1 per-play path.
+    std::atomic<bool>                       batch_settle_enabled_{false};
+    // Node-local epoch batching interval (ms). NON-consensus: only affects which
+    // plays share a settlement tx, never the credited amounts.
+    static constexpr uint64_t               EPOCH_MS = 10000;
+    uint64_t                                last_epoch_swept_ = 0;
+    void settle_epoch_sweep();   // reaper-driven: emit closed epochs
 
     mutable std::mutex                            sessions_mutex_;
     std::unordered_map<std::string, PlaySession>  sessions_;

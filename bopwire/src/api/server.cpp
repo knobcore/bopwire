@@ -7,6 +7,7 @@
 #include "../tokens/mint.h"
 #include "device_attestation.h"
 #include "../core/transaction.h"
+#include "../core/merkle.h"        // merkle_root_bytes (settlement emit, Phase 3)
 #include <nlohmann/json.hpp>
 #include <cstdlib>
 #include <chrono>
@@ -14,6 +15,7 @@
 #include <random>
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -142,6 +144,11 @@ bool HttpServer::start() {
     // a soak surfaces false-positives (skips, NAT, collisions) before enforcing.
     if (const char* e = std::getenv("BOPWIRE_DEVICE_CAP_ENFORCE"))
         device_cap_enforce_.store(e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    if (const char* e = std::getenv("BOPWIRE_BATCH_SETTLE"))
+        batch_settle_enabled_.store(e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    if (batch_settle_enabled_.load())
+        std::cout << "[settle] batched settlement ON (epoch=" << (EPOCH_MS/1000)
+                  << "s) — session.complete accrues, reaper emits SETTLEMENT_MINT\n";
     std::cout << "[antifarm] per-device caps "
               << (device_cap_enforce_.load() ? "ENFORCING" : "dark (log-only)")
               << " (concurrency<=" << kMaxConcurrentPerDevice
@@ -182,23 +189,91 @@ void HttpServer::reaper_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         if (reaper_stop_.load()) break;
         const uint64_t now = now_ms_api();
-        std::lock_guard<std::mutex> lk(sessions_mutex_);
-        for (auto it = sessions_.begin(); it != sessions_.end(); ) {
-            PlaySession& s = it->second;
-            const uint64_t idle = now - s.last_heartbeat;
-            // Release the concurrency slot early on silence, but keep the
-            // session for a late complete until TIMEOUT_MS.
-            if (s.slot_held && idle > kSlotIdleReleaseMs)
-                release_device_slot_locked(s);
-            const bool drop = (s.completed && idle > PlaySession::TIMEOUT_MS) ||
-                              s.is_expired(now);
-            if (drop) {
-                release_device_slot_locked(s);   // idempotent
-                it = sessions_.erase(it);
-            } else {
-                ++it;
+        {
+            std::lock_guard<std::mutex> lk(sessions_mutex_);
+            for (auto it = sessions_.begin(); it != sessions_.end(); ) {
+                PlaySession& s = it->second;
+                const uint64_t idle = now - s.last_heartbeat;
+                // Release the concurrency slot early on silence, but keep the
+                // session for a late complete until TIMEOUT_MS.
+                if (s.slot_held && idle > kSlotIdleReleaseMs)
+                    release_device_slot_locked(s);
+                const bool drop = (s.completed && idle > PlaySession::TIMEOUT_MS) ||
+                                  s.is_expired(now);
+                if (drop) {
+                    release_device_slot_locked(s);   // idempotent
+                    it = sessions_.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
+        // Phase 3: close matured epochs into SETTLEMENT_MINT (no session lock).
+        if (batch_settle_enabled_.load())
+            settle_epoch_sweep();
+    }
+}
+
+// Close every epoch older than the current one: gather its accrued PlayProofs,
+// build the canonical body + Merkle root, flood the body, then sign + ingest one
+// SETTLEMENT_MINT. Emit timing is NODE-LOCAL wall clock (non-consensus); the
+// credited amounts come only from the flooded tx + body + committed state.
+void HttpServer::settle_epoch_sweep() {
+    const uint64_t now           = now_ms_api();
+    const uint64_t current_epoch = now / EPOCH_MS;
+    // Group closed-epoch proofs (epoch < current_epoch).
+    std::map<uint64_t, std::vector<PlayProof>> by_epoch;
+    std::map<uint64_t, std::vector<std::string>> keys_by_epoch;
+    db_.for_each_with_prefix("accplay:", [&](const std::string& key,
+                                             const std::string& val) {
+        const std::string rest = key.substr(8);          // strip "accplay:"
+        const auto colon = rest.find(':');
+        if (colon == std::string::npos) return true;
+        uint64_t e = 0;
+        try { e = std::stoull(rest.substr(0, colon)); } catch (...) { return true; }
+        if (e >= current_epoch) return true;             // not closed yet
+        PlayProof pr;
+        if (PlayProof::deserialize(
+                reinterpret_cast<const uint8_t*>(val.data()), val.size(), pr)) {
+            by_epoch[e].push_back(pr);
+            keys_by_epoch[e].push_back(key);
+        }
+        return true;
+    });
+    for (auto& [epoch, proofs] : by_epoch) {
+        if (proofs.empty()) continue;
+        std::sort(proofs.begin(), proofs.end(),
+                  [](const PlayProof& a, const PlayProof& b) {
+            int c = std::memcmp(a.content_hash.data(), b.content_hash.data(), 32);
+            if (c != 0) return c < 0;
+            return std::memcmp(a.session_id.data(), b.session_id.data(), 32) < 0;
+        });
+        std::vector<std::vector<uint8_t>> leaves;
+        leaves.reserve(proofs.size());
+        for (const auto& pr : proofs) leaves.push_back(pr.serialize());
+        const Hash256 root = mc::merkle_root_bytes(leaves);
+        // Flood + store the companion body FIRST (apply needs sb:<root> present).
+        if (settle_body_cb_)
+            settle_body_cb_(crypto::to_hex(serialize_settle_body(proofs)));
+        // Build + sign the settlement tx.
+        SettlementMintTx sm;
+        sm.serving_node_id          = config_.node_id;
+        sm.serving_node_wallet      = node_keypair_.address;
+        sm.epoch_id                 = epoch;
+        sm.constituents_merkle_root = root;
+        sm.constituent_count        = static_cast<uint32_t>(proofs.size());
+        auto msg = sm.sign_message();
+        Hash256 h = crypto::sha256(msg.data(), msg.size());
+        sm.node_signature = crypto::sign_ecdsa(h, node_keypair_.private_key);
+        if (ingest_tx_cb_) {
+            const std::string env = "{\"tx\":\"" + crypto::to_hex(sm.serialize())
+                                  + "\",\"submit_ms\":" + std::to_string(now) + "}";
+            ingest_tx_cb_(env);
+        }
+        // Drop the accrual scratch for this settled epoch.
+        for (const auto& k : keys_by_epoch[epoch]) db_.del(k);
+        std::cout << "[settle] emitted SETTLEMENT_MINT epoch " << epoch
+                  << " with " << proofs.size() << " plays\n";
     }
 }
 
@@ -1074,7 +1149,15 @@ std::pair<int, std::string> HttpServer::post_session_complete(
             db_.write(local);
         }
 
-        if (ingest_tx_cb_) {
+        if (batch_settle_enabled_.load()) {
+            // Phase 3: accrue the signed PlayProof to the node-local epoch bucket
+            // (NON-consensus scratch, plain put). The reaper closes the epoch
+            // into one SETTLEMENT_MINT that credits every constituent at once.
+            const uint64_t epoch = now / EPOCH_MS;
+            const std::string akey = "accplay:" + std::to_string(epoch) + ":"
+                                   + crypto::to_hex(sess.session_id);
+            db_.put(akey, proof.serialize());
+        } else if (ingest_tx_cb_) {
             Transaction txw = Transaction::from_mint(mint);
             const std::string tx_hex = crypto::to_hex(txw.raw);
             const std::string env =

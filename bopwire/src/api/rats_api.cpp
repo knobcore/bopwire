@@ -104,6 +104,9 @@ RatsApi::RatsApi(HttpServer& http,
     http_.set_ingest_tx([this](const std::string& env) {
         return ingest_tx(env, /*broadcast_if_new=*/true);
     });
+    http_.set_settle_body([this](const std::string& body_hex) {
+        return ingest_settle_body(body_hex, /*broadcast_if_new=*/true);
+    });
 }
 
 void RatsApi::start(rats_client_t client) {
