@@ -41,6 +41,18 @@ class PlayerServer {
     await lib.ensureLoaded();
     final inst = PlayerServer._(lib, rats.bindingsForServer,
                                 rats.handleForServer);
+    // A song deleted from the library must stop being served IMMEDIATELY —
+    // including transfers already in flight, not just new requests (new
+    // stream.open / swarm.fetch already miss because entryByHash returns
+    // null after removal). Chain behind any previously-installed hook.
+    final priorRemoved = lib.onEntryRemoved;
+    lib.onEntryRemoved = (entry) {
+      inst.cancelStreamsForHash(entry.contentHash);
+      if (entry.canonicalHash.isNotEmpty) {
+        inst.cancelStreamsForHash(entry.canonicalHash);
+      }
+      priorRemoved?.call(entry);
+    };
     // Chain our dispatcher behind any previously-installed handler so
     // multiple subsystems can register without clobbering each other.
     // We're first in the chain; the prior handler (if any) becomes the
@@ -64,6 +76,10 @@ class PlayerServer {
     if (i == null) throw StateError('PlayerServer.initialize() not called');
     return i;
   }
+
+  /// Null before [initialize] — for callers that only want to poke the
+  /// server if it exists (e.g. cancelling streams on library deletes).
+  static PlayerServer? get maybeInstance => _instance;
 
   final LibraryService    _lib;
   final ffi.RatsBindings  _bindings;
@@ -187,6 +203,7 @@ class PlayerServer {
       sendTo:      peerId,
       relayTo:     originator,
       streamId:    sid,
+      contentHash: hash,
       file:        file,
       totalBytes:  totalSize,
       deliveryId:  deliveryId,
@@ -261,12 +278,13 @@ class PlayerServer {
     // to peerId (the VPS) instead of dropped at the immediate sender.
     // Direct peer-to-peer (originator empty) sends straight to peerId.
     unawaited(_streamChunks(
-      sendTo:     peerId,
-      relayTo:    originator,
-      streamId:   sid,
-      file:       file,
-      totalBytes: totalBytes,
-      deliveryId: deliveryId,
+      sendTo:      peerId,
+      relayTo:     originator,
+      streamId:    sid,
+      contentHash: hash,
+      file:        file,
+      totalBytes:  totalBytes,
+      deliveryId:  deliveryId,
     ));
 
     return {
@@ -306,10 +324,28 @@ class PlayerServer {
     }
   }
 
+  /// Cancel every in-flight stream serving [contentHash] (the hash the
+  /// REQUESTER asked for — a peer may know us by either the local
+  /// content_hash or the canonical hash, so callers should invoke this
+  /// for both). Wired to LibraryService.onEntryRemoved in [initialize]:
+  /// deleting a song from the library stops its uploads at the next
+  /// 16 KB chunk boundary instead of streaming the rest of the file.
+  void cancelStreamsForHash(String contentHash) {
+    if (contentHash.isEmpty) return;
+    final victims = <int>[];
+    _streams.forEach((sid, active) {
+      if (active.contentHash == contentHash) victims.add(sid);
+    });
+    for (final sid in victims) {
+      cancelStream(sid);
+    }
+  }
+
   Future<void> _streamChunks({
     required String sendTo,
     required String relayTo,
     required int    streamId,
+    required String contentHash,
     required File   file,
     required int    totalBytes,
     String          deliveryId = '',
@@ -342,7 +378,7 @@ class PlayerServer {
     // copy cost is unavoidable; reusing 'native' just keeps malloc
     // churn out of the hot loop.
     RandomAccessFile? raf;
-    final active = _ActiveStream(peerId: sendTo);
+    final active = _ActiveStream(peerId: sendTo, contentHash: contentHash);
     _streams[streamId] = active;
     try {
       raf = await file.open();
@@ -463,8 +499,11 @@ class PlayerServer {
 /// can `await` clean teardown when shutting the server down without
 /// changing public method signatures.
 class _ActiveStream {
-  _ActiveStream({required this.peerId});
+  _ActiveStream({required this.peerId, required this.contentHash});
   final String peerId;
+  /// The hash the requester asked for — lets cancelStreamsForHash stop
+  /// in-flight uploads of a song the moment it leaves the library.
+  final String contentHash;
   bool cancelled = false;
   final Completer<void> done = Completer<void>();
 }

@@ -118,6 +118,13 @@ void main() {
     expect(entry.title.trim(), isNotEmpty,
         reason: 'title from tags, or the filename fallback');
     expect(entry.isLocal, isTrue);
+    // PROVENANCE: a file that arrived through the download pipeline must
+    // be flagged as bopwire's own — this flag (recorded at import time,
+    // never guessed from the path) is what authorizes deleting the file
+    // from disk when the track is later removed from the library.
+    expect(entry.source, LibraryEntry.kSourceDownload,
+        reason: 'importDownloadedFile records download provenance');
+    expect(entry.isDownloadedByBopwire, isTrue);
     // No decoder on this host → the fingerprint must be EMPTY, not a
     // crash; an empty fingerprintHash is what makes a later force-scan
     // retry the fingerprint + chain submit.

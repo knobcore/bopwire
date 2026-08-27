@@ -11,6 +11,7 @@ import 'package:flutter/foundation.dart';
 
 import '../models/song.dart';
 import '../services/library_service.dart';
+import '../services/local_library_actions.dart';
 import '../services/node_client.dart';
 import '../services/node_service.dart';
 import '../services/rats_client.dart';
@@ -199,7 +200,7 @@ class DownloadProvider extends ChangeNotifier {
         throw StateError('No full node discovered yet.');
       }
       final client = NodeClient(ratsPeerId: pid);
-      await client.downloadToLibrary(
+      final savedPath = await client.downloadToLibrary(
         job.song.contentHash,
         variant:   job.variant,
         chainSong: job.song,
@@ -222,6 +223,24 @@ class DownloadProvider extends ChangeNotifier {
             'download exceeded ${_kJobHardCeiling.inMinutes} min — '
             'swarm member unresponsive');
       });
+      // PROVENANCE: flag the freshly-downloaded entry as bopwire's own so a
+      // later library delete may also delete the file from disk. Guarded by
+      // the download-area check because downloadToLibrary short-circuits to
+      // an EXISTING local file when we already hold the song — possibly one
+      // the user scanned from their own folders, which must never be flagged
+      // deletable. Best-effort: a failed flag just means the file survives
+      // deletion (safe direction).
+      try {
+        final cache = await LocalLibraryActions.instance.downloadsCachePath();
+        if (LocalLibraryActions.isBopwireDownloadPath(savedPath, cache)) {
+          final lib = LibraryService.instance;
+          final e = lib.entryByPath(savedPath);
+          if (e != null && !e.isDownloadedByBopwire) {
+            e.source = LibraryEntry.kSourceDownload;
+            await lib.upsert(e);
+          }
+        }
+      } catch (_) {/* provenance flag is best-effort */}
       job.status = DownloadStatus.done;
     } catch (e) {
       job.status = DownloadStatus.failed;

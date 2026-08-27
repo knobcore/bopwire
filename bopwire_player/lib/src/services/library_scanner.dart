@@ -353,6 +353,17 @@ class LibraryScanner {
           'will retry on the next scan'
         : 'full node = ${homePid.substring(0, 12)}…');
     await _processFile(file, lib, rats, homePid, force: force);
+
+    // PROVENANCE: this file arrived through the download pipeline, so flag
+    // the entry as bopwire-downloaded — recorded at import time, the ONLY
+    // thing that ever authorizes deleting it from disk later. Done after
+    // _processFile (which may have kept a pre-existing row from a scan
+    // that raced the import), so every path lands flagged.
+    final imported = lib.entryByPath(path);
+    if (imported != null && !imported.isDownloadedByBopwire) {
+      imported.source = LibraryEntry.kSourceDownload;
+      await lib.upsert(imported);
+    }
     _ilog('library now holds ${lib.entries.length} entries');
     // Tell the node (and via flood, the mesh) that our holdings changed.
     // Fire-and-forget: the import itself already succeeded, and a failed
@@ -642,6 +653,15 @@ class LibraryScanner {
         audioFormat:     fmt,
         filePath:        file.path,
         addedAtMs:       DateTime.now().millisecondsSinceEpoch,
+        // Preserve the recorded provenance across force-rescans: a
+        // downloaded file re-processed by a scan must keep its
+        // 'download' flag or a later delete would wrongly leave it on
+        // disk. A fresh file defaults to '' (user-owned, never deleted);
+        // importDownloadedFile flags its own entries right after this.
+        source:          (existingByPath != null &&
+                          existingByPath.source.isNotEmpty)
+                             ? existingByPath.source
+                             : (existing?.source ?? ''),
       ));
       _ilog('ADDED "$title" by "$artist" (${file.path})');
 

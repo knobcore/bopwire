@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'library_publisher.dart';
+import 'presence_publisher.dart';
 import 'library_scanner.dart';
 import 'node_service.dart';
 import 'rats_client.dart';
@@ -335,6 +337,31 @@ class LibratsDiscovery extends ChangeNotifier {
     _timer?.cancel();
     _timer = null;
 
+    // "Go offline" must PROPAGATE: publish an EMPTY library snapshot while
+    // we can still reach the node, so the mesh (website / Discover / other
+    // players) stops listing our songs as available the moment we leave —
+    // instead of serving a stale snapshot forever. Must run BEFORE the
+    // prefs are cleared below (publish resolves the home node from
+    // 'auto_rats_peer_id') and before disconnectAll(). Time-capped so a
+    // dead node can't wedge the user's explicit "go offline" tap; the next
+    // reconnect's reAnnounce republishes the real library (its digest
+    // differs from the empty one, so the digest gate can't suppress it).
+    try {
+      await LibraryPublisher.publishOffline()
+          .timeout(const Duration(seconds: 6));
+    } catch (_) {/* best effort — going offline must never block */}
+
+    // Then withdraw our presence binding. Order matters: publish FIRST, then
+    // withdraw. The node keeps a wallet discoverable for kPresenceTtlMs
+    // (3 min) after its last signed hello, so without this the empty snapshot
+    // above would be correct while the wallet stayed listed as live for up to
+    // three minutes — which is exactly the "went offline but the website still
+    // shows my songs" delay. goodbye() also stops the heartbeat, so a beat
+    // 22-38 s later cannot silently re-announce us.
+    try {
+      await PresencePublisher.goodbye().timeout(const Duration(seconds: 6));
+    } catch (_) {/* best effort — the 3-min TTL still expires us */}
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('auto_node_url');
     await prefs.remove('auto_rats_peer_id');
@@ -357,6 +384,10 @@ class LibratsDiscovery extends ChangeNotifier {
       refresh();
       _bidirectionalProbe();
     });
+    // disconnect() stopped the presence heartbeat as part of saying goodbye.
+    // Without restarting it the user would come back online but stay
+    // undiscoverable to everyone else until an app restart.
+    PresencePublisher.startHeartbeat();
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('auto_node_url');

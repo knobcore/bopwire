@@ -15,6 +15,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'library_publisher.dart';
+
 class LibraryEntry {
   LibraryEntry({
     required this.contentHash,
@@ -31,7 +33,14 @@ class LibraryEntry {
     required this.audioFormat,
     required this.filePath,
     required this.addedAtMs,
+    this.source = '',
   });
+
+  /// [source] value for a file BOPWIRE itself downloaded (Soulseek /
+  /// napstr / the bopwire swarm) into its own download area. Only these
+  /// entries are ever eligible for on-disk deletion when removed from
+  /// the library.
+  static const String kSourceDownload = 'download';
 
   /// Hash of THIS local file's bytes. PlayerServer uses this to find the
   /// file when a peer asks stream.open(this_hash).
@@ -63,6 +72,17 @@ class LibraryEntry {
   String filePath;     // empty for entries downloaded from peers
   int    addedAtMs;
 
+  /// PROVENANCE, recorded at import time — never guessed from the path.
+  /// [kSourceDownload] for files bopwire itself downloaded; '' (the
+  /// default) for everything else, including every entry that predates
+  /// this field. Anything that is not exactly [kSourceDownload] is
+  /// treated as the user's own file and must NEVER be deleted from disk:
+  /// an un-deleted download is a minor annoyance, a wrongly-deleted user
+  /// file destroys an unrecoverable personal collection.
+  String source;
+
+  bool get isDownloadedByBopwire => source == kSourceDownload;
+
   bool get isLocal => filePath.isNotEmpty && File(filePath).existsSync();
 
   Map<String, dynamic> toJson() => {
@@ -80,6 +100,7 @@ class LibraryEntry {
         'audio_format':     audioFormat,
         'file_path':        filePath,
         'added_at_ms':      addedAtMs,
+        'source':           source,
       };
 
   static LibraryEntry fromJson(Map<String, dynamic> j) => LibraryEntry(
@@ -97,6 +118,10 @@ class LibraryEntry {
         audioFormat:     j['audio_format']     as String? ?? 'mp3',
         filePath:        j['file_path']        as String? ?? '',
         addedAtMs:       j['added_at_ms']      as int?    ?? 0,
+        // Entries persisted before the provenance field existed decode to
+        // '' — deliberately indistinguishable from "user-owned", so a
+        // pre-existing download is merely not disk-deleted (safe default).
+        source:          j['source']           as String? ?? '',
       );
 }
 
@@ -110,6 +135,12 @@ class LibraryService extends ChangeNotifier {
   final List<String>              _folders = [];
   bool _loaded = false;
   Future<void>? _loading;
+
+  /// Fired synchronously for every entry dropped by [remove] /
+  /// [purgeFolder], AFTER the maps are updated. PlayerServer subscribes
+  /// so in-flight uploads of a just-deleted song are cancelled
+  /// immediately instead of streaming to completion.
+  void Function(LibraryEntry removed)? onEntryRemoved;
 
   static const _kFoldersKey = 'mc_library_folders';
   static const _kEntriesKey = 'mc_library_entries';
@@ -204,6 +235,8 @@ class LibraryService extends ChangeNotifier {
   /// Drop every entry whose `filePath` lives under [folderPath], remove
   /// [folderPath] from the folder list, and return the list of entries
   /// that were dropped so the caller can deannounce them from the swarm.
+  /// NOTE: removing a folder never touches the disk — the user's files
+  /// stay exactly where they are; only the library rows are dropped.
   Future<List<LibraryEntry>> purgeFolder(String folderPath) async {
     final affected = entriesUnder(folderPath);
     for (final e in affected) {
@@ -212,7 +245,11 @@ class LibraryService extends ChangeNotifier {
     _folders.remove(folderPath);
     await _persistFolders();
     await _persistEntries();
+    for (final e in affected) {
+      onEntryRemoved?.call(e);
+    }
     notifyListeners();
+    if (affected.isNotEmpty) _republishAfterRemoval();
     return affected;
   }
 
@@ -247,7 +284,34 @@ class LibraryService extends ChangeNotifier {
     if (prior == null) return;
     _unindex(prior);
     await _persistEntries();
+    onEntryRemoved?.call(prior);
     notifyListeners();
+    _republishAfterRemoval();
+  }
+
+  /// A removal must PROPAGATE: the node keeps a version-gated SNAPSHOT of
+  /// this wallet's library (DB2 library.delta), so until we republish the
+  /// (now smaller) full set, the mesh — and therefore the website /
+  /// Discover / other players — keeps showing the deleted song as held by
+  /// us forever. Runs AFTER the maps + prefs are updated so the snapshot
+  /// publishFull reads is already the post-removal library. Fire-and-
+  /// forget: a failed publish is retried by the next reAnnounce/scan, and
+  /// publishFull no-ops safely without a wallet or node (e.g. in tests).
+  void _republishAfterRemoval() {
+    unawaited(LibraryPublisher.publishFull());
+  }
+
+  /// Test-only: return the singleton to its pristine state so test cases
+  /// don't leak entries/folders/listeners into each other.
+  @visibleForTesting
+  void debugResetForTests() {
+    _byHash.clear();
+    _byCanonical.clear();
+    _byPath.clear();
+    _folders.clear();
+    _loaded  = false;
+    _loading = null;
+    onEntryRemoved = null;
   }
 
   Future<void> _persistFolders() async {
