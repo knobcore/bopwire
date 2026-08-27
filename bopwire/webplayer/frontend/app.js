@@ -580,7 +580,13 @@
     return { kind, buckets };
   }
 
+  // Bumped at the top of every renderChips() call so a real-art fetch left
+  // over from a PREVIOUS render (the user already clicked into something
+  // else, or switched artist/genre mode) never lands on the wrong chips.
+  let _chipArtGen = 0;
+
   function renderChips() {
+    const gen = ++_chipArtGen;
     const wrap = $('chips'), empty = $('chips-empty');
     if (state.browseLoading) {
       wrap.innerHTML = ''; empty.hidden = false;
@@ -621,6 +627,28 @@
         <div class="c-sub">${b.count} song${b.count === 1 ? '' : 's'}</div>
       </button>`;
     }).join('');
+
+    // Root-level artist/genre buckets have no song data (they come
+    // straight from /api/facets: name + count only), so they render
+    // generated-only above, then get upgraded here — one small, specific
+    // songs query per bucket, exactly the query drillFetch already makes on
+    // click, just made proactively so the button shows real art before the
+    // user ever taps it. A bucket with no real art for any of its 4
+    // candidates simply stays generated, which is a normal case (a brand
+    // new artist/genre with no scraped or contributed covers yet), not an
+    // error.
+    if (buckets.length && !buckets[0].items) {
+      const param = kind === 'artist' ? 'artist' : 'genre';
+      buckets.forEach((b, i) => {
+        fetchSongs({ [param]: b.label, limit: 6 }).then((songs) => {
+          if (gen !== _chipArtGen) return; // the user moved on — drop it
+          const cands = artCandidatesFrom(songs);
+          if (!cands.length) return;
+          const cover = wrap.querySelector(`.chip[data-i="${i}"] .cover`);
+          if (cover) cover.innerHTML = coverArt(seedFromName(b.label), { art: cands });
+        }).catch(() => {});
+      });
+    }
 
     wrap.querySelectorAll('.chip').forEach((el) => {
       el.onclick = () => {
@@ -1073,11 +1101,35 @@
       }, 250);
     });
 
-    // CTA download — a direct link to the Linux AppImage. No dropdown: the
-    // Windows and Android assets were removed from the release, so a menu
-    // offering them just sent people to 404s.
-    const ctaLink = $('cta-link');
-    if (ctaLink) ctaLink.href = CFG.downloads.linux || '#';
+    // CTA download — built from CFG.downloads so it can only ever offer
+    // platforms that actually have a released asset, never a hand-maintained
+    // list that drifts out of sync with the release and 404s.
+    const PLATFORM_META = {
+      linux:   { icon: '🐧', label: 'Linux AppImage' },
+      android: { icon: '🤖', label: 'Android APK' },
+      windows: { icon: '🪟', label: 'Windows Installer' },
+    };
+    const link = $('cta-link'), dd = $('cta-dropdown');
+    const platforms = Object.keys(CFG.downloads || {}).filter((k) => CFG.downloads[k]);
+    if (platforms.length <= 1) {
+      // One (or zero) real option: skip the menu, go straight there.
+      link.removeAttribute('aria-haspopup'); link.removeAttribute('aria-expanded');
+      link.href = platforms.length ? CFG.downloads[platforms[0]] : '#';
+    } else {
+      dd.innerHTML = `<img class="cta-logo" src="logo.png" alt="Bopwire app" width="72" height="72" />` +
+        `<div class="cta-dd-title">Get the Bopwire app</div>` +
+        platforms.map((p) => {
+          const meta = PLATFORM_META[p] || { icon: '⬇', label: p };
+          return `<a class="cta-opt" href="${CFG.downloads[p]}" role="menuitem" rel="noopener">` +
+                 `<span>${meta.icon}</span> ${esc(meta.label)}</a>`;
+        }).join('');
+      link.onclick = (e) => {
+        e.stopPropagation();
+        const open = dd.hidden;
+        dd.hidden = !open; link.setAttribute('aria-expanded', String(open));
+      };
+      document.addEventListener('click', () => { dd.hidden = true; link.setAttribute('aria-expanded', 'false'); });
+    }
 
     // Draggable pane divider
     const divider = $('divider'), chipPane = $('chip-pane');

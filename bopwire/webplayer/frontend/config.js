@@ -15,6 +15,7 @@ window.BOPWIRE = {
   // removed from the release, so advertising them here pointed users at
   // 404s. Only list a platform once its asset actually exists.
   downloads: {
-    linux: 'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-linux-x86_64.AppImage',
+    linux:   'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-linux-x86_64.AppImage',
+    android: 'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-android.apk',
   },
 };
