@@ -86,6 +86,7 @@ bopwire_player/ios/Pods/
 bopwire_player/ios/Flutter/.last_build_id
 bopwire_player/ios/Flutter/Generated.xcconfig
 bopwire_player/ios/Flutter/flutter_export_environment.sh
+bopwire_player/ios/Flutter/ephemeral/
 bopwire_player/macos/Pods/
 bopwire_player/macos/Flutter/ephemeral/
 bopwire_player/linux/flutter/ephemeral/
