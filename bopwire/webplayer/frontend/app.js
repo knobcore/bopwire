@@ -279,7 +279,7 @@
       <div class="hero">
         <div class="hero-art">${songArt(s)}</div>
         <div class="hero-meta">
-          <div class="hero-kicker">✦ Rising — every listen pays the artist in full</div>
+          <div class="hero-kicker">✦ Rising</div>
           <div class="hero-title">${esc(s.title) || '(untitled)'}</div>
           <div class="hero-sub">${esc(s.artist)}${s.playCount ? ` · ${fmtPlays(s.playCount)} plays` : ''}</div>
           <div class="hero-actions">

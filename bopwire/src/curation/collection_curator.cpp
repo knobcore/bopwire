@@ -245,8 +245,12 @@ void CollectionCurator::regenerate(uint64_t epoch, uint32_t snapshot_height) {
     set.snapshot_height = snapshot_height;
     if (auto h = chain_.get_block_hash(snapshot_height)) set.snapshot_block_hash = *h;
 
-    // Rising — the product hook: songs still under the full-reward
-    // threshold, i.e. every play mints the artist the full amount.
+    // Rising — songs still under the full-reward threshold.
+    //
+    // The subtitle deliberately states the threshold and nothing more. It
+    // previously read "every listen pays the artist in full", which is a
+    // payout claim rather than a description of the collection, and the same
+    // wording was removed from the site hero for that reason.
     {
         std::vector<const Entry*> v;
         for (const auto& e : entries)
@@ -254,7 +258,7 @@ void CollectionCurator::regenerate(uint64_t epoch, uint32_t snapshot_height) {
                 v.push_back(&e);
         std::sort(v.begin(), v.end(), by_plays);
         set.collections.push_back({"rising:", "rising", "Rising",
-                                   "Under 10k plays — every listen pays the artist in full",
+                                   "Under 10k plays",
                                    "", take(v)});
     }
 
