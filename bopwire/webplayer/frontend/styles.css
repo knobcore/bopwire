@@ -121,7 +121,27 @@ body {
 }
 .tile:hover { transform: translateY(-2px); border-color: rgba(255,255,255,.25); }
 .tile .tile-count { position: absolute; top: 8px; right: 10px; font-size: 10.5px; font-weight: 700;
-  color: rgba(255,255,255,.85); background: rgba(0,0,0,.35); border-radius: 999px; padding: 2px 7px; }
+  color: rgba(255,255,255,.85); background: rgba(0,0,0,.35); border-radius: 999px; padding: 2px 7px;
+  z-index: 1; }
+
+/* Rotating cover slideshow under the tile's label — the gradient in .tile's
+   own background stays as the base layer so a genre with no real art (or
+   every candidate 404ing) still looks intentional, not broken. */
+.tile-slide {
+  position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
+  opacity: 0; transition: opacity .6s ease;
+}
+.tile-slide.active { opacity: 1; }
+/* Text is plain in-flow content, which paints BELOW positioned siblings
+   (the slides, the darkening gradient) regardless of source order — give it
+   its own stacking context so the label stays legible over a photo. */
+.tile-label { position: relative; z-index: 1; }
+/* Darken under the label text so it stays readable over a photo, same
+   contrast trick .tile already relies on with its text-shadow. */
+.tile::after {
+  content: ''; position: absolute; inset: 0; z-index: 0; pointer-events: none;
+  background: linear-gradient(180deg, transparent 40%, rgba(0,0,0,.55) 100%);
+}
 
 /* Carousel rows */
 .carousel { margin-bottom: 22px; }
@@ -393,4 +413,17 @@ body {
   .lyr-wrap { padding: 14px 16px; }
   .lyr-title { font-size: 20px; }
   .lyr-line { font-size: 17px; }
+}
+
+/* Real album art, layered over the generated cover underneath. The wrapper
+   carries its own position:relative so this drops into any existing
+   container (.hero-art, .card .cover, .t-art, .list-art) without needing
+   each one edited — they already clip via overflow:hidden and size via
+   fixed dimensions or aspect-ratio, both of which the wrapper inherits by
+   filling 100%. */
+.art-wrap { position: relative; display: block; width: 100%; height: 100%; }
+.art-wrap svg { position: relative; }
+.art-wrap .art-real {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; display: block;
 }

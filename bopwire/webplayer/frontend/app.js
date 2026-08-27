@@ -169,15 +169,35 @@
       }
     }
     const gid = 'g' + p.seed.map((x) => x.toString(16).padStart(2, '0')).join('');
-    return `<svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid slice"${opts && opts.attrs ? ' ' + opts.attrs : ''}>
+    const svg = `<svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid slice"${opts && opts.attrs ? ' ' + opts.attrs : ''}>
       <defs><linearGradient id="${gid}" gradientTransform="rotate(${p.angle},.5,.5)">
         <stop offset="0" stop-color="${bg1}"/><stop offset="1" stop-color="${bg2}"/>
       </linearGradient></defs>
       <rect width="96" height="96" fill="url(#${gid})"/>
       <g transform="rotate(${p.rot},48,48)">${m}</g>
     </svg>`;
+    // Real cover on top, when the caller has an artist to look one up by.
+    // The node scrapes real covers (sacad) AND takes contributed ones from
+    // players' own embedded art (art.put), both landing at /api/art. A miss
+    // is a normal 404 (nothing has been found for this album yet), so the
+    // <img> just removes itself on error and the generated art underneath
+    // shows through — no placeholder flash, no visible failure state. The
+    // wrapper carries its own position:relative so this works inside ANY
+    // container regardless of that container's own CSS.
+    if (opts && opts.art && opts.art.artist) {
+      const url = `${CFG.gateway}/api/art?artist=${encodeURIComponent(opts.art.artist)}` +
+                  `&album=${encodeURIComponent(opts.art.album || '')}`;
+      return `<span class="art-wrap">${svg}` +
+             `<img class="art-real" src="${url}" alt="" loading="lazy" onerror="this.remove()"></span>`;
+    }
+    return svg;
   }
-  const songArt  = (s) => coverArt(seedFromHash(s.contentHash));
+  // songArt fetches the real cover when the row has an artist to look one up
+  // by (search results, library rows, anything server-backed). Collection
+  // membership sometimes trims artist/album for weight — those fall back to
+  // generated art only, same as before.
+  const songArt  = (s) => coverArt(seedFromHash(s.contentHash),
+      s.artist ? { art: { artist: s.artist, album: s.album } } : undefined);
   const nameArt  = (name) => coverArt(seedFromName(name));
   // Genre tile background: the two hues of the same seed as a CSS gradient.
   function tileGradient(name) {
@@ -293,21 +313,67 @@
     $('hero-more').onclick = () => openCollection(rising);
   }
 
+  // Genre tiles cycle through a handful of real covers from songs in that
+  // genre, the same "gentle slideshow" ArtistArt does in the app for an
+  // artist's albums — one gradient tile felt static next to song cards that
+  // show a specific cover. One shared timer drives every tile (cheaper than
+  // one Timer per tile, and visually indistinguishable), and a slide that
+  // 404s is marked dead and skipped rather than retried or removed — removing
+  // it would shift every later index and desync which slide "1", "2"... mean.
+  let _tileCycleTimer = null;
+  const _tileCyclePeriodMs = 6000;
+
+  function _tileArtCandidates(songs) {
+    const seen = new Set();
+    const out = [];
+    for (const s of (songs || [])) {
+      if (!s.artist) continue;
+      const key = `${s.artist}\x1f${s.album || ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ artist: s.artist, album: s.album || '' });
+      if (out.length >= 4) break;
+    }
+    return out;
+  }
+
   function renderGenreTiles(cols) {
+    if (_tileCycleTimer) { clearInterval(_tileCycleTimer); _tileCycleTimer = null; }
     const genres = cols.filter((c) => c.kind === 'genre');
     const el = $('genre-tiles');
     if (!genres.length) { el.innerHTML = ''; return; }
     el.innerHTML = `
       <div class="tiles-title">Genres</div>
-      <div class="tiles">${genres.map((c, i) => `
-        <div class="tile" data-i="${i}" style="background:${tileGradient(c.facet)}">
+      <div class="tiles">${genres.map((c, i) => {
+        const cands = _tileArtCandidates(c.songs);
+        const slides = cands.map((cd, si) => {
+          const url = `${CFG.gateway}/api/art?artist=${encodeURIComponent(cd.artist)}` +
+                      `&album=${encodeURIComponent(cd.album)}`;
+          return `<img class="tile-slide${si === 0 ? ' active' : ''}" data-si="${si}" ` +
+                 `src="${url}" alt="" loading="lazy" ` +
+                 `onerror="this.dataset.dead='1'; this.classList.remove('active')">`;
+        }).join('');
+        return `<div class="tile" data-i="${i}" style="background:${tileGradient(c.facet)}">
+          ${slides}
           <span class="tile-count">${(c.songs || []).length}</span>
-          ${esc(c.title.replace(/^Best of /, ''))}
-        </div>`).join('')}
+          <span class="tile-label">${esc(c.title.replace(/^Best of /, ''))}</span>
+        </div>`;
+      }).join('')}
       </div>`;
     el.querySelectorAll('.tile').forEach((t) => {
       t.onclick = () => openCollection(genres[+t.dataset.i]);
     });
+    if (genres.some((c) => _tileArtCandidates(c.songs).length > 1)) {
+      _tileCycleTimer = setInterval(() => {
+        el.querySelectorAll('.tile').forEach((t) => {
+          const slides = [...t.querySelectorAll('.tile-slide')].filter((im) => !im.dataset.dead);
+          if (slides.length < 2) return;
+          const cur = slides.findIndex((im) => im.classList.contains('active'));
+          slides.forEach((im) => im.classList.remove('active'));
+          slides[(cur + 1) % slides.length].classList.add('active');
+        });
+      }, _tileCyclePeriodMs);
+    }
   }
 
   function renderRows(cols) {
