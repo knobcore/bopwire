@@ -123,6 +123,7 @@ void main() {
       serverHost: '127.0.0.1',
       serverPorts: [server.port],
       usernameOverride: 'me',
+      allowLoopbackPeers: true,
       passwordOverride: 'pw',
     );
 
@@ -227,6 +228,7 @@ void main() {
       serverHost: '127.0.0.1',
       serverPorts: [server.port],
       usernameOverride: 'me',
+      allowLoopbackPeers: true,
       passwordOverride: 'pw',
     );
     await net.connect();

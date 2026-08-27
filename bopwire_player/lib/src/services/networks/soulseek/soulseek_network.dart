@@ -63,13 +63,24 @@ class SoulseekNetwork implements ExternalNetwork {
     String? passwordOverride,
     Future<PortMapping?> Function(int port)? portMapOpen,
     Future<void> Function(int port)? portMapClose,
-  })  : _serverHost = serverHost,
+    bool allowLoopbackPeers = false,
+  })  : _allowLoopbackPeers = allowLoopbackPeers,
+        _serverHost = serverHost,
         _serverPorts = serverPorts,
         _usernameOverride = usernameOverride,
         _passwordOverride = passwordOverride,
         _portMapOpen = portMapOpen ?? _defaultPortMapOpen,
         _portMapClose = portMapClose ?? _defaultPortMapClose,
         _log = logger ?? _defaultLog;
+
+  /// Tests drive fake peers over loopback, which the production
+  /// routability rule rejects on purpose — a real peer advertising
+  /// 127.0.0.1 would have us dial our OWN listening port. Off by default
+  /// so the strict rule is what ships.
+  final bool _allowLoopbackPeers;
+
+  bool _canDial(String ip, int port) =>
+      isRoutableAddress(ip, port, allowLoopback: _allowLoopbackPeers);
 
   static Future<PortMapping?> _defaultPortMapOpen(int port) =>
       PortMap.openTcp(port);
@@ -563,9 +574,22 @@ class SoulseekNetwork implements ExternalNetwork {
 
   /// A peer (or a peer we asked for) wants us to dial them.
   Future<void> _onConnectToPeer(ConnectToPeerRequest req) async {
-    if (req.connType == ConnType.distributed || req.port <= 0) {
+    if (req.connType == ConnType.distributed ||
+        !_canDial(req.ipAddress, req.port)) {
       // We don't join the distributed overlay, and an unroutable address is
       // nothing we can act on.
+      //
+      // "Unroutable" here means private/loopback/link-local/CGNAT as well
+      // as port 0: a peer that could not work out its own public address
+      // advertises its LAN address instead, and dialling that from here
+      // reaches nothing (or, worse, reaches an unrelated machine on OUR
+      // LAN holding the same 192.168.x.x). Answering CantConnectToPeer
+      // straight away is both honest and useful — it is the signal that
+      // makes the peer try the other direction instead of waiting on us.
+      if (req.connType != ConnType.distributed) {
+        _log('ignoring unroutable ConnectToPeer from ${req.username} '
+            '(${req.ipAddress}:${req.port})');
+      }
       _serverSend(ServerCode.cantConnectToPeer,
           SlskOut.cantConnectToPeer(req.token, req.username));
       return;
@@ -811,7 +835,7 @@ class SoulseekNetwork implements ExternalNetwork {
       _log('address lookup for $username failed: $e');
     }
 
-    if (addr != null && addr.isRoutable) {
+    if (addr != null && _canDial(addr.ipAddress, addr.port)) {
       try {
         final conn = await SlskPeerConnection.dialDirect(
           ourUsername: _username!,
@@ -1201,7 +1225,7 @@ class SoulseekNetwork implements ExternalNetwork {
       // Direct dial first.
       try {
         final addr = await _lookupAddress(up.username);
-        if (addr.isRoutable) {
+        if (_canDial(addr.ipAddress, addr.port)) {
           final sck = await Socket.connect(addr.ipAddress, addr.port,
               timeout: const Duration(seconds: 8));
           sck.setOption(SocketOption.tcpNoDelay, true);

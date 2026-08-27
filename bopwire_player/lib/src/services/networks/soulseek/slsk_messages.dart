@@ -266,13 +266,66 @@ class LoginResponse {
   }
 }
 
+/// True when [ip]:[port] is an address we could actually reach over the
+/// internet.
+///
+/// Why this is stricter than it looks like it needs to be
+/// -----------------------------------------------------
+/// A Soulseek client that cannot determine its own public address
+/// advertises whatever it found on its interface — routinely a
+/// 192.168.x.x or 10.x.x.x LAN address. Dialling one of those from our
+/// machine does not reach that peer; it either fails instantly with
+/// "No route to host" or, worse, connects to a completely unrelated
+/// device on OUR LAN that happens to hold the same address.
+///
+/// The previous check was `port > 0 && ip != '0.0.0.0'`, which let every
+/// one of those through. A live run dialled 18 such peers and failed 18
+/// times, which read as a NAT problem but was really us dialling
+/// addresses that were never reachable from here.
+///
+/// Peers filtered out here are not lost: they are unreachable only in the
+/// outbound direction, and the protocol's other path (asking the server
+/// to have them dial us) is exactly what CantConnectToPeer triggers.
+bool isRoutableAddress(String ip, int port, {bool allowLoopback = false}) {
+  if (port <= 0 || port > 65535) return false;
+
+  final parts = ip.split('.');
+  if (parts.length != 4) return false;
+  final o = <int>[];
+  for (final p in parts) {
+    final v = int.tryParse(p);
+    if (v == null || v < 0 || v > 255) return false;
+    o.add(v);
+  }
+
+  // 0.0.0.0/8      "this network" — also the classic "I don't know my IP"
+  if (o[0] == 0) return false;
+  // 10.0.0.0/8     RFC1918 private
+  if (o[0] == 10) return false;
+  // 127.0.0.0/8    loopback: would connect to ourselves. Tests drive
+  //                fake peers over loopback and opt in explicitly.
+  if (o[0] == 127) return allowLoopback;
+  // 100.64.0.0/10  RFC6598 carrier-grade NAT
+  if (o[0] == 100 && o[1] >= 64 && o[1] <= 127) return false;
+  // 169.254.0.0/16 link-local (DHCP failed on that peer)
+  if (o[0] == 169 && o[1] == 254) return false;
+  // 172.16.0.0/12  RFC1918 private
+  if (o[0] == 172 && o[1] >= 16 && o[1] <= 31) return false;
+  // 192.168.0.0/16 RFC1918 private
+  if (o[0] == 192 && o[1] == 168) return false;
+  // 224.0.0.0/4    multicast, and 240.0.0.0/4 reserved — neither is a host
+  if (o[0] >= 224) return false;
+
+  return true;
+}
+
 class PeerAddress {
   const PeerAddress(this.username, this.ipAddress, this.port);
   final String username;
   final String ipAddress;
   final int port;
 
-  bool get isRoutable => port > 0 && ipAddress != '0.0.0.0';
+  bool get isRoutable => isRoutableAddress(ipAddress, port);
 
   static PeerAddress parse(Uint8List payload) {
     final r = SlskReader(payload);
