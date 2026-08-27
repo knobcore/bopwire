@@ -20,7 +20,6 @@ import '../services/local_library_actions.dart';
 import '../services/playlist_service.dart';
 import '../widgets/album_art.dart';
 import '../widgets/cover_art.dart';
-import '../widgets/lyrics_panel.dart';
 import 'dmca_screen.dart';
 import 'folders_screen.dart';
 
@@ -1861,42 +1860,9 @@ class _LocalEntryRow extends StatelessWidget {
             maxLines: 1, overflow: TextOverflow.ellipsis,
           ),
           onTap: isLocal ? onPlay : null,
-          trailing: SizedBox(
-            width: 128,
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                IconButton(
-                  tooltip: 'Lyrics',
-                  padding: EdgeInsets.zero,
-                  constraints:
-                      const BoxConstraints(minWidth: 28, minHeight: 28),
-                  icon: Icon(Icons.lyrics_outlined,
-                      size: 18,
-                      color: theme.colorScheme.onSurface.withOpacity(.7)),
-                  onPressed: () => openLyrics(
-                    context,
-                    LyricsRequest(
-                      // The library's stable song id keys the local
-                      // lyrics cache; every hash this file answers to is
-                      // a match for "is this the song that's playing".
-                      songKey: entry.songId,
-                      title: entry.title,
-                      artist: entry.artist,
-                      hashes: {
-                        entry.songId,
-                        entry.contentHash,
-                        entry.canonicalHash,
-                      },
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 4),
-                SizedBox(width: 96, child: trailing),
-              ],
-            ),
-          ),
+          // Lyrics moved to the play bar (one control for whatever is
+          // playing) — the row keeps just its own actions.
+          trailing: SizedBox(width: 96, child: trailing),
         ),
       ),
     );

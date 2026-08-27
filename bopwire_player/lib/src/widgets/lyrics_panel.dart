@@ -134,12 +134,11 @@ class LyricsController extends ChangeNotifier {
   }
 }
 
-/// Row-button entry point. Pops any pushed route (a collection screen,
-/// say) back to the home shell first, because that is where the lyrics
-/// panel lives — mirroring the website, where lyrics replace the main
-/// view whatever you were looking at.
+/// Play-bar entry point. The panel overlays the home shell's nested
+/// navigator, ABOVE whatever screen is showing (a pushed collection's
+/// track list included) — so nothing is popped here: closing lyrics is a
+/// genuine BACK that reveals the untouched screen underneath.
 void openLyrics(BuildContext context, LyricsRequest req) {
-  Navigator.of(context).popUntil((r) => r.isFirst);
   LyricsController.instance.open(req);
 }
 
@@ -203,6 +202,58 @@ Future<LyricsResult?> defaultLyricsLoader(LyricsRequest req) async {
     return res.hasAny ? res : null;
   } catch (_) {
     return null;
+  }
+}
+
+// ─────────────────────── Availability (play-bar glow) ───────────────────────
+
+/// Cheap "does this song have lyrics?" answer for the play bar, which
+/// wants its Lyrics button to glow when lyrics actually exist for the
+/// current track. The bar rebuilds on every position tick, so [check]
+/// MUST stay a map lookup: the async resolution (same two sources as the
+/// panel — local cache, then node) runs AT MOST ONCE per song, and both
+/// hits and misses are remembered for the process. Failures are simply
+/// "no lyrics"; nothing here can block or stutter playback.
+class LyricsAvailability extends ChangeNotifier {
+  LyricsAvailability._();
+  static final LyricsAvailability instance = LyricsAvailability._();
+
+  /// Injectable for tests; production uses the panel's own loader.
+  LyricsLoader loader = defaultLyricsLoader;
+
+  final Map<String, bool> _known = {};
+  final Set<String> _inFlight = {};
+
+  static String _key(LyricsRequest req) =>
+      '${req.songKey}|${req.artist.trim().toLowerCase()}'
+      '|${req.title.trim().toLowerCase()}';
+
+  /// true/false once known; null while a (single) resolution is still in
+  /// flight — listeners are notified when it lands.
+  bool? check(LyricsRequest req) {
+    final k = _key(req);
+    final known = _known[k];
+    if (known != null) return known;
+    if (_inFlight.add(k)) {
+      () async {
+        var has = false;
+        try {
+          final res = await loader(req);
+          has = res != null && res.hasAny;
+        } catch (_) {/* a failure is just "no lyrics" */}
+        _known[k] = has;
+        _inFlight.remove(k);
+        notifyListeners();
+      }();
+    }
+    return null;
+  }
+
+  /// Test hook: forget everything and restore the default loader.
+  void debugReset() {
+    _known.clear();
+    _inFlight.clear();
+    loader = defaultLyricsLoader;
   }
 }
 
@@ -362,6 +413,15 @@ class _LyricsPanelState extends State<LyricsPanel> {
             ),
             child: Row(
               children: [
+                // Reads as BACK, because that is what it does now: the
+                // screen the lyrics opened over (tab or pushed track
+                // list) is still there underneath, untouched.
+                IconButton(
+                  tooltip: 'Back',
+                  icon: const Icon(Icons.arrow_back, size: 20),
+                  onPressed: widget.onClose,
+                ),
+                const SizedBox(width: 2),
                 Icon(Icons.lyrics_outlined,
                     size: 20, color: theme.colorScheme.primary),
                 const SizedBox(width: 10),
@@ -387,11 +447,6 @@ class _LyricsPanelState extends State<LyricsPanel> {
                         ),
                     ],
                   ),
-                ),
-                IconButton(
-                  tooltip: 'Close lyrics',
-                  icon: const Icon(Icons.close, size: 20),
-                  onPressed: widget.onClose,
                 ),
               ],
             ),

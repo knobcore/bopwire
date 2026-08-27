@@ -6,6 +6,7 @@ import 'package:media_kit/media_kit.dart';
 import '../models/song.dart';
 import '../models/session.dart';
 import '../services/audio_stream_proxy.dart';
+import '../services/metadata_lookup.dart';
 import '../services/node_client.dart';
 import '../services/node_service.dart';
 import '../services/heartbeat_service.dart';
@@ -80,6 +81,20 @@ class PlayerProvider extends ChangeNotifier {
   PlaySession?  currentSession;
   PlayerState   state        = PlayerState.idle;
   int           positionMs   = 0;
+
+  // ---- preview enrichment (web metadata + real cover) -----------------
+  // Corrects a foreign-network preview's mangled search-result tags via
+  // MetadataLookup (opt-in, debounced, rate-limited) and pulls the real
+  // cover from Cover Art Archive as the track buffers. Entirely off the
+  // playback path: results arrive via callbacks that are epoch-guarded in
+  // PreviewEnricher, so a late reply from a scrubbed-past preview can
+  // never land on whatever is playing now.
+  final PreviewEnricher _previewEnricher = PreviewEnricher();
+
+  /// Real cover for the CURRENT preview, once the enricher lands one.
+  /// Null for chain tracks (those resolve art through AlbumArt/the node)
+  /// and for previews with no cover found yet.
+  Uint8List? previewArtBytes;
 
   /// Duration reported by the decoder for whatever is loaded, 0 until it
   /// arrives. Prefer [durationMs], which falls back to chain metadata.
@@ -194,6 +209,11 @@ class PlayerProvider extends ChangeNotifier {
     positionMs       = 0;
     bufferedFraction = 0;   // progressive source: the bar shows fill
 
+    // A new preview abandons the previous one's lookup NOW — before any
+    // await — so a reply already in flight can't land on this track.
+    _previewEnricher.cancel();
+    previewArtBytes = null;
+
     try {
       await _player.open(Media(url), play: true);
       state = PlayerState.playing;
@@ -202,6 +222,53 @@ class PlayerProvider extends ChangeNotifier {
       state = PlayerState.stopped;
       currentSong = null;
     }
+    notifyListeners();
+
+    // Kick off the web metadata + cover enrichment (opt-in via Settings,
+    // debounced inside the enricher). Fire-and-forget: playback is
+    // already running and must never wait on this.
+    if (state == PlayerState.playing) {
+      unawaited(_previewEnricher.start(
+        title: title,
+        artist: artist,
+        album: album,
+        durationMs: durationMs,
+        onTags: (out) => _applyPreviewTags(preview, out),
+        onArt: (bytes) {
+          // Belt and braces on top of the enricher's epoch guard: only a
+          // still-current preview may receive the cover.
+          if (!isPreview) return;
+          previewArtBytes = bytes;
+          notifyListeners();
+        },
+      ));
+    }
+  }
+
+  /// Swap the synthetic preview Song for one carrying the corrected
+  /// title/artist/album. Display-only: contentHash stays '' (still a
+  /// preview — see [isPreview]), nothing is written to the library or
+  /// the chain.
+  void _applyPreviewTags(Song original, MergeOutcome out) {
+    final cur = currentSong;
+    // Only apply to the exact preview this lookup was started for.
+    if (cur == null || !isPreview || !identical(cur, original)) return;
+    if (!out.changed) return;
+    currentSong = Song(
+      contentHash:     '',
+      fingerprintHash: '',
+      title:           out.title,
+      artist:          out.artist,
+      genre:           '',
+      album:           out.album,
+      year:            out.year,
+      trackNumber:     out.trackNumber,
+      durationMs:      cur.durationMs,
+      playCount:       0,
+      swarmSize:       0,
+    );
+    playlist     = [currentSong!];
+    _playlistIdx = 0;
     notifyListeners();
   }
 
@@ -252,6 +319,8 @@ class PlayerProvider extends ChangeNotifier {
     }
     _player.stop();
     _heartbeat.stop();
+    _previewEnricher.cancel();       // stop() ends any preview lookup too
+    previewArtBytes  = null;
     bufferedFraction = null;
     state          = PlayerState.stopped;
     currentSong    = null;
@@ -364,6 +433,10 @@ class PlayerProvider extends ChangeNotifier {
       currentSession = null;
     }
     await _player.stop();
+    // A chain track replacing a preview abandons the preview's lookup —
+    // a late enrichment reply must never restyle the chain track.
+    _previewEnricher.cancel();
+    previewArtBytes  = null;
     state            = PlayerState.loading;
     errorMessage     = null;
     playerDurationMs = 0;

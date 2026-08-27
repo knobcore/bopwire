@@ -55,11 +55,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'album_art_cache.dart';
 import 'node_client.dart';
 import 'node_service.dart';
 
@@ -109,6 +111,8 @@ class TagCandidate {
     this.year = 0,
     this.trackNumber = 0,
     this.durationMs = 0,
+    this.releaseMbid = '',
+    this.releaseGroupMbid = '',
     required this.source,     // 'acoustid' | 'musicbrainz' | 'genius'
     required this.score,      // acoustid 0..1, musicbrainz 0..100, genius 0..1
     required this.confident,  // may CORRECT populated fields, not just fill
@@ -120,6 +124,16 @@ class TagCandidate {
   final int    year;
   final int    trackNumber;
   final int    durationMs;
+
+  /// MusicBrainz release MBID of the chosen release (bestRel['id']), ''
+  /// when the source doesn't carry one. Cover Art Archive is keyed on
+  /// exactly this: coverartarchive.org/release/<mbid>/front-500.
+  final String releaseMbid;
+
+  /// MBID of that release's release-group — the CAA fallback key when the
+  /// specific release has no front image.
+  final String releaseGroupMbid;
+
   final String source;
   final double score;
   final bool   confident;
@@ -128,6 +142,8 @@ class TagCandidate {
         'title': title, 'artist': artist, 'album': album,
         'year': year, 'track_number': trackNumber,
         'duration_ms': durationMs,
+        if (releaseMbid.isNotEmpty)      'release_mbid': releaseMbid,
+        if (releaseGroupMbid.isNotEmpty) 'release_group_mbid': releaseGroupMbid,
         'source': source, 'score': score, 'confident': confident,
       };
 
@@ -138,6 +154,8 @@ class TagCandidate {
         year:        (j['year']         as num?)?.toInt() ?? 0,
         trackNumber: (j['track_number'] as num?)?.toInt() ?? 0,
         durationMs:  (j['duration_ms']  as num?)?.toInt() ?? 0,
+        releaseMbid:      (j['release_mbid']       as String?) ?? '',
+        releaseGroupMbid: (j['release_group_mbid'] as String?) ?? '',
         source:      (j['source'] as String?) ?? '',
         score:       (j['score']  as num?)?.toDouble() ?? 0,
         confident:   j['confident'] == true,
@@ -156,6 +174,8 @@ class MergeOutcome {
     required this.source,
     required this.filled,
     required this.corrected,
+    this.releaseMbid = '',
+    this.releaseGroupMbid = '',
   });
 
   final String title;
@@ -164,6 +184,12 @@ class MergeOutcome {
   final int    year;
   final int    trackNumber;
   final String source;
+
+  /// MBIDs carried through verbatim from the accepted candidate ('' when
+  /// the source had none). Not merge data — they exist so a caller can
+  /// fetch the Cover Art Archive front image for the matched release.
+  final String releaseMbid;
+  final String releaseGroupMbid;
 
   /// Fields that were blank (or filename-derived) and got a value.
   final List<String> filled;
@@ -260,6 +286,8 @@ class TagMerge {
       title: title, artist: artist, album: album,
       year: year, trackNumber: track,
       source: cand.source, filled: filled, corrected: corrected,
+      releaseMbid: cand.releaseMbid,
+      releaseGroupMbid: cand.releaseGroupMbid,
     );
   }
 }
@@ -291,6 +319,7 @@ class MetadataLookup {
     'musicbrainz': Duration(milliseconds: 1100),
     'genius':      Duration(milliseconds: 600),
     'lrclib':      Duration(milliseconds: 600),
+    'coverart':    Duration(milliseconds: 600),
   };
 
   Future<T> _serialized<T>(String service, Future<T> Function() job) {
@@ -419,6 +448,167 @@ class MetadataLookup {
     } catch (e) {
       _mlog('enrich failed (ignored, scan continues): $e');
       return null;
+    }
+  }
+
+  // ---- preview enrichment + Cover Art Archive ---------------------------
+
+  /// Cache key for a preview lookup: a preview has no file on disk yet,
+  /// so no fingerprint/content hash — key on the normalized artist+title
+  /// the search result gave us. '' when the title is unusable.
+  static String previewCacheKey(
+      {required String title, required String artist}) {
+    final t = normalizeFuzzy(title);
+    if (t.isEmpty) return '';
+    return 'preview:${normalizeFuzzy(artist)}|$t';
+  }
+
+  /// Look up corrected tags for a foreign-network PREVIEW (Soulseek /
+  /// napstr). Same pipeline, opt-in gate, on-disk cache (hits AND
+  /// misses), serial queue and merge policy as [enrich]; the preview's
+  /// search-result title is treated as filename-derived (they nearly
+  /// always are), so a non-confident match may still replace it for
+  /// display. Returns null when disabled, on a miss, or on any error.
+  /// Display-only: callers must not write library rows or chain state
+  /// from this.
+  Future<MergeOutcome?> enrichPreview({
+    required String title,
+    required String artist,
+    String album = '',
+    int durationMs = 0,
+  }) {
+    final key = previewCacheKey(title: title, artist: artist);
+    if (key.isEmpty) return Future.value(null);
+    return enrich(
+      current: CurrentTags(
+        title: title, artist: artist, album: album,
+        year: 0, trackNumber: 0,
+        titleIsFromFilename: true,
+      ),
+      fingerprint: '',
+      durationMs: durationMs,
+      cacheKey: key,
+    );
+  }
+
+  /// Fetch the real front cover for a matched release from Cover Art
+  /// Archive (keyless, CDN-backed, keyed on the release MBID; the
+  /// release-group is the fallback when that release has no front image).
+  /// Stored into [AlbumArtCache] under the CORRECTED artist/album so the
+  /// display layer and a later real download reuse it, and offered to the
+  /// node (gap-fill only) exactly when it was newly fetched — the same
+  /// once-per-album rule the import path follows.
+  ///
+  /// Honours the same opt-in as tag lookups. A CAA 404 is a NORMAL answer
+  /// (plenty of releases have no art) — recorded as a miss in the lookup
+  /// cache so scrubbing back and forth re-queries nothing. Returns the
+  /// cached art file (which may have been there all along), or null.
+  /// Never throws.
+  Future<File?> fetchCoverArtIfEnabled({
+    required String releaseMbid,
+    required String releaseGroupMbid,
+    required String artist,
+    required String album,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (!(prefs.getBool(MetadataLookupPrefs.enabled) ?? false)) return null;
+      if (artist.trim().isEmpty) return null; // no usable cache key
+      // Already have art for this album (embedded from a local file, or a
+      // previous fetch) → zero network.
+      final existing = await AlbumArtCache.cachedArt(artist, album);
+      if (existing != null) return existing;
+      if (releaseMbid.isEmpty && releaseGroupMbid.isEmpty) return null;
+
+      await _ensureCacheLoaded();
+      final missKey =
+          'art:${releaseMbid.isNotEmpty ? releaseMbid : releaseGroupMbid}';
+      final prior = _cache![missKey];
+      if (prior is Map && prior['found'] == false) return null; // cached miss
+
+      final bytes = await _coverArtLookup(releaseMbid, releaseGroupMbid);
+      if (bytes == null) {
+        _cache![missKey] = {
+          'ts': DateTime.now().millisecondsSinceEpoch,
+          'found': false,
+        };
+        await _saveCache();
+        return null;
+      }
+      final stored = await AlbumArtCache.storeBytes(bytes, artist, album);
+      if (stored == null) return null; // corrupt bytes / disk error
+      _cache![missKey] = {
+        'ts': DateTime.now().millisecondsSinceEpoch,
+        'found': true,
+      };
+      await _saveCache();
+      // NEWLY fetched (the cachedArt check above was a miss) → offer to
+      // the node once. Fire-and-forget, same contract as lyrics.
+      unawaited(_contributeArt(artist, album, bytes));
+      return stored;
+    } catch (e) {
+      _mlog('cover art fetch failed (ignored): $e');
+      return null;
+    }
+  }
+
+  /// GET the CAA front image, release first then release-group. Follows
+  /// redirects (the endpoint 307s to the archive.org item — package:http
+  /// follows GET redirects by default). 404 = "this release has no front
+  /// image" — an expected answer, not an error. Only JPEG/PNG (by magic
+  /// bytes, never the Content-Type header) are accepted: the node's
+  /// art.put rejects anything else, and so do we.
+  Future<Uint8List?> _coverArtLookup(
+      String releaseMbid, String releaseGroupMbid) {
+    return _serialized('coverart', () async {
+      for (final path in [
+        if (releaseMbid.isNotEmpty) 'release/$releaseMbid',
+        if (releaseGroupMbid.isNotEmpty) 'release-group/$releaseGroupMbid',
+      ]) {
+        try {
+          final resp = await _http.get(
+            Uri.parse('https://coverartarchive.org/$path/front-500'),
+            headers: {'User-Agent': _userAgent},
+          ).timeout(const Duration(seconds: 15));
+          if (resp.statusCode == 404) {
+            _mlog('coverart: no front image for $path (normal miss)');
+            continue;
+          }
+          if (resp.statusCode != 200) {
+            _mlog('coverart HTTP ${resp.statusCode} for $path — skipping');
+            continue;
+          }
+          final b = resp.bodyBytes;
+          final ext = AlbumArtCache.sniffExtension(b);
+          if (ext != 'jpg' && ext != 'png') {
+            _mlog('coverart: $path returned non-JPEG/PNG bytes '
+                '(${b.length} B) — rejected');
+            continue;
+          }
+          _mlog('coverart: fetched ${b.length} B $ext for $path');
+          return b;
+        } catch (e) {
+          _mlog('coverart fetch failed for $path (ignored): $e');
+        }
+      }
+      return null;
+    });
+  }
+
+  /// Offer freshly-fetched cover art to the node (gap-fill only, same
+  /// contract as [_contributeLyrics]): false usually means the node
+  /// already had art — a normal outcome, not a failure.
+  Future<void> _contributeArt(
+      String artist, String album, Uint8List bytes) async {
+    try {
+      final pid = await NodeService.getRatsPeerId(
+          waitFor: const Duration(seconds: 5));
+      if (pid.isEmpty) return;
+      final ok = await NodeClient(ratsPeerId: pid)
+          .contributeAlbumArt(artist, album, bytes);
+      if (ok) _mlog('cover art for "$artist / $album" contributed to node');
+    } catch (e) {
+      _mlog('art contribute failed (ignored): $e');
     }
   }
 
@@ -789,6 +979,8 @@ class MetadataLookup {
     String album = '';
     var year = 0;
     var track = 0;
+    var releaseMbid = '';
+    var releaseGroupMbid = '';
     final rels = top['releases'];
     if (rels is List) {
       Map? bestRel;
@@ -809,6 +1001,11 @@ class MetadataLookup {
       }
       if (bestRel != null) {
         album = _str(bestRel['title']);
+        // The release MBID (and its release-group's) are what Cover Art
+        // Archive is keyed on — capture them instead of discarding.
+        releaseMbid = _str(bestRel['id']);
+        final bestRg = bestRel['release-group'];
+        releaseGroupMbid = _str(bestRg is Map ? bestRg['id'] : null);
         final date = _str(bestRel['date']);
         if (date.length >= 4) year = int.tryParse(date.substring(0, 4)) ?? 0;
         final media = bestRel['media'];
@@ -827,6 +1024,7 @@ class MetadataLookup {
     return TagCandidate(
       title: title, artist: artist, album: album,
       year: year, trackNumber: track, durationMs: lenMs,
+      releaseMbid: releaseMbid, releaseGroupMbid: releaseGroupMbid,
       source: 'musicbrainz', score: topScore, confident: confident,
     );
   }
@@ -996,5 +1194,76 @@ class MetadataLookup {
       if (r != null) return r;
     }
     return null;
+  }
+}
+
+/// Coordinates the metadata + cover-art enrichment of ONE playing preview,
+/// handling the two hazards previews add over library scans:
+///
+///   * Users scrub through previews quickly, so every [start] supersedes
+///     the previous one: an epoch counter is re-checked after EVERY await
+///     and a stale generation exits without invoking a single callback —
+///     a late reply can never land on the wrong track.
+///   * The debounce in front of the first network touch means rapid
+///     preview-switching fires no request at all for the abandoned ones
+///     (on top of MetadataLookup's serial queue + per-service rate
+///     limits, which throttle whatever does get through).
+///
+/// Everything is off the playback path: callbacks fire only with results,
+/// failures are swallowed inside MetadataLookup, and the opt-in gate
+/// (MetadataLookupPrefs.enabled, default OFF) is enforced by the lookup
+/// methods themselves.
+class PreviewEnricher {
+  PreviewEnricher({
+    this.debounce = const Duration(milliseconds: 900),
+    MetadataLookup? lookup,
+  }) : _lookup = lookup ?? MetadataLookup.instance;
+
+  /// Delay before the first network touch. A preview abandoned within
+  /// this window costs zero requests.
+  final Duration debounce;
+
+  final MetadataLookup _lookup;
+  int _epoch = 0;
+
+  /// Abandon whatever lookup is in flight. Call whenever the preview
+  /// stops or something else starts playing.
+  void cancel() => _epoch++;
+
+  /// Start enrichment for a just-started preview. [onTags] fires when a
+  /// corrected candidate lands, [onArt] when a real cover does (possibly
+  /// straight from the on-disk cache). Neither fires after a newer
+  /// [start] or a [cancel]. Never throws.
+  Future<void> start({
+    required String title,
+    String artist = '',
+    String album = '',
+    int durationMs = 0,
+    required void Function(MergeOutcome outcome) onTags,
+    required void Function(Uint8List bytes) onArt,
+  }) async {
+    final epoch = ++_epoch;
+    try {
+      if (debounce > Duration.zero) await Future.delayed(debounce);
+      if (epoch != _epoch) return; // superseded during debounce → no request
+      final out = await _lookup.enrichPreview(
+          title: title, artist: artist, album: album, durationMs: durationMs);
+      if (epoch != _epoch) return; // superseded mid-flight → drop the reply
+      if (out != null) onTags(out);
+      // Art is keyed on the CORRECTED artist/album (so a later real
+      // download finds it), falling back to what the search result said.
+      final f = await _lookup.fetchCoverArtIfEnabled(
+        releaseMbid:      out?.releaseMbid ?? '',
+        releaseGroupMbid: out?.releaseGroupMbid ?? '',
+        artist: out?.artist ?? artist,
+        album:  out?.album ?? album,
+      );
+      if (f == null || epoch != _epoch) return;
+      final bytes = await f.readAsBytes();
+      if (epoch != _epoch) return;
+      onArt(bytes);
+    } catch (e) {
+      _mlog('preview enrichment failed (ignored): $e');
+    }
   }
 }

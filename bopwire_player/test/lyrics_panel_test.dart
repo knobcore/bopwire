@@ -131,7 +131,7 @@ void main() {
       await t.pump();
       expect(find.text('Song h1'), findsOneWidget);
       expect(find.text('Artist'), findsOneWidget);
-      await t.tap(find.byTooltip('Close lyrics'));
+      await t.tap(find.byTooltip('Back'));
       expect(closed, isTrue);
     });
   });

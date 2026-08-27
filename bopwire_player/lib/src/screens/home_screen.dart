@@ -24,7 +24,28 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  int _selectedIndex = 0;
+  // Selected tab. A ValueNotifier (not a plain setState field) because the
+  // tab stack now lives INSIDE the nested shell navigator's home route,
+  // and a route's builder does not re-run when this State rebuilds — the
+  // IndexedStack listens to this directly instead.
+  final ValueNotifier<int> _tab = ValueNotifier<int>(0);
+
+  /// The nested "shell" navigator that pushed screens (a collection's
+  /// track list, folders, chat rooms…) go onto. Because it sits inside
+  /// the Expanded, everything it shows renders ABOVE the tab stack but
+  /// BELOW the download banner, mini player and nav bar — so the play
+  /// bar (and its lyrics button) stays visible on every pushed screen.
+  /// Tab content resolves `Navigator.of(context)` to this navigator
+  /// automatically; dialogs (`showDialog` defaults to the root
+  /// navigator) and the wallet gate are unaffected.
+  final GlobalKey<NavigatorState> _shellNavKey = GlobalKey<NavigatorState>();
+
+  /// Whether the shell navigator has a pushed screen to pop — kept live
+  /// by [_ShellDepthObserver] so the PopScope's canPop stays accurate
+  /// for Android's (predictive) back gesture.
+  final ValueNotifier<bool> _shellCanPop = ValueNotifier<bool>(false);
+  late final _ShellDepthObserver _shellObserver =
+      _ShellDepthObserver(_shellCanPop);
 
   static const _screens = [
     DiscoverScreen(),
@@ -35,37 +56,70 @@ class _HomeScreenState extends State<HomeScreen> {
   ];
 
   @override
+  void dispose() {
+    _tab.dispose();
+    _shellCanPop.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: Column(
         children: [
           const _ConnectionBanner(),
-          // The "top window": the tab stack, with the lyrics panel laid
-          // over it when a row's Lyrics button is tapped. A Stack (not a
-          // swap) so every tab keeps its state, and the banners + mini
-          // player below keep running — the same shape as the website,
-          // where the lyrics view replaces the main area while the
-          // now-playing bar stays live.
+          // The "top window": the nested shell navigator (tab stack as its
+          // home route), with the lyrics panel laid over it when the play
+          // bar's Lyrics button is tapped. A Stack (not a swap) so every
+          // tab — and any pushed track list — keeps its state, and the
+          // banners + mini player below keep running. Closing lyrics is a
+          // BACK action: the screen underneath was never destroyed.
           Expanded(
             child: AnimatedBuilder(
-              animation: LyricsController.instance,
+              animation:
+                  Listenable.merge([LyricsController.instance, _shellCanPop]),
               builder: (context, _) {
                 final req = LyricsController.instance.request;
-                return Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    IndexedStack(index: _selectedIndex, children: _screens),
-                    if (req != null)
-                      LyricsPanel(
-                        // Keyed per song so switching songs rebuilds the
-                        // panel (and its scroll position) from scratch.
-                        key: ValueKey('lyrics:${req.songKey}'),
-                        request: req,
-                        playback: LyricsPlayback.fromProvider(
-                            context.read<PlayerProvider>()),
-                        onClose: LyricsController.instance.close,
+                return PopScope(
+                  // System back: close lyrics first, then pop the shell
+                  // navigator; only when neither has anything left does
+                  // the pop reach the root (app exit on Android).
+                  canPop: req == null && !_shellCanPop.value,
+                  onPopInvokedWithResult: (didPop, _) {
+                    if (didPop) return;
+                    if (LyricsController.instance.request != null) {
+                      LyricsController.instance.close();
+                    } else {
+                      _shellNavKey.currentState?.maybePop();
+                    }
+                  },
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Navigator(
+                        key: _shellNavKey,
+                        observers: [_shellObserver],
+                        onGenerateRoute: (settings) => MaterialPageRoute(
+                          settings: settings,
+                          builder: (_) => ValueListenableBuilder<int>(
+                            valueListenable: _tab,
+                            builder: (_, idx, __) => IndexedStack(
+                                index: idx, children: _screens),
+                          ),
+                        ),
                       ),
-                  ],
+                      if (req != null)
+                        LyricsPanel(
+                          // Keyed per song so switching songs rebuilds the
+                          // panel (and its scroll position) from scratch.
+                          key: ValueKey('lyrics:${req.songKey}'),
+                          request: req,
+                          playback: LyricsPlayback.fromProvider(
+                              context.read<PlayerProvider>()),
+                          onClose: LyricsController.instance.close,
+                        ),
+                    ],
+                  ),
                 );
               },
             ),
@@ -85,18 +139,24 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _selectedIndex,
+      bottomNavigationBar: ValueListenableBuilder<int>(
+        valueListenable: _tab,
+        builder: (context, selected, _) => NavigationBar(
+        selectedIndex: selected,
         onDestinationSelected: (i) {
           // Picking a tab leaves lyrics mode, same as the website where
           // any nav click swaps the lyrics view out for the chosen one.
           LyricsController.instance.close();
-          if (i == 0 && _selectedIndex != 0) {
+          // And pops any pushed screen off the shell navigator — the tab
+          // stack sits UNDER pushed routes, so switching tabs while a
+          // collection was open would otherwise change an invisible view.
+          _shellNavKey.currentState?.popUntil((r) => r.isFirst);
+          if (i == 0 && selected != 0) {
             final lib = context.read<LibraryProvider>();
             lib.refresh();
             lib.loadCollections();
           }
-          setState(() => _selectedIndex = i);
+          _tab.value = i;
         },
         destinations: const [
           NavigationDestination(icon: Icon(Icons.library_music),         label: 'Discover'),
@@ -105,9 +165,32 @@ class _HomeScreenState extends State<HomeScreen> {
           NavigationDestination(icon: Icon(Icons.account_balance_wallet), label: 'Wallet'),
           NavigationDestination(icon: Icon(Icons.settings),              label: 'Settings'),
         ],
+        ),
       ),
     );
   }
+}
+
+/// Keeps a "can the shell navigator pop?" flag live for the PopScope
+/// above it. Route mutations happen from gesture handlers (never during
+/// build), so flipping the ValueNotifier here is safe; the initial home
+/// route push is a no-op (canPop() is false → value unchanged).
+class _ShellDepthObserver extends NavigatorObserver {
+  _ShellDepthObserver(this.canPopNotifier);
+  final ValueNotifier<bool> canPopNotifier;
+
+  void _sync() => canPopNotifier.value = navigator?.canPop() ?? false;
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) => _sync();
+  @override
+  void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) => _sync();
+  @override
+  void didRemove(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _sync();
+  @override
+  void didReplace({Route<dynamic>? newRoute, Route<dynamic>? oldRoute}) =>
+      _sync();
 }
 
 // ---- Connection status banner ------------------------------------------
@@ -460,6 +543,24 @@ class _MiniPlayerState extends State<_MiniPlayer> {
   // finger is even though `playing` keeps emitting new positions.
   double? _dragPositionMs;
 
+  @override
+  void initState() {
+    super.initState();
+    // Repaint the lyrics button when an availability lookup lands (the
+    // glow). check() itself is a map hit on the rebuilds in between.
+    LyricsAvailability.instance.addListener(_onLyricsAvailability);
+  }
+
+  @override
+  void dispose() {
+    LyricsAvailability.instance.removeListener(_onLyricsAvailability);
+    super.dispose();
+  }
+
+  void _onLyricsAvailability() {
+    if (mounted) setState(() {});
+  }
+
   String _fmt(int ms) {
     if (ms <= 0) return '0:00';
     final total = ms ~/ 1000;
@@ -591,9 +692,22 @@ class _MiniPlayerState extends State<_MiniPlayer> {
               if (!idle) ...[
                 ClipRRect(
                   borderRadius: BorderRadius.circular(8),
-                  child: AlbumArt(
-                      seed: seedFromHash(song.contentHash), size: 40,
-                      artist: song.artist, album: song.album),
+                  // A preview's real cover (fetched from Cover Art Archive
+                  // as it buffers) wins; otherwise the usual resolution
+                  // (node-scraped cover, else generated art) applies.
+                  child: player.previewArtBytes != null
+                      ? Image.memory(
+                          player.previewArtBytes!,
+                          width: 40,
+                          height: 40,
+                          fit: BoxFit.cover,
+                          gaplessPlayback: true,
+                          errorBuilder: (_, __, ___) => CoverArt(
+                              seed: seedFromHash(song.contentHash), size: 40),
+                        )
+                      : AlbumArt(
+                          seed: seedFromHash(song.contentHash), size: 40,
+                          artist: song.artist, album: song.album),
                 ),
                 const SizedBox(width: 10),
               ],
@@ -644,6 +758,42 @@ class _MiniPlayerState extends State<_MiniPlayer> {
                   ],
                 ),
               ),
+              // Lyrics live in the play bar (not the track rows) so they
+              // are reachable for WHATEVER is playing — Discover, search,
+              // local library, even a foreign-network preview — from
+              // anywhere in the app. Disabled when idle, matching the
+              // transport controls around it. The button GLOWS (filled
+              // icon, accent, soft halo) when lyrics actually resolved
+              // for this track — local cache or node, cached per song.
+              Builder(builder: (context) {
+                final req =
+                    song == null ? null : LyricsRequest.fromSong(song);
+                final has = req != null &&
+                    (LyricsAvailability.instance.check(req) ?? false);
+                return IconButton(
+                  iconSize: 20,
+                  tooltip: has
+                      ? 'Lyrics available'
+                      : 'No lyrics for this track',
+                  color: has ? accent : null,
+                  icon: has
+                      ? Icon(Icons.lyrics, shadows: [
+                          Shadow(
+                              color: accent.withValues(alpha: .9),
+                              blurRadius: 12),
+                        ])
+                      : const Icon(Icons.lyrics_outlined),
+                  // Only clickable once it GLOWS. The glow means lyrics
+                  // actually resolved for this track, so an enabled button
+                  // can never open an empty panel — while a lookup is still
+                  // in flight check() returns null and this stays disabled,
+                  // then the availability listener repaints it the moment
+                  // the answer lands.
+                  onPressed: (req == null || !has)
+                      ? null
+                      : () => openLyrics(context, req),
+                );
+              }),
               IconButton(
                 iconSize: 20,
                 icon: const Icon(Icons.skip_previous),
