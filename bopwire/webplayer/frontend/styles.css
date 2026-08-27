@@ -167,11 +167,8 @@ body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card .c-plays { color: var(--text-dim); font-size: 11px; margin-top: 4px; display: flex; align-items: center; gap: 5px; }
 .card .c-plays .rising-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
-.card.off { opacity: .45; }
-.card.off .cov-play { display: none; }
-.card .off-chip { position: absolute; top: 16px; left: 16px; font-size: 10px; font-weight: 700;
-  color: var(--text); background: rgba(12,13,16,.75); border: 1px solid var(--line);
-  border-radius: 999px; padding: 2px 8px; }
+/* Offline songs are hidden outright rather than dimmed, so the .off /
+   .off-chip treatments no longer have anything to style. */
 .card.playing { border-color: var(--accent); }
 
 .verify-line { color: var(--text-dim); font-size: 11px; text-align: center; padding: 8px 0 2px; opacity: .8; }
@@ -262,7 +259,6 @@ body {
 .track .t-dur { color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .track .t-play { opacity: 0; color: var(--accent); font-size: 16px; text-align: center; }
 .track:hover .t-play, .track.playing .t-play { opacity: 1; }
-.track.off { opacity: .45; }
 
 .empty { color: var(--text-dim); padding: 24px 8px; text-align: center; }
 .empty.big { padding: 60px 8px; font-size: 15px; }

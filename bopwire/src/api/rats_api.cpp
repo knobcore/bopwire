@@ -1930,6 +1930,104 @@ void RatsApi::handle_request(const std::string& peer_id,
                 }
             }
         }
+        else if (type == "presence.bye") {
+            // Explicit, SIGNED withdrawal: "this wallet is going offline now."
+            //
+            // Why this exists: liveness is last_verified_ms within
+            // kPresenceTtlMs (3 min), which is deliberately generous so a
+            // download saturating the relay cannot make a live player flap
+            // offline. That is right for a CRASH, but wrong for an intentional
+            // exit — a user who deletes their library or goes offline waited up
+            // to three minutes before the website stopped listing their songs.
+            // TTL now covers the unclean case; this covers the clean one, which
+            // is the common one.
+            //
+            // Security: a forgeable bye would let anyone knock any wallet
+            // offline, so it carries the same proof as a hello — wallet-derived
+            // pubkey, ECDSA signature, bounded clock skew, and per-wallet ts
+            // monotonicity. The domain tag differs ("mcbye1" vs "mcprs1") so a
+            // captured hello can never be replayed as a bye, or the reverse.
+            const std::string peer_id_decl = in.value("peer_id", std::string());
+            const std::string w_in         = in.value("wallet",  std::string());
+            const std::string pk_in        = in.value("pubkey",  std::string());
+            const std::string sg_in        = in.value("sig",     std::string());
+            const uint64_t    ts           = in.value("ts", static_cast<uint64_t>(0));
+
+            Address  wallet{};
+            PubKey33 pubkey{};
+            Sig64    sig{};
+            if (!crypto::parse_address_checksummed(w_in, wallet) ||
+                !from_hex_fixed(pk_in, pubkey.data(), pubkey.size()) ||
+                !from_hex_fixed(sg_in, sig.data(), sig.size())) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error",  "bad wallet / pubkey / signature"}};
+            } else if (crypto::address_from_pubkey(pubkey) != wallet) {
+                reply = {{"req_id", req_id}, {"status", "rejected"},
+                         {"error",  "pubkey does not derive to wallet"}};
+            } else {
+                std::vector<uint8_t> b;
+                static const char bye_tag[6] = {'m', 'c', 'b', 'y', 'e', '1'};
+                b.insert(b.end(), bye_tag, bye_tag + 6);
+                b.insert(b.end(), wallet.begin(), wallet.end());
+                put_le(b, ts, 8);
+                b.insert(b.end(), peer_id_decl.begin(), peer_id_decl.end());
+                const Hash256 digest = crypto::sha256(b.data(), b.size());
+                if (!crypto::verify_ecdsa(digest, sig, pubkey)) {
+                    reply = {{"req_id", req_id}, {"status", "rejected"},
+                             {"error",  "signature did not verify"}};
+                } else {
+                    const uint64_t now  = presence_now_ms();
+                    const uint64_t skew = now >= ts ? now - ts : ts - now;
+                    if (skew > kPresenceHelloSkewMs) {
+                        reply = {{"req_id", req_id}, {"status", "rejected"},
+                                 {"error",  "stale timestamp"}};
+                    } else {
+                        bool withdrew = false, replay = false;
+                        {
+                            std::lock_guard<std::mutex> lk(wallet_presence_mu_);
+                            const std::string wh =
+                                crypto::to_hex(wallet.data(), wallet.size());
+                            auto ex = wallet_to_peer_.find(wh);
+                            if (ex == wallet_to_peer_.end()) {
+                                // Nothing bound: already offline. Not an error —
+                                // a client retrying its goodbye should not see a
+                                // failure for reaching the desired state.
+                                withdrew = true;
+                            } else if (ts <= ex->second.last_ts) {
+                                replay = true;
+                            } else {
+                                // Zero last_verified_ms so the wallet is
+                                // instantly outside the TTL and drops out of
+                                // discovery on the very next query. The entry
+                                // itself is KEPT, carrying the accepted ts, so
+                                // per-wallet monotonicity still blocks a
+                                // replayed hello from resurrecting the binding.
+                                peer_to_wallet_player_.erase(ex->second.peer_id);
+                                ex->second.last_verified_ms = 0;
+                                ex->second.last_ts          = ts;
+                                withdrew = true;
+                            }
+                        }
+                        if (replay) {
+                            reply = {{"req_id", req_id}, {"status", "rejected"},
+                                     {"error",  "out-of-order timestamp"}};
+                        } else {
+                            // Discovery reads a cached summary; without this the
+                            // withdrawal would not show until it next rebuilt,
+                            // which is exactly the delay this endpoint removes.
+                            mark_db2_summary_dirty_();
+                            reply = {{"req_id", req_id}, {"status", "ok"},
+                                     {"body", {{"withdrawn", withdrew}}}};
+                            if (debug_log_.load()) {
+                                std::cout << "[rats-api] presence.bye: wallet "
+                                          << w_in.substr(0, 10)
+                                          << "… withdrawn\n";
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // NOTE: there is deliberately NO lightweight presence.ping keepalive.
         // A signature-less refresh is forgeable for a relayed player — the
         // {wallet, peer_id} tuple is public (peer_id is returned in stream.open

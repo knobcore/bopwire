@@ -57,7 +57,16 @@
     if (n < 1e6)    return `${(n / 1e3).toFixed(1).replace(/\.0$/, '')}K`;
     return `${(n / 1e6).toFixed(1).replace(/\.0$/, '')}M`;
   };
-  const avail = (s) => s.available !== false && (s.swarmSize || 0) >= 0; // membership is deterministic; only an explicit false dims
+  const avail = (s) => s.available !== false && (s.swarmSize || 0) >= 0;
+
+  // Offline songs are HIDDEN, not dimmed. A listener cannot play a track with
+  // no seeder online, so showing it is an invitation to click something that
+  // will only ever fail. Filtering happens once here, at the data boundary,
+  // rather than in each render site — that way a new surface cannot forget to
+  // apply it, and a collection whose songs are all offline becomes empty and
+  // is dropped by the existing non-empty check instead of rendering a row of
+  // dead tiles.
+  const onlyOnline = (arr) => (arr || []).filter(avail);
 
   let toastTimer = null;
   function toast(msg) {
@@ -202,7 +211,7 @@
   async function fetchSongs(params) {
     const qs = new URLSearchParams(params).toString();
     const r  = await apiGet('/api/songs?' + qs);
-    return Array.isArray(r) ? r : (r.songs || []);
+    return onlyOnline(Array.isArray(r) ? r : (r.songs || []));
   }
 
   // ── Transport icons ────────────────────────────────────────────────────
@@ -332,22 +341,21 @@
   }
 
   function cardEl(s, ri, i) {
-    const off     = !avail(s);
     const playing = state.playing === s.contentHash;
     const rising  = (s.playCount || 0) > 0 && (s.playCount || 0) < 10000;
-    return `<div class="card${off ? ' off' : ''}${playing ? ' playing' : ''}" data-ri="${ri}" data-i="${i}">
+    return `<div class="card${playing ? ' playing' : ''}" data-ri="${ri}" data-i="${i}">
       <div class="cover">${songArt(s)}
         <div class="cov-play">${playing ? '♫' : '▶'}</div>
       </div>
-      ${off ? '<div class="off-chip">offline</div>' : ''}
       <div class="c-title">${esc(s.title) || '(untitled)'}</div>
       <div class="c-sub">${esc(s.artist)}</div>
       <div class="c-plays">${rising ? '<span class="rising-dot"></span>' : ''}${fmtPlays(s.playCount)} plays</div>
     </div>`;
   }
 
-  // Play from a collection: the queue is the collection's ordered songs,
-  // minus the ones with no seeders (kept visible, dimmed, but unplayable).
+  // Play from a collection. Offline songs are already filtered out upstream;
+  // the avail() guard here is belt-and-braces for a row built before a
+  // refresh took a seeder away mid-session.
   function playCollection(c, idx) {
     const playable = (c.songs || []).filter((s) => avail(s));
     if (!playable.length) { toast('Nothing in this row is streamable right now.'); return; }
@@ -568,10 +576,9 @@
   function renderTrackList(list, tracks, numbered, withArt) {
     const playable = tracks.filter((s) => avail(s));
     list.innerHTML = tracks.map((s, i) => {
-      const off = !avail(s);
       const playing = state.playing === s.contentHash ? ' playing' : '';
       const num = numbered ? (s.trackNumber || i + 1) : i + 1;
-      return `<div class="track${playing}${off ? ' off' : ''}" data-i="${i}">
+      return `<div class="track${playing}" data-i="${i}">
         <div class="t-num">${num}</div>
         <div class="t-art">${withArt ? songArt(s) : ''}</div>
         <div class="t-main">
@@ -581,7 +588,7 @@
         <div class="t-plays">${fmtPlays(s.playCount)} plays</div>
         <button class="t-lyr" data-lyr="${i}" title="Lyrics">Lyrics</button>
         <div class="t-dur">${fmtDur(s.durationMs)}</div>
-        <div class="t-play">${off ? '' : ICON.play}</div>
+        <div class="t-play">${ICON.play}</div>
       </div>`;
     }).join('');
     list.querySelectorAll('.track').forEach((el) => {
@@ -912,7 +919,15 @@
 
   async function refreshCollections() {
     try {
-      state.collections = await apiGet('/api/collections');
+      const cs = await apiGet('/api/collections');
+      // Same rule for curated rows: drop offline songs, and a collection left
+      // with none is then filtered out by renderHome's non-empty check.
+      if (cs && Array.isArray(cs.collections)) {
+        cs.collections = cs.collections
+          .map((c) => ({ ...c, songs: onlyOnline(c.songs) }))
+          .filter((c) => c.songs.length > 0);
+      }
+      state.collections = cs;
       if (state.view === 'home') renderHome();
     } catch (e) {
       if (!state.collections && state.view === 'home') {
