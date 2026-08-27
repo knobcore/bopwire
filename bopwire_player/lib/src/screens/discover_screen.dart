@@ -29,6 +29,7 @@ import '../services/node_client.dart';
 import '../services/node_service.dart';
 import '../widgets/album_art.dart';
 import '../widgets/cover_art.dart';
+import '../widgets/lyrics_panel.dart';
 import '../services/networks/external_network.dart';
 import '../services/networks/network_registry.dart';
 import '../widgets/external_result_filters.dart';
@@ -847,7 +848,12 @@ class CollectionScreen extends StatelessWidget {
     final shown = live ?? s;
     final isPlaying = playing == s.contentHash;
 
+    // Stable key: rows shift as the live catalog / results change, and
+    // without a key Flutter re-associates elements by position, which can
+    // drop an in-flight tap on the row's buttons (see the external-result
+    // rows for the long version of this story).
     return Opacity(
+      key: ValueKey('row:${s.contentHash}'),
       opacity: off ? .45 : 1,
       child: ListTile(
         dense: true,
@@ -890,6 +896,19 @@ class CollectionScreen extends StatelessWidget {
             Text('${shown.playCount} plays', style: theme.textTheme.labelSmall),
             const SizedBox(width: 10),
             Text(shown.durationFormatted, style: theme.textTheme.labelSmall),
+            const SizedBox(width: 4),
+            IconButton(
+              tooltip: 'Lyrics',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+              icon: Icon(Icons.lyrics_outlined,
+                  size: 18,
+                  color: theme.colorScheme.onSurface.withOpacity(.7)),
+              // Works for offline rows too — reading lyrics doesn't need
+              // a seeder, only the row's tap-to-play does.
+              onPressed: () =>
+                  openLyrics(context, LyricsRequest.fromSong(s)),
+            ),
             const SizedBox(width: 4),
             Icon(
               off
@@ -1239,7 +1258,12 @@ class _SearchResultsViewState extends State<_SearchResultsView> {
     final shown = live ?? s;
     final isPlaying = playing == s.contentHash;
 
+    // Stable key: rows shift as the live catalog / results change, and
+    // without a key Flutter re-associates elements by position, which can
+    // drop an in-flight tap on the row's buttons (see the external-result
+    // rows for the long version of this story).
     return Opacity(
+      key: ValueKey('row:${s.contentHash}'),
       opacity: off ? .45 : 1,
       child: ListTile(
         dense: true,
@@ -1283,6 +1307,19 @@ class _SearchResultsViewState extends State<_SearchResultsView> {
             Text('${shown.playCount} plays', style: theme.textTheme.labelSmall),
             const SizedBox(width: 10),
             Text(shown.durationFormatted, style: theme.textTheme.labelSmall),
+            const SizedBox(width: 4),
+            IconButton(
+              tooltip: 'Lyrics',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+              icon: Icon(Icons.lyrics_outlined,
+                  size: 18,
+                  color: theme.colorScheme.onSurface.withOpacity(.7)),
+              // Works for offline rows too — reading lyrics doesn't need
+              // a seeder, only the row's tap-to-play does.
+              onPressed: () =>
+                  openLyrics(context, LyricsRequest.fromSong(s)),
+            ),
             const SizedBox(width: 4),
             Icon(
               off

@@ -9,6 +9,7 @@ import '../services/librats_discovery.dart';
 import '../services/rats_client.dart';
 import '../widgets/album_art.dart';
 import '../widgets/cover_art.dart';
+import '../widgets/lyrics_panel.dart';
 import 'discover_screen.dart';
 import 'local_library_screen.dart';
 import 'chat_screen.dart';
@@ -39,8 +40,35 @@ class _HomeScreenState extends State<HomeScreen> {
       body: Column(
         children: [
           const _ConnectionBanner(),
+          // The "top window": the tab stack, with the lyrics panel laid
+          // over it when a row's Lyrics button is tapped. A Stack (not a
+          // swap) so every tab keeps its state, and the banners + mini
+          // player below keep running — the same shape as the website,
+          // where the lyrics view replaces the main area while the
+          // now-playing bar stays live.
           Expanded(
-            child: IndexedStack(index: _selectedIndex, children: _screens),
+            child: AnimatedBuilder(
+              animation: LyricsController.instance,
+              builder: (context, _) {
+                final req = LyricsController.instance.request;
+                return Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    IndexedStack(index: _selectedIndex, children: _screens),
+                    if (req != null)
+                      LyricsPanel(
+                        // Keyed per song so switching songs rebuilds the
+                        // panel (and its scroll position) from scratch.
+                        key: ValueKey('lyrics:${req.songKey}'),
+                        request: req,
+                        playback: LyricsPlayback.fromProvider(
+                            context.read<PlayerProvider>()),
+                        onClose: LyricsController.instance.close,
+                      ),
+                  ],
+                );
+              },
+            ),
           ),
           // Download banner sits between the body and the mini player so
           // the user can always glance at "what's downloading right now"
@@ -60,6 +88,9 @@ class _HomeScreenState extends State<HomeScreen> {
       bottomNavigationBar: NavigationBar(
         selectedIndex: _selectedIndex,
         onDestinationSelected: (i) {
+          // Picking a tab leaves lyrics mode, same as the website where
+          // any nav click swaps the lyrics view out for the chosen one.
+          LyricsController.instance.close();
           if (i == 0 && _selectedIndex != 0) {
             final lib = context.read<LibraryProvider>();
             lib.refresh();
