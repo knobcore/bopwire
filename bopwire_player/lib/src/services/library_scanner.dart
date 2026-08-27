@@ -30,6 +30,15 @@ import 'rats_client.dart';
 /// (the "All files access" toggle), which has its own settings-page flow.
 /// Exposed via `LibraryScanner.ensureStoragePermissions` so the folder-picker
 /// UI can prompt before the system picker opens.
+/// Stage logging for the download->library->chain path. "It downloaded
+/// but never showed up" has at least four distinct causes (bad
+/// extension, no node, submit rejected, publish failed) and they are
+/// indistinguishable from the UI without this.
+void _ilog(String m) {
+  // ignore: avoid_print
+  print('[import] $m');
+}
+
 Future<void> _ensureStoragePermissions() async {
   if (!Platform.isAndroid) return;
   try {
@@ -284,8 +293,73 @@ class LibraryScanner {
     }
   }
 
+  /// Fingerprint + tag-import a single file that arrived from outside the
+  /// normal folder walk — i.e. something downloaded from Soulseek or
+  /// napstr. Runs the exact same pipeline [scanOnce] uses per file, so an
+  /// imported track is indistinguishable from a locally-scanned one, then
+  /// republishes the library snapshot so the mesh learns we have it.
+  ///
+  /// Returns true when the file was processed and recorded in the local
+  /// library. Returns false (without throwing) only when the file is
+  /// missing or is not an audio container we handle — callers are UI
+  /// paths that should report rather than crash. A missing full node, an
+  /// uninitialized RatsClient, or a failed fingerprint does NOT fail the
+  /// import: the entry is recorded locally and the chain side retries on
+  /// the next scan / publish cycle.
+  Future<bool> importDownloadedFile(String path, {bool force = true}) async {
+    final file = File(path);
+    if (!await file.exists()) {
+      _ilog('SKIP missing file: $path');
+      return false;
+    }
+    final lower = path.toLowerCase();
+    if (!_audioExtensions.any((ext) => lower.endsWith(ext))) {
+      // Silent-failure trap: a download saved without a recognised audio
+      // extension is dropped here and never reaches the library.
+      _ilog('SKIP unsupported extension: $path');
+      return false;
+    }
+    _ilog('importing $path');
+
+    final lib = LibraryService.instance;
+    await lib.ensureLoaded();
+    // A downloaded file belongs in the user's library whether or not a
+    // full node happens to be reachable right now. We still WANT the node
+    // (chain registration, and the album-art scraper only sees songs that
+    // reached the chain), but an empty peer id must not abort the import
+    // — _processFile records the entry locally and a later scan retries
+    // the submit.
+    final homePid =
+        await NodeService.getRatsPeerId(waitFor: const Duration(seconds: 8));
+
+    // RatsClient is normally initialized at app startup, but an import can
+    // race that (or run in a test / degraded session) — and `instance`
+    // THROWS before initialize(). That throw used to escape straight out
+    // of the import and the downloaded file never reached the library.
+    // A missing client is the same situation as "no node reachable":
+    // record locally, let a later scan do the chain work.
+    RatsClient? rats;
+    try {
+      rats = RatsClient.instance;
+    } on StateError {
+      rats = null;
+    }
+
+    _ilog(homePid.isEmpty || rats == null
+        ? 'NO FULL NODE reachable — importing locally, chain registration '
+          'will retry on the next scan'
+        : 'full node = ${homePid.substring(0, 12)}…');
+    await _processFile(file, lib, rats, homePid, force: force);
+    _ilog('library now holds ${lib.entries.length} entries');
+    // Tell the node (and via flood, the mesh) that our holdings changed.
+    // Fire-and-forget: the import itself already succeeded, and a failed
+    // publish is retried by the next scan.
+    unawaited(LibraryPublisher.publishFull());
+    return true;
+  }
+
   Future<void> _processFile(File file, LibraryService lib,
-                            RatsClient rats, String homePid,
+                            RatsClient? rats, String homePid,
                             {bool force = false}) async {
     try {
       // O(1) path lookup. The old loop here was O(N) per file × N files
@@ -302,7 +376,8 @@ class LibraryScanner {
       // full node with the cached fingerprint_hash. If it matches,
       // we're already swarm-joined and done.
       if (force && existingByPath != null
-          && existingByPath.fingerprintHash.isNotEmpty) {
+          && existingByPath.fingerprintHash.isNotEmpty
+          && rats != null && homePid.isNotEmpty) {
         try {
           final reply = await rats.request(homePid, 'fingerprint.submit', {
             'fingerprint_hash': existingByPath.fingerprintHash,
@@ -362,8 +437,23 @@ class LibraryScanner {
         return;
       }
 
-      // Compute the chromaprint fingerprint locally.
-      final fp = await Fingerprinter.ofFile(file.path);
+      // Compute the chromaprint fingerprint locally. A decode/fingerprint
+      // failure must NOT drop the file from the library: the bytes are on
+      // disk and playable, so record the entry below (tag metadata only)
+      // with an empty fingerprintHash — a later force-scan retries the
+      // fingerprint + chain submit (the hash-only probe above requires a
+      // non-empty fingerprintHash, so it can't mask the retry). This is
+      // load-bearing on desktop Linux, where Fingerprinter.ofFile throws
+      // UnsupportedError for EVERY file (no PCM decoder is wired yet) and
+      // used to make every import and scan vanish without a trace.
+      FingerprintResult? fp;
+      try {
+        fp = await Fingerprinter.ofFile(file.path);
+      } catch (e) {
+        _ilog('fingerprint failed for ${file.path}: $e — recording the '
+            'entry locally without chain registration');
+        _errors += 1;
+      }
 
       // Read container tags (ID3 v1/v2, MP4, FLAC, Vorbis comments).
       // Falls back to filename heuristics if the container has nothing
@@ -394,9 +484,11 @@ class LibraryScanner {
       // than counting PCM samples, which doubled stereo files because we
       // weren't dividing by channelCount). Fall back to PCM math.
       final tagDurMs = tag?.duration?.inMilliseconds ?? 0;
-      final pcmDurMs = (fp.pcmSamples /
-                       (fp.channelCount > 0 ? fp.channelCount : 1) /
-                       fp.sampleRate * 1000).round();
+      final pcmDurMs = fp == null
+          ? 0
+          : (fp.pcmSamples /
+             (fp.channelCount > 0 ? fp.channelCount : 1) /
+             fp.sampleRate * 1000).round();
       // Sanity-gate the duration. A container/tag can report a wildly wrong
       // value (seen registered on-chain: 662646176 ms = 184 h). Because the
       // play-reward gate requires listening to 50% of the REGISTERED duration,
@@ -412,23 +504,48 @@ class LibraryScanner {
       final fmt = _formatFromPath(file.path);
 
       // Submit to the full node.
-      final reply = await rats.request(homePid, 'fingerprint.submit', {
-        'fingerprint':      fp.compressed,
-        'fingerprint_hash': fp.fingerprintHash,
-        'peer_id':          rats.ownPeerId,
-        'content_hash':     contentHash,
-        'title':            title,
-        'artist':           artist,
-        'genre':            genre,
-        'album':            album,
-        'duration_ms':      durationMs,
-        'year':             year,
-        'track_number':     trackNumber,
-        'bitrate':          bitrate,
-        'audio_format':     fmt,
-        'manifest':         pieceManifest.toJson(),
-        if (_artistAddress.isNotEmpty) 'artist_address': _artistAddress,
-      }, timeout: const Duration(seconds: 20));
+      //
+      // NB: this is wrapped so a submit failure cannot skip lib.upsert()
+      // below. It used to be a bare await inside the outer try, which
+      // meant an unreachable node / RPC timeout threw straight past the
+      // upsert into `catch { _errors++ }` — the file was fingerprinted,
+      // the bytes were on disk, and yet the track never appeared in the
+      // user's library at all. The local library is LOCAL state; chain
+      // registration is a separate concern that retries on the next scan
+      // (see resubmitUnknown / publishFull).
+      Object? reply;
+      if (fp == null || rats == null || homePid.isEmpty) {
+        // Nothing to submit with (no fingerprint) or nobody to submit to
+        // (no node / no rats client). Skip the RPC — it could only burn
+        // its 20 s timeout and fail — and record the entry locally below.
+        // publishFull / the next scan retries the chain side.
+        reply = null;
+      } else {
+      try {
+        reply = await rats.request(homePid, 'fingerprint.submit', {
+          'fingerprint':      fp.compressed,
+          'fingerprint_hash': fp.fingerprintHash,
+          'peer_id':          rats.ownPeerId,
+          'content_hash':     contentHash,
+          'title':            title,
+          'artist':           artist,
+          'genre':            genre,
+          'album':            album,
+          'duration_ms':      durationMs,
+          'year':             year,
+          'track_number':     trackNumber,
+          'bitrate':          bitrate,
+          'audio_format':     fmt,
+          'manifest':         pieceManifest.toJson(),
+          if (_artistAddress.isNotEmpty) 'artist_address': _artistAddress,
+        }, timeout: const Duration(seconds: 20));
+      } catch (e) {
+        // Chain registration failed; the entry is still recorded locally
+        // below and will be resubmitted by a later scan.
+        reply = null;
+        _errors += 1;
+      }
+      }
 
       // Safe narrowing: `as Map<String, dynamic>?` throws TypeError if
       // the RPC came back as Map<dynamic, dynamic> (the common shape
@@ -445,6 +562,8 @@ class LibraryScanner {
       final m = (reply is Map) ? reply : const {};
       final matched    = m['matched']    == true;
       final registered = m['registered'] == true;
+      _ilog('fingerprint.submit -> matched=$matched registered=$registered '
+          'reply=${reply == null ? 'NONE (submit skipped or failed)' : 'ok'}');
       // Don't trust a bare matched/registered flag for the displayed tally.
       // The node returns content_hash + swarm_size on a real match; only count
       // a match when it names a chain song that actually has a swarm. This
@@ -466,7 +585,7 @@ class LibraryScanner {
         // stay LOCAL — we never adopt chain metadata.
         canonicalHash:   (chainHash.isNotEmpty && chainHash != contentHash)
                              ? chainHash : '',
-        fingerprintHash: fp.fingerprintHash,
+        fingerprintHash: fp?.fingerprintHash ?? '',
         title:           title,
         artist:          artist,
         album:           album,
@@ -479,8 +598,16 @@ class LibraryScanner {
         filePath:        file.path,
         addedAtMs:       DateTime.now().millisecondsSinceEpoch,
       ));
-    } catch (_) {
+      _ilog('ADDED "$title" by "$artist" (${file.path})');
+    } catch (e, st) {
+      // This used to be `catch (_) { _errors += 1; }` — a completely
+      // silent swallow. A file that failed to fingerprint, or hit any
+      // other error, vanished with no record anywhere, which is exactly
+      // how a downloaded track could be "imported" and then simply not
+      // exist in the library. Never swallow this again.
       _errors += 1;
+      _ilog('FAILED ${file.path}: $e');
+      _ilog('  at ${st.toString().split('\n').take(3).join(' | ')}');
     }
   }
 

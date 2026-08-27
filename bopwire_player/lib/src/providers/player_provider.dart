@@ -24,7 +24,22 @@ class PlayerProvider extends ChangeNotifier {
   String _seederAddr = '';
   String _relayAddr  = '';
 
+  /// The live instance, for the handful of non-widget callers that must
+  /// reach the ONE player without a BuildContext — currently the
+  /// pre-download cache's preview hook, installed in main.dart. The app
+  /// constructs exactly one PlayerProvider (see the provider tree), so
+  /// this is a handle to that one, not a second player.
+  static PlayerProvider? _current;
+  static PlayerProvider get instance {
+    final p = _current;
+    if (p == null) {
+      throw StateError('PlayerProvider has not been constructed yet');
+    }
+    return p;
+  }
+
   PlayerProvider() {
+    _current = this;
     // Share the same NodeClient so heartbeats use the same resolved URL
     _heartbeat = HeartbeatService(_client);
     _player.stream.playing.listen((playing) {
@@ -41,6 +56,17 @@ class PlayerProvider extends ChangeNotifier {
       state = playing ? PlayerState.playing : PlayerState.paused;
       notifyListeners();
     });
+    // The player's OWN duration. Chain tracks carry a duration from their
+    // metadata, but a foreign-network preview has none — and without this
+    // the transport bar had no scale, so the handle drifted to the end and
+    // seek() clamped every request to 0.
+    _player.stream.duration.listen((d) {
+      final ms = d.inMilliseconds;
+      if (ms > 0 && ms != playerDurationMs) {
+        playerDurationMs = ms;
+        notifyListeners();
+      }
+    });
     _player.stream.position.listen((pos) {
       positionMs = pos.inMilliseconds;
       notifyListeners();
@@ -54,6 +80,38 @@ class PlayerProvider extends ChangeNotifier {
   PlaySession?  currentSession;
   PlayerState   state        = PlayerState.idle;
   int           positionMs   = 0;
+
+  /// Duration reported by the decoder for whatever is loaded, 0 until it
+  /// arrives. Prefer [durationMs], which falls back to chain metadata.
+  int           playerDurationMs = 0;
+
+  /// Duration the UI should scale the seek bar to. The decoder's value
+  /// wins when it has one: it is authoritative for previews (no chain
+  /// metadata) and for files whose tags lie about length.
+  int get durationMs =>
+      playerDurationMs > 0 ? playerDurationMs : (currentSong?.durationMs ?? 0);
+
+  /// True once we know how long the current item is. The bar should render
+  /// indeterminate until then rather than pretending to be seekable.
+  bool get hasDuration => durationMs > 0;
+
+  /// 0..1 of the current item that has been downloaded, or null when the
+  /// concept doesn't apply (chain streaming, local file). Set by whoever
+  /// is feeding a progressive source — see main.dart's preview hook.
+  double? bufferedFraction;
+  void setBufferedFraction(double? f) {
+    final prev = bufferedFraction;
+    if (f == prev) return;
+    // Only rebuild on a change the eye can see. This is fed per download
+    // chunk; notifying on every one rebuilt the whole transport bar
+    // hundreds of times a second and made the UI feel frozen.
+    if (f != null && prev != null && (f - prev).abs() < 0.005) {
+      bufferedFraction = f;   // keep the value current, skip the rebuild
+      return;
+    }
+    bufferedFraction = f;
+    notifyListeners();
+  }
   String?       errorMessage;
 
   // Playlist / queue
@@ -78,6 +136,80 @@ class PlayerProvider extends ChangeNotifier {
     _playerAddr  = playerAddress;
     await _playSong(song, playerAddress);
   }
+
+  /// Play a foreign-network preview (Soulseek / napstr) through the SAME
+  /// player the library uses, so the transport bar drives it — seek,
+  /// pause, stop and the position readout all work.
+  ///
+  /// This deliberately bypasses [_playSong]: that path opens a chain play
+  /// SESSION (startSession + heartbeat + token spend), and a track being
+  /// previewed off another network has no chain song to bind to and must
+  /// not mint or spend anything. So: no session, no heartbeat, no
+  /// contentHash — just audio.
+  ///
+  /// [url] is normally the pre-download cache's loopback URL, which keeps
+  /// serving while the file is still arriving.
+  Future<void> playPreview({
+    required String url,
+    required String title,
+    String artist = '',
+    String album  = '',
+    int durationMs = 0,
+  }) async {
+    // Close any real session first, or the node keeps an orphaned one
+    // open for a song we are no longer playing.
+    final priorId = currentSession?.sessionId;
+    if (priorId != null) {
+      unawaited(_completeSessionSilently(priorId));
+      currentSession = null;
+    }
+    _heartbeat.stop();
+    await _player.stop();
+
+    state        = PlayerState.loading;
+    errorMessage = null;
+    notifyListeners();
+
+    // A synthetic Song purely so the transport bar has something to
+    // render. The empty contentHash is the marker that this is not a
+    // chain track — see [isPreview].
+    final preview = Song(
+      contentHash:     '',
+      fingerprintHash: '',
+      title:           title,
+      artist:          artist,
+      genre:           '',
+      album:           album,
+      year:            0,
+      trackNumber:     0,
+      durationMs:      durationMs,
+      playCount:       0,
+      swarmSize:       0,
+    );
+
+    playlist         = [preview];
+    _playlistIdx     = 0;
+    currentSong      = preview;
+    playerDurationMs = 0;   // repopulated by the duration stream
+    positionMs       = 0;
+    bufferedFraction = 0;   // progressive source: the bar shows fill
+
+    try {
+      await _player.open(Media(url), play: true);
+      state = PlayerState.playing;
+    } catch (e) {
+      errorMessage = 'Preview failed: $e';
+      state = PlayerState.stopped;
+      currentSong = null;
+    }
+    notifyListeners();
+  }
+
+  /// True while the transport is driving a foreign-network preview rather
+  /// than a chain track. Callers should not offer session-only actions
+  /// (rate, tip, add-to-playlist) for these.
+  bool get isPreview =>
+      currentSong != null && currentSong!.contentHash.isEmpty;
 
   Future<void> playPlaylist(List<Song> songs, int startIndex, String playerAddress) async {
     playlist     = List.of(songs);
@@ -120,6 +252,7 @@ class PlayerProvider extends ChangeNotifier {
     }
     _player.stop();
     _heartbeat.stop();
+    bufferedFraction = null;
     state          = PlayerState.stopped;
     currentSong    = null;
     currentSession = null;
@@ -145,8 +278,37 @@ class PlayerProvider extends ChangeNotifier {
   /// uses that delta vs the wall-clock delta to decide whether to count
   /// the post-seek interval toward the session's effective listen time.
   Future<void> seek(int ms) async {
-    final clamped = ms.clamp(0, currentSong?.durationMs ?? ms);
+    // Clamp against the EFFECTIVE duration. Using currentSong.durationMs
+    // meant a preview (duration 0) clamped every seek to 0, so the bar
+    // appeared frozen while audio kept playing.
+    final max = durationMs;
+    var clamped = max > 0 ? ms.clamp(0, max) : (ms < 0 ? 0 : ms);
+
+    // Progressive source (Soulseek / napstr preview): those protocols
+    // have no resume-from-offset, so only the bytes already on disk can
+    // be played. Seeking past the downloaded edge would stall on data
+    // that will never arrive at that position, so land on the edge
+    // instead. bopwire's own swarm DOES support offset resume and is not
+    // a progressive source here, so it keeps full-range seeking.
+    final buf = bufferedFraction;
+    if (buf != null && max > 0) {
+      final edge = (max * buf).floor();
+      // A small margin back from the edge: the very last bytes are
+      // usually a partial frame the decoder cannot start on.
+      final safe = (edge - 750).clamp(0, max);
+      if (clamped > safe) clamped = safe;
+    }
+
     await _player.seek(Duration(milliseconds: clamped));
+
+    // Resume if we were playing. After running to the end of the
+    // then-available bytes mpv sits at EOF, and a bare seek() leaves it
+    // parked there — the bar moves and no audio comes out, which is the
+    // "silent from that downloaded piece" case.
+    if (state == PlayerState.playing) {
+      await _player.play();
+    }
+
     positionMs = clamped;
     notifyListeners();
   }
@@ -202,8 +364,10 @@ class PlayerProvider extends ChangeNotifier {
       currentSession = null;
     }
     await _player.stop();
-    state        = PlayerState.loading;
-    errorMessage = null;
+    state            = PlayerState.loading;
+    errorMessage     = null;
+    playerDurationMs = 0;
+    bufferedFraction = null;   // chain stream: not a progressive download
     notifyListeners();
 
     try {

@@ -17,6 +17,7 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:ffi/ffi.dart';
+import '../ffi/native_decoder.dart';
 import 'package:flutter/services.dart';
 
 import '../ffi/chromaprint_bindings.dart';
@@ -121,9 +122,19 @@ class Fingerprinter {
       pcm          = d.pcm;
       sampleRate   = d.sampleRate;
       channelCount = d.channelCount;
+    } else if (NativeDecoder.supported) {
+      // Linux / macOS: decode with the FFmpeg-backed decoder already
+      // compiled into libbopwire.so (bopwire.h mc_decoder_*). This branch
+      // used to be a hard `throw UnsupportedError`, which meant NOTHING on
+      // Linux could be fingerprinted — every scan and every download
+      // import failed, silently, because the caller swallowed it.
+      final d = NativeDecoder.instance.decodeFile(path);
+      pcm          = d.pcm;
+      sampleRate   = d.sampleRate;
+      channelCount = d.channelCount;
     } else {
       throw UnsupportedError(
-          'Audio decode not yet wired for ${Platform.operatingSystem}; '
+          'Audio decode not wired for ${Platform.operatingSystem}; '
           'add a native decoder path before fingerprinting.');
     }
 

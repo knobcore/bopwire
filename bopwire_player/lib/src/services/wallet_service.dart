@@ -1,4 +1,5 @@
 import 'dart:ffi';
+import 'networks/network_registry.dart';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
@@ -48,7 +49,27 @@ class WalletService {
   bool get isUnlocked => _secureStorage.isUnlocked;
 
   /// Decrypt the vault with [password]. Returns false on wrong password.
-  Future<bool> unlock(String password) => _secureStorage.unlock(password);
+  /// Unlock the vault, then re-read any credentials that live inside it.
+  ///
+  /// Foreign-network secrets (the Soulseek password, a napstr nsec) are
+  /// stored in this same vault, but NetworkRegistry.bootstrap() runs at
+  /// startup — BEFORE the user has unlocked. Without this reload those
+  /// reads come back empty, isConfigured stays false, and the network is
+  /// silently dropped from every search for the rest of the session with
+  /// no visible reason.
+  Future<bool> unlock(String password) async {
+    final ok = await _secureStorage.unlock(password);
+    if (ok) {
+      for (final net in NetworkRegistry.instance.networks) {
+        // Best-effort: a network that fails to reload must not block the
+        // unlock the user actually asked for.
+        try {
+          await NetworkRegistry.instance.credentialsChanged(net.id);
+        } catch (_) {}
+      }
+    }
+    return ok;
+  }
 
   /// Start a fresh vault under [password] (call before createWalletFromMnemonic
   /// on first launch / import).

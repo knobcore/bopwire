@@ -391,7 +391,26 @@ class _LibraryScreenState extends State<LibraryScreen> {
   /// Playlists facet: gradient cards (tap opens; long-press / right-click
   /// for add/rename/delete) plus a "New playlist" card.
   Widget _playlistPane() {
-    final pls = PlaylistService.instance.playlists;
+    // Playlist tracks already resolve against filteredSongs (swarmSize > 0),
+    // so an offline song simply doesn't appear inside a playlist. What was
+    // still showing is the CARD for a playlist whose every song is offline
+    // — it opened to an empty pane, which reads as a bug. Hide those, and
+    // show the playable count rather than the stored count so the number
+    // on the card matches what opening it will give you.
+    final online = <String>{
+      for (final s in context.read<LibraryProvider>().filteredSongs)
+        s.contentHash,
+    };
+    int playable(Playlist p) =>
+        p.songs.where(online.contains).length;
+
+    final pls = [
+      for (final p in PlaylistService.instance.playlists)
+        // An empty playlist the user just made is kept — it isn't
+        // "offline", it just has nothing in it yet, and hiding it would
+        // make creation look broken.
+        if (p.songs.isEmpty || playable(p) > 0) p,
+    ];
     return GridView.builder(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
       gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
@@ -408,7 +427,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final pl = pls[i];
         return _PlaylistCard(
           name:     pl.name,
-          count:    pl.songs.length,
+          count:    playable(pl),
           selected: _selectedPlaylistId == pl.id,
           onTap: () => setState(() {
             _selectedPlaylistId =

@@ -6,16 +6,15 @@
 // screen, which already exposes the artist's escrow balance via the
 // full node's wallet.escrow_balance RPC.
 
-import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../providers/wallet_provider.dart';
 import '../services/node_client.dart';
 import '../services/node_service.dart';
+import '../util/file_dialogs.dart';
 import 'escrow_claim_screen.dart';
 
 class DmcaScreen extends StatelessWidget {
@@ -115,20 +114,21 @@ class _ContactCardState extends State<_ContactCard> {
   String _status    = '';
 
   Future<void> _pickAndSubmit() async {
-    final result = await FilePicker.platform.pickFiles(
-      type:              FileType.custom,
-      allowedExtensions: const ['pdf'],
-      withData:          true,
+    // pickFile() drives the chooser directly on Linux — see
+    // util/file_dialogs.dart. It reads the bytes for us on every
+    // platform, and reports why nothing was picked so a missing or
+    // crashed dialog surfaces instead of looking like a dead button.
+    final result = await pickFile(
+      title:       'Choose a takedown PDF',
+      extensions:  const ['pdf'],
+      filterLabel: 'PDF documents',
     );
-    if (result == null || result.files.isEmpty) return;
-    final picked = result.files.single;
-
-    // Mobile picks return `bytes` directly; desktop pickers may only set
-    // `path`. Handle both so the same button works on Android + Windows.
-    Uint8List? bytes = picked.bytes;
-    if (bytes == null && picked.path != null) {
-      bytes = await File(picked.path!).readAsBytes();
+    if (result.isError) {
+      setState(() => _status = result.message ?? 'Could not open the file picker.');
+      return;
     }
+    if (!result.ok) return; // cancelled
+    final Uint8List? bytes = result.bytes;
     if (bytes == null) {
       _flash('Could not read the picked file.');
       return;
@@ -149,7 +149,7 @@ class _ContactCardState extends State<_ContactCard> {
                          'Refresh nodes and try again.');
       }
       final client   = NodeClient(ratsPeerId: pid);
-      final storedAs = await client.submitDmcaPdf(picked.name, bytes);
+      final storedAs = await client.submitDmcaPdf(result.name, bytes);
       if (!mounted) return;
       setState(() => _status = 'Delivered as $storedAs');
       _flash('Takedown PDF delivered. The node moderator will review it.');

@@ -1,0 +1,51 @@
+[package]
+name = "tor-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C-ABI static library embedding Arti (Tor) as an in-process SOCKS5 proxy"
+
+# Static library linked into libbopwire.so, so Tor ships on EVERY platform
+# the player builds for — including Android, where spawning a `tor` binary
+# is not an option. Bundles Arti + its Rust dep tree + std into a single
+# archive; the C/Dart side only sees tor_ffi_start / tor_ffi_stop.
+[lib]
+name = "tor_ffi"
+crate-type = ["staticlib"]
+
+[dependencies]
+# Arti is the Rust Tor implementation, built to be embedded. C-tor can be
+# forced into a static lib too, but it wants to own the process and its
+# per-ABI build fights with OpenSSL/libevent; Arti cross-compiles to
+# aarch64/armv7 Android cleanly and is pure Rust + rustls.
+#
+# NB: we depend on arti-CLIENT (the library), not the `arti` binary crate.
+# The SOCKS5 front end below is ~150 lines and is all napstr needs
+# (CONNECT to an onion host), so there is no reason to pull in an
+# application crate and its CLI/config surface.
+arti-client = { version = "0.45", default-features = false, features = ["tokio", "rustls", "onion-service-client"] }
+# PreferredRuntime appears in the public TorClient type signature.
+# Arti's directory cache is SQLite-backed. Without this the archive
+# references sqlite3_* symbols that nothing provides, and libbopwire.so
+# fails to load with "undefined symbol: sqlite3_column_double". The
+# "bundled" feature compiles SQLite INTO the archive, which is what we
+# want: a self-contained static lib that needs no system sqlite on any
+# platform — Android included, where there is no guarantee of one.
+# Declared here purely so cargo's feature unification turns it on for
+# arti's own (transitive) rusqlite dependency.
+# rustls 0.23 refuses to pick a crypto backend implicitly when more than
+# one could apply; without an explicit provider it panics on first use
+# with "Could not automatically determine the process-level
+# CryptoProvider". We select ring and install it in tor_ffi_start.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+tor-rtcompat = { version = "0.45", default-features = false, features = ["tokio", "rustls"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+
+[profile.release]
+# Arti's dep tree is large; this keeps the archive down for mobile.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

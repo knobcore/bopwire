@@ -2,12 +2,12 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../ffi/keystore_bindings.dart';
 import '../models/wallet.dart';
 import '../services/wallet_service.dart';
+import '../util/file_dialogs.dart';
 import 'password_dialogs.dart';
 
 void _snack(BuildContext c, String m, {bool err = false}) {
@@ -44,12 +44,21 @@ Future<void> exportWalletToFile(BuildContext context, WalletService ws) async {
   final addr = ws.info?.address ?? '';
   final short = addr.length >= 10 ? addr.substring(2, 10) : 'wallet';
   final bytes = Uint8List.fromList(utf8.encode(ks));
-  final path = await FilePicker.platform.saveFile(
-    dialogTitle: 'Save wallet export',
+  // See util/file_dialogs.dart — file_picker's Linux shell-out dies
+  // inside the AppImage, so saveFile() drives the dialog itself there.
+  final res = await saveFile(
+    title: 'Save wallet export',
     fileName: 'bopwire-wallet-$short.json',
     bytes: bytes,
   );
-  if (path == null) return; // cancelled
+  if (res.isError) {
+    if (context.mounted) {
+      _snack(context, res.message ?? 'Could not open the save dialog.', err: true);
+    }
+    return;
+  }
+  if (!res.ok) return; // cancelled
+  final path = res.path!;
   try {
     await File(path).writeAsString(ks, flush: true);
   } catch (_) {
@@ -65,12 +74,20 @@ Future<void> exportWalletToFile(BuildContext context, WalletService ws) async {
 /// cancel / failure). The caller is responsible for updating WalletProvider +
 /// navigating.
 Future<WalletInfo?> importWalletFromFile(BuildContext context, WalletService ws) async {
-  final picked = await FilePicker.platform.pickFiles(
-    dialogTitle: 'Choose a wallet export file',
-    withData: true,
+  final picked = await pickFile(
+    title: 'Choose a wallet export file',
+    extensions: const ['json'],
+    filterLabel: 'Wallet exports',
   );
-  if (picked == null || picked.files.isEmpty) return null;
-  final f = picked.files.first;
+  if (picked.isError) {
+    if (context.mounted) {
+      _snack(context, picked.message ?? 'Could not open the file picker.',
+             err: true);
+    }
+    return null;
+  }
+  if (!picked.ok) return null; // cancelled
+  final f = picked;
   String contents;
   try {
     if (f.bytes != null) {

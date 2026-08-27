@@ -14,6 +14,7 @@ import '../providers/download_provider.dart';
 import '../providers/player_provider.dart';
 import '../providers/wallet_provider.dart';
 import '../services/library_scanner.dart';
+import '../widgets/downloads_pane.dart';
 import '../services/library_service.dart';
 import '../services/local_library_actions.dart';
 import '../services/playlist_service.dart';
@@ -22,23 +23,26 @@ import '../widgets/cover_art.dart';
 import 'dmca_screen.dart';
 import 'folders_screen.dart';
 
-enum _FacetMode { artist, genre, playlists }
+enum _FacetMode { artist, genre, playlists, downloads }
 
 extension _FacetModeLabel on _FacetMode {
   String get label => switch (this) {
     _FacetMode.artist    => 'Artist',
     _FacetMode.genre     => 'Genre',
     _FacetMode.playlists => 'Playlists',
+    _FacetMode.downloads => 'Downloads',
   };
   IconData get icon => switch (this) {
     _FacetMode.artist    => Icons.person_outline,
     _FacetMode.genre     => Icons.style_outlined,
     _FacetMode.playlists => Icons.queue_music,
+    _FacetMode.downloads => Icons.download_outlined,
   };
   String get rootLabel => switch (this) {
     _FacetMode.artist    => 'Artists',
     _FacetMode.genre     => 'Genres',
     _FacetMode.playlists => 'Playlists',
+    _FacetMode.downloads => 'Downloads',
   };
 }
 
@@ -312,11 +316,35 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
       body: Consumer<LibraryService>(
         builder: (context, lib, _) {
           final entries = lib.entries;
-          if (entries.isEmpty) {
-            return _EmptyLibrary(
-              onFolders: _openFolders,
-              onScan:    _scanning ? null : _scanNow,
-              scanning:  _scanning,
+          // An empty library used to return the empty-state INSTEAD of the
+          // whole screen, which also swallowed the facet toolbar — so the
+          // Downloads facet was unreachable exactly when you needed it
+          // most: a fresh install with a download in flight and nothing in
+          // the library yet. The empty state now replaces only the browse
+          // body, and the toolbar is always present.
+          final isEmpty = entries.isEmpty;
+          if (isEmpty && _mode != _FacetMode.downloads) {
+            return Column(
+              children: [
+                _ModeToolbar(mode: _mode, onChange: _selectMode),
+                Expanded(
+                  child: _EmptyLibrary(
+                    onFolders: _openFolders,
+                    onScan:    _scanning ? null : _scanNow,
+                    scanning:  _scanning,
+                  ),
+                ),
+              ],
+            );
+          }
+          if (isEmpty) {
+            // Downloads facet with an empty library: no header (it counts
+            // library entries) but the toolbar stays so you can get back.
+            return Column(
+              children: [
+                _ModeToolbar(mode: _mode, onChange: _selectMode),
+                const Expanded(child: DownloadsPane()),
+              ],
             );
           }
           return Column(
@@ -332,10 +360,15 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
                 onScan:     _scanning ? null : _scanNow,
               ),
               _ModeToolbar(mode: _mode, onChange: _selectMode),
-              _Breadcrumb(segments: _breadcrumb()),
+              if (_mode != _FacetMode.downloads)
+                _Breadcrumb(segments: _breadcrumb()),
               if (_scanning)
                 _ScannerProgressBar(scanner: LibraryScanner.instance),
-              Expanded(child: _splitBody(entries)),
+              Expanded(
+                child: _mode == _FacetMode.downloads
+                    ? const DownloadsPane()
+                    : _splitBody(entries),
+              ),
             ],
           );
         },

@@ -163,3 +163,6 @@ bopwire/deps/librats/src/peers*.rats
 /bopwire/tools/admin/
 founder.seed
 moderation.key
+
+# Rust build artifacts for the embedded Tor (Arti) static lib
+bopwire/deps/tor-ffi/target/

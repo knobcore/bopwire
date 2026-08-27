@@ -6,13 +6,13 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 
 import '../services/library_scanner.dart';
 import '../services/library_service.dart';
+import '../util/file_dialogs.dart';
 
 class FoldersScreen extends StatelessWidget {
   const FoldersScreen({super.key});
@@ -42,9 +42,21 @@ class FoldersScreen extends StatelessWidget {
         return;
       }
     }
-    final path = await FilePicker.platform.getDirectoryPath();
-    if (path == null) return;
-    await LibraryService.instance.addFolder(path);
+    // pickDirectory() drives the platform chooser itself on Linux — see
+    // util/file_dialogs.dart for why file_picker cannot be used
+    // there. It reports *why* nothing was picked, so a missing zenity or
+    // a crashed dialog surfaces instead of looking like a dead button.
+    final result = await pickDirectory();
+    if (result.status == PickStatus.picked) {
+      await LibraryService.instance.addFolder(result.path!);
+      return;
+    }
+    if (result.status == PickStatus.cancelled) return;
+    // unavailable / failed: the button would otherwise look dead.
+    messenger?.showSnackBar(SnackBar(
+      content: Text(result.message ?? 'Could not open the folder picker.'),
+      duration: const Duration(seconds: 6),
+    ));
   }
 
   Future<void> _confirmRemove(BuildContext context, String folder) async {

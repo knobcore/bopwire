@@ -6,10 +6,8 @@
 // KYC form (PDF / scan / photo of ID) straight to the full node's KYC
 // inbox, where the moderator reviews it on the TUI before releasing.
 
-import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -17,6 +15,7 @@ import 'package:provider/provider.dart';
 import '../providers/wallet_provider.dart';
 import '../services/node_client.dart';
 import '../services/node_service.dart';
+import '../util/file_dialogs.dart';
 
 class EscrowClaimScreen extends StatelessWidget {
   const EscrowClaimScreen({super.key});
@@ -156,18 +155,19 @@ class _KycUploadCardState extends State<_KycUploadCard> {
       return;
     }
 
-    final result = await FilePicker.platform.pickFiles(
-      type:              FileType.custom,
-      allowedExtensions: const ['pdf', 'jpg', 'jpeg', 'png'],
-      withData:          true,
+    // See util/file_dialogs.dart — file_picker's shell-out is broken
+    // inside the AppImage, so pickFile() runs the dialog itself.
+    final result = await pickFile(
+      title:       'Choose a KYC form or ID scan',
+      extensions:  const ['pdf', 'jpg', 'jpeg', 'png'],
+      filterLabel: 'Documents and images',
     );
-    if (result == null || result.files.isEmpty) return;
-    final picked = result.files.single;
-
-    Uint8List? bytes = picked.bytes;
-    if (bytes == null && picked.path != null) {
-      bytes = await File(picked.path!).readAsBytes();
+    if (result.isError) {
+      _flash(result.message ?? 'Could not open the file picker.');
+      return;
     }
+    if (!result.ok) return; // cancelled
+    final Uint8List? bytes = result.bytes;
     if (bytes == null) {
       _flash('Could not read the picked file.');
       return;
@@ -189,7 +189,7 @@ class _KycUploadCardState extends State<_KycUploadCard> {
       }
       final client   = NodeClient(ratsPeerId: pid);
       final storedAs = await client.submitKycForm(
-        filename:    picked.name,
+        filename:    result.name,
         bytes:       bytes,
         fromAddress: wallet.address,
       );

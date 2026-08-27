@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/librats_discovery.dart';
+import '../widgets/network_settings_section.dart';
 import 'dmca_screen.dart';
 import 'escrow_claim_screen.dart';
 
@@ -152,6 +153,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               );
             }),
+
+          const NetworkSettingsSection(),
 
           const Divider(height: 32),
           const Text('Legal', style: TextStyle(fontWeight: FontWeight.bold)),

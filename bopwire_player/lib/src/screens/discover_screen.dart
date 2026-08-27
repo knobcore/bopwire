@@ -29,6 +29,10 @@ import '../services/node_client.dart';
 import '../services/node_service.dart';
 import '../widgets/album_art.dart';
 import '../widgets/cover_art.dart';
+import '../services/networks/external_network.dart';
+import '../services/networks/network_registry.dart';
+import '../widgets/external_result_filters.dart';
+import '../widgets/external_result_tile.dart';
 import 'library_screen.dart';
 
 class DiscoverScreen extends StatefulWidget {
@@ -46,6 +50,12 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
   final _searchCtrl = TextEditingController();
   Timer? _searchDebounce;
   String _query = '';
+  /// Bumped on every Enter press. The results view keys off this as well
+  /// as the query text, so hitting Enter on an UNCHANGED query still
+  /// re-runs the search — which is what you want for the foreign
+  /// networks, where a retry is how you pick up peers that were slow or
+  /// offline a moment ago.
+  int _searchNonce = 0;
 
   @override
   void dispose() {
@@ -89,6 +99,13 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
                   child: TextField(
                     controller: _searchCtrl,
                     onChanged: _onSearchChanged,
+                    onSubmitted: (v) {
+                      _searchDebounce?.cancel();
+                      setState(() {
+                        _query = v.trim();
+                        _searchNonce++;   // force a re-query
+                      });
+                    },
                     textInputAction: TextInputAction.search,
                     decoration: InputDecoration(
                       hintText: 'Search…',
@@ -113,12 +130,16 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
                   ),
                 ),
               ),
+              // Per-network toggles right beside the search box, so turning
+              // Soulseek or napstr into a query is a one-tap decision at
+              // the moment you search — not a trip into Settings.
+              const _NetworkToggles(),
             ],
           ),
         ),
         Expanded(
           child: _query.isNotEmpty
-              ? _SearchResultsView(query: _query)
+              ? _SearchResultsView(query: _query, nonce: _searchNonce)
               : IndexedStack(
                   index: _tab,
                   children: const [
@@ -184,6 +205,23 @@ class _DiscoverHomeState extends State<_DiscoverHome> {
             lib.onlineSong(s.contentHash)!,
       ];
 
+  /// A copy of [c] containing only members the swarm can currently serve,
+  /// resolved to the live catalogue row (which carries the current swarm
+  /// size). Returns null when nothing in the collection is online, so the
+  /// caller can drop the row.
+  SongCollection? _onlineOnly(LibraryProvider lib, SongCollection c) {
+    final live = _playableQueue(lib, c);
+    if (live.isEmpty) return null;
+    return SongCollection(
+      id:       c.id,
+      kind:     c.kind,
+      title:    c.title,
+      subtitle: c.subtitle,
+      facet:    c.facet,
+      songs:    live,
+    );
+  }
+
   void _playFromCollection(
       BuildContext context, LibraryProvider lib, SongCollection c, Song tapped) {
     final queue = _playableQueue(lib, c);
@@ -209,9 +247,15 @@ class _DiscoverHomeState extends State<_DiscoverHome> {
     final set   = lib.collections;
     final theme = Theme.of(context);
 
-    final rows = (set?.collections ?? const <SongCollection>[])
-        .where((c) => c.songs.isNotEmpty)
-        .toList();
+    // Discover is "what you can play right now", so offline members are
+    // DROPPED rather than dimmed, and a row with nothing playable left is
+    // dropped entirely. Dimming meant rows padded out with dead entries
+    // that fail on tap, and whole sections that looked full but had
+    // nothing streamable in them.
+    final rows = [
+      for (final c in (set?.collections ?? const <SongCollection>[]))
+        if (_onlineOnly(lib, c) case final oc? ) oc,
+    ];
 
     if (rows.isEmpty) {
       return Center(
@@ -721,11 +765,15 @@ class CollectionScreen extends StatelessWidget {
     final playing = context.select<PlayerProvider, String>(
         (p) => p.currentSong?.contentHash ?? '');
 
+    // Online-only, same rule as the Discover rows that opened this. Also
+    // what gets RENDERED below, not just what gets queued — otherwise the
+    // list shows dead rows the play button silently skips.
     final queue = <Song>[
       for (final s in collection.songs)
         if (lib.onlineSong(s.contentHash) != null)
           lib.onlineSong(s.contentHash)!,
     ];
+    final visible = queue;
     final seed = collection.facet.isNotEmpty
         ? seedFromName(collection.facet)
         : seedFromName(collection.id);
@@ -782,7 +830,7 @@ class CollectionScreen extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 14),
-          for (var i = 0; i < collection.songs.length; i++)
+          for (var i = 0; i < visible.length; i++)
             _trackRow(context, theme, lib, playing, i, queue),
         ],
       ),
@@ -791,7 +839,9 @@ class CollectionScreen extends StatelessWidget {
 
   Widget _trackRow(BuildContext context, ThemeData theme, LibraryProvider lib,
       String playing, int i, List<Song> queue) {
-    final s     = collection.songs[i];
+    // `queue` is the online-only list the rows are built from, so
+    // indexing it keeps row order and playback order identical.
+    final s     = queue[i];
     final live  = lib.onlineSong(s.contentHash);
     final off   = live == null;
     final shown = live ?? s;
@@ -873,8 +923,11 @@ class CollectionScreen extends StatelessWidget {
 // track rows with availability dimming from the live catalog.
 
 class _SearchResultsView extends StatefulWidget {
-  const _SearchResultsView({required this.query});
+  const _SearchResultsView({required this.query, this.nonce = 0});
   final String query;
+
+  /// Changes on every Enter press so an identical query still re-runs.
+  final int nonce;
 
   @override
   State<_SearchResultsView> createState() => _SearchResultsViewState();
@@ -885,6 +938,20 @@ class _SearchResultsViewState extends State<_SearchResultsView> {
   String?     _error;
   int         _reqSeq = 0;
 
+  // Foreign-network hits (Soulseek / napstr), accumulated per network.
+  // They stream in over several seconds — Soulseek peers answer one by
+  // one — so results are appended as they land rather than awaited.
+  final Map<String, List<ExternalTrack>> _external = {};
+  final Map<String, StreamSubscription<List<ExternalTrack>>> _extSubs = {};
+  bool _extSearching = false;
+
+  // User's narrowing of the foreign results (file types, folders, bitrate,
+  // free text). Lives here — not in the bar widget — so it survives every
+  // progressive result batch, and survives an Enter-press retry of the
+  // SAME query (which just fishes for more peers). It resets only when
+  // the query text actually changes.
+  ExternalResultFilter _extFilter = ExternalResultFilter.empty;
+
   @override
   void initState() {
     super.initState();
@@ -894,12 +961,56 @@ class _SearchResultsViewState extends State<_SearchResultsView> {
   @override
   void didUpdateWidget(_SearchResultsView old) {
     super.didUpdateWidget(old);
-    if (old.query != widget.query) _run();
+    if (old.query != widget.query) _extFilter = ExternalResultFilter.empty;
+    if (old.query != widget.query || old.nonce != widget.nonce) _run();
+  }
+
+  @override
+  void dispose() {
+    _cancelExternal();
+    super.dispose();
+  }
+
+  void _cancelExternal() {
+    for (final sub in _extSubs.values) {
+      sub.cancel();
+    }
+    _extSubs.clear();
+  }
+
+  /// Fan the same query out to every ticked + configured foreign network.
+  void _searchExternal(String query) {
+    _cancelExternal();
+    setState(() {
+      _external.clear();
+      _extSearching = false;
+    });
+    final active = NetworkRegistry.instance.activeNetworks;
+    if (active.isEmpty) return;
+    setState(() => _extSearching = true);
+    for (final net in active) {
+      _external[net.id] = [];
+      _extSubs[net.id] = net.search(query).listen(
+        (batch) {
+          if (!mounted) return;
+          setState(() => _external[net.id]!.addAll(batch));
+        },
+        onError: (_) {},
+        onDone: () {
+          if (!mounted) return;
+          setState(() {
+            _extSubs.remove(net.id);
+            if (_extSubs.isEmpty) _extSearching = false;
+          });
+        },
+      );
+    }
   }
 
   Future<void> _run() async {
     final seq = ++_reqSeq;
     setState(() { _results = null; _error = null; });
+    _searchExternal(widget.query);
     try {
       final pid = await NodeService.getRatsPeerId(
           waitFor: const Duration(seconds: 8));
@@ -937,13 +1048,19 @@ class _SearchResultsViewState extends State<_SearchResultsView> {
     if (_results == null) {
       return const Center(child: CircularProgressIndicator());
     }
-    final results = _results!;
-    // Availability overlay from the live catalog — dim, don't drop.
-    final queue = <Song>[
-      for (final s in results)
+    // Discover is a catalogue of what you can actually play RIGHT NOW, so
+    // offline songs are dropped, not dimmed. A row you cannot stream is
+    // just a dead end: tapping it fails, and it pushes real results down
+    // the list. (My Library is the place where files you hold locally
+    // show up regardless of swarm state.)
+    final all = _results!;
+    final results = <Song>[
+      for (final s in all)
         if (lib.onlineSong(s.contentHash) != null)
           lib.onlineSong(s.contentHash)!,
     ];
+    final queue = results;
+    final hiddenOffline = all.length - results.length;
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 24),
@@ -974,8 +1091,9 @@ class _SearchResultsViewState extends State<_SearchResultsView> {
                   Text(
                     _error != null
                         ? 'Search failed: $_error'
-                        : '${results.length} result${results.length == 1 ? '' : 's'}'
-                          ' · ${queue.length} streamable',
+                        : '${results.length} online result'
+                          '${results.length == 1 ? '' : 's'}'
+                          '${hiddenOffline > 0 ? ' · $hiddenOffline offline hidden' : ''}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.labelSmall?.copyWith(
@@ -1027,8 +1145,91 @@ class _SearchResultsViewState extends State<_SearchResultsView> {
           ),
         for (var i = 0; i < results.length; i++)
           _resultRow(context, theme, lib, playing, results[i], i, queue),
+
+        // ---- other networks -------------------------------------------
+        if (_extSearching)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 10),
+            child: LinearProgressIndicator(minHeight: 2),
+          ),
+        ..._externalBlock(theme),
       ],
     );
+  }
+
+  /// Filter bar + one titled block per foreign network. Tapping a row
+  /// downloads it; the download manager fingerprints and tag-imports it
+  /// on completion, so a hit from Soulseek or napstr ends up in the local
+  /// library the same as a locally-scanned file.
+  List<Widget> _externalBlock(ThemeData theme) {
+    final all = [for (final l in _external.values) ...l];
+    if (all.isEmpty) return const [];
+
+    // Apply the user's filter per network so section counts stay honest.
+    final filtered = {
+      for (final e in _external.entries) e.key: _extFilter.apply(e.value),
+    };
+    final shownTotal =
+        filtered.values.fold<int>(0, (n, l) => n + l.length);
+
+    return [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(4, 14, 4, 2),
+        // The bar derives its chips from the CURRENT results, so as
+        // Soulseek peers trickle in, new extensions grow new chips while
+        // the user's existing selections stay put (the filter is a
+        // denylist — see external_result_filters.dart).
+        child: ExternalResultFilterBar(
+          filter: _extFilter,
+          results: all,
+          hiddenCount: all.length - shownTotal,
+          onChanged: (f) => setState(() => _extFilter = f),
+        ),
+      ),
+      ..._externalSections(theme, filtered),
+    ];
+  }
+
+  List<Widget> _externalSections(
+      ThemeData theme, Map<String, List<ExternalTrack>> filtered) {
+    final out = <Widget>[];
+    for (final entry in _external.entries) {
+      if (entry.value.isEmpty) continue;
+      final shown = filtered[entry.key] ?? const <ExternalTrack>[];
+      final net = NetworkRegistry.instance.byId(entry.key);
+      final label = net?.displayName ?? entry.key;
+      // When the filter bites, the header says "shown of total" so a
+      // fully filtered-out network still reads as "0 of 37" rather than
+      // vanishing as if the search came back empty.
+      final counts = shown.length == entry.value.length
+          ? '${entry.value.length} result'
+              '${entry.value.length == 1 ? '' : 's'}'
+          : '${shown.length} of ${entry.value.length} results';
+      out.add(Padding(
+        padding: const EdgeInsets.fromLTRB(4, 18, 4, 6),
+        child: Text(
+          '$label · $counts',
+          style: theme.textTheme.labelSmall?.copyWith(
+            fontWeight: FontWeight.w800,
+            letterSpacing: 1.1,
+            color: theme.colorScheme.primary,
+          ),
+        ),
+      ));
+      // Stable keys: results stream in over seconds (Soulseek peers reply
+      // one at a time), and without a key Flutter matches children by
+      // position. A row arriving above yours re-associates the element
+      // under your finger with a different widget, which destroys the
+      // gesture recogniser mid-tap — the click is then simply lost while
+      // hover keeps working. Filtering rows in and out has exactly the
+      // same effect, so the keys matter even more now.
+      out.addAll(shown.map((t) => ExternalResultTile(
+            key: ValueKey('${t.networkId}:${t.id}'),
+            track: t,
+            networkLabel: label,
+          )));
+    }
+    return out;
   }
 
   Widget _resultRow(BuildContext context, ThemeData theme,
@@ -1105,6 +1306,88 @@ class _SearchResultsViewState extends State<_SearchResultsView> {
           _play(context, queue, idx);
         },
       ),
+    );
+  }
+}
+
+
+/// Compact on/off chips for each foreign network, shown next to the
+/// Discover search field.
+///
+/// Ticking one only enables querying — credentials still live in
+/// Settings. A network that isn't set up yet stays visibly dim and says
+/// so when tapped, rather than silently doing nothing (which is what the
+/// old Settings-only toggle did).
+class _NetworkToggles extends StatefulWidget {
+  const _NetworkToggles();
+
+  @override
+  State<_NetworkToggles> createState() => _NetworkTogglesState();
+}
+
+class _NetworkTogglesState extends State<_NetworkToggles> {
+  @override
+  void initState() {
+    super.initState();
+    NetworkRegistry.instance.addListener(_onChanged);
+  }
+
+  @override
+  void dispose() {
+    NetworkRegistry.instance.removeListener(_onChanged);
+    super.dispose();
+  }
+
+  void _onChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final networks = NetworkRegistry.instance.networks;
+    if (networks.isEmpty) return const SizedBox.shrink();
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (final net in networks) ...[
+          const SizedBox(width: 6),
+          Tooltip(
+            message: net.isConfigured
+                ? 'Include ${net.displayName} in searches'
+                : '${net.displayName} needs setting up in '
+                    'Settings → Other networks',
+            child: FilterChip(
+              visualDensity: VisualDensity.compact,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              label: Text(net.displayName,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: net.isConfigured
+                        ? null
+                        : theme.colorScheme.onSurfaceVariant,
+                  )),
+              avatar: net.status == NetworkStatus.error
+                  ? const Icon(Icons.error_outline,
+                      size: 14, color: Colors.redAccent)
+                  : null,
+              selected: net.enabled,
+              onSelected: (v) {
+                if (v && !net.isConfigured) {
+                  ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(
+                    content: Text(
+                      '${net.displayName} needs to be set up first — '
+                      'Settings → Other networks.',
+                    ),
+                    duration: const Duration(seconds: 4),
+                  ));
+                }
+                NetworkRegistry.instance.setEnabled(net.id, v);
+              },
+            ),
+          ),
+        ],
+      ],
     );
   }
 }

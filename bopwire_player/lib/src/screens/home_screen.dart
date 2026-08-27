@@ -455,7 +455,12 @@ class _MiniPlayerState extends State<_MiniPlayer> {
       accent = hslColor(p.h1, 75, 62);
     }
 
-    final durationMs = idle ? 0 : song.durationMs;
+    // Use the player's EFFECTIVE duration, not the Song's. A foreign
+    // network preview has no chain metadata (durationMs 0), which left
+    // sliderMax pinned to the live position — so the handle sat at the
+    // end and every seek clamped to 0. PlayerProvider.durationMs prefers
+    // the decoder's own value and falls back to the track metadata.
+    final durationMs = idle ? 0 : player.durationMs;
     final livePosMs  = player.positionMs.clamp(0, durationMs == 0
         ? player.positionMs
         : durationMs);
@@ -485,7 +490,31 @@ class _MiniPlayerState extends State<_MiniPlayer> {
                 ),
               ),
               Expanded(
-                child: SliderTheme(
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    // How much of the file is actually downloaded, drawn
+                    // behind the handle. Without it, scrubbing past the
+                    // downloaded edge of a still-arriving file just stalls
+                    // with no indication of why.
+                    if (player.bufferedFraction != null && !idle)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 24),
+                        child: SizedBox(
+                          height: 3,
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(2),
+                            child: LinearProgressIndicator(
+                              value: player.bufferedFraction!.clamp(0.0, 1.0),
+                              minHeight: 3,
+                              backgroundColor: Colors.transparent,
+                              valueColor: AlwaysStoppedAnimation(
+                                  accent.withValues(alpha: .30)),
+                            ),
+                          ),
+                        ),
+                      ),
+                    SliderTheme(
                   data: SliderTheme.of(context).copyWith(
                     trackHeight: 3,
                     activeTrackColor: accent,
@@ -494,6 +523,10 @@ class _MiniPlayerState extends State<_MiniPlayer> {
                         enabledThumbRadius: 6),
                     overlayShape: const RoundSliderOverlayShape(
                         overlayRadius: 10),
+                    // Let the buffered bar show through the unplayed part.
+                    inactiveTrackColor: player.bufferedFraction == null
+                        ? null
+                        : theme.colorScheme.onSurface.withValues(alpha: .12),
                   ),
                   child: Slider(
                     min: 0,
@@ -507,6 +540,8 @@ class _MiniPlayerState extends State<_MiniPlayer> {
                       setState(() => _dragPositionMs = null);
                     },
                   ),
+                    ),
+                  ],
                 ),
               ),
               SizedBox(

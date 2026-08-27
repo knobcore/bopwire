@@ -18,7 +18,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -28,6 +27,7 @@ import '../providers/wallet_provider.dart';
 import '../services/librats_discovery.dart';
 import '../services/rats_client.dart';
 import '../services/wallet_service.dart';
+import '../util/file_dialogs.dart';
 import '../widgets/password_dialogs.dart';
 import '../widgets/wallet_export_import.dart';
 
@@ -130,12 +130,21 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
       // ourselves. Belt-and-braces: pass bytes AND fall back to a
       // manual File write — on desktop the manual write is the real
       // one; on mobile it'll throw a permission error which we eat.
-      final pickedPath = await FilePicker.platform.saveFile(
-        dialogTitle: 'Save recovery phrase',
-        fileName:    'bopwire-recovery-phrase.txt',
-        bytes:       Uint8List.fromList(utf8.encode(body)),
+      final saved = await saveFile(
+        title:    'Save recovery phrase',
+        fileName: 'bopwire-recovery-phrase.txt',
+        bytes:    Uint8List.fromList(utf8.encode(body)),
       );
-      if (pickedPath == null) return; // user cancelled
+      if (saved.isError) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(saved.message ?? 'Could not open the save dialog.'),
+          duration: const Duration(seconds: 6),
+        ));
+        return;
+      }
+      if (!saved.ok) return; // user cancelled
+      final pickedPath = saved.path!;
       try {
         await File(pickedPath).writeAsString(body, flush: true);
       } catch (_) {

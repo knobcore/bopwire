@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+// AppExitResponse lives in dart:ui, not package:flutter/services.
+import 'dart:ui' show AppExitResponse;
 import 'package:media_kit/media_kit.dart';
 import 'package:provider/provider.dart';
 
@@ -16,6 +18,11 @@ import 'src/services/player_server.dart';
 import 'src/services/swarm_registry.dart';
 import 'src/services/audio_stream_proxy.dart';
 import 'src/services/library_service.dart';
+import 'src/services/networks/network_registry.dart';
+import 'src/services/networks/napstr/tor_service.dart';
+import 'src/services/networks/predownload_cache.dart';
+import 'src/services/networks/napstr/napstr_network.dart';
+import 'src/services/networks/soulseek/soulseek_network.dart';
 import 'src/services/library_scanner.dart';
 import 'src/services/presence_publisher.dart';
 import 'src/services/chat_service.dart';
@@ -166,6 +173,73 @@ void main() async {
     }
   }
 
+  // Sweep the pre-download cache before anything can use it. It
+  // self-initialises on first use, but doing it here is what actually
+  // clears a previous crash's leftovers — otherwise stale partial files
+  // sit in temp until the user next opens Discover.
+  // Preview playback routes through the app's SINGLE player. The cache
+  // produces a URL for a still-downloading file; PlayerProvider opens it
+  // with no chain session, so the transport bar drives it like anything
+  // else and there is never a second libmpv instance making sound.
+  PredownloadCache.previewOpener = (url, track) async {
+    await PlayerProvider.instance.playPreview(
+      url:    url,
+      title:  track?.title ?? 'Preview',
+      artist: track?.artist ?? '',
+      album:  track?.album ?? '',
+      // Soulseek carries duration in its file attributes, so the bar has
+      // a scale before a single byte lands. napstr's catalogue doesn't —
+      // there the decoder's own duration (from the container header)
+      // fills it in a moment later.
+      durationMs: (track?.durationSeconds ?? 0) * 1000,
+    );
+  };
+  PredownloadCache.previewStopper = () async => PlayerProvider.instance.stop();
+  PredownloadCache.previewProgress =
+      (f) => PlayerProvider.instance.setBufferedFraction(f);
+
+  try {
+    await PredownloadCache.instance.init();
+  } catch (e) {
+    // ignore: avoid_print
+    print('[predownload] init failed: $e');
+  }
+
+  // Register the foreign networks the search screen can fan out to.
+  // Bootstrap restores each network's enabled flag and credentials; it
+  // never dials out on its own — connecting happens when the user ticks
+  // a checkbox that has its credentials filled in.
+  try {
+    await NetworkRegistry.instance.bootstrap([
+      SoulseekNetwork(),
+      NapstrNetwork(),
+    ]);
+  } catch (e) {
+    // A network that fails to register must not take the app down with
+    // it — the rest of the player works fine without external search.
+    // ignore: avoid_print
+    print('[networks] bootstrap failed: $e');
+  }
+
+  // Clean shutdown. Both networks serve ONE transfer per peer at a time,
+  // so a process that exits mid-transfer leaves that peer holding a slot
+  // for a download that will never resume — and the next launch times
+  // out against it. AppLifecycleListener.onExitRequested is awaited by
+  // the framework, so the CANCEL frames actually get to leave.
+  final exitListener = AppLifecycleListener(
+    onExitRequested: () async {
+      try {
+        await PredownloadCache.instance.shutdown();
+      } catch (_) {}
+      try {
+        await TorService.instance.shutdown();
+      } catch (_) {}
+      return AppExitResponse.exit;
+    },
+  );
+  // Held for the process lifetime; disposing it would unregister the hook.
+  assert(exitListener.runtimeType == AppLifecycleListener);
+
   runApp(const BopwireApp());
 
   // Headless network-stack smoke test. Compiled in; only runs with
@@ -205,6 +279,7 @@ class BopwireApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => LibraryProvider()),
         ChangeNotifierProvider(create: (_) => PlayerProvider()),
         ChangeNotifierProvider.value(value: LibraryService.instance),
+        ChangeNotifierProvider.value(value: NetworkRegistry.instance),
         ChangeNotifierProvider.value(value: DownloadProvider.instance),
         ChangeNotifierProvider.value(value: ChatService.instance),
         ChangeNotifierProvider(

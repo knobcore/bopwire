@@ -23,6 +23,15 @@ import 'rats_client.dart';
 class LibraryPublisher {
   static bool _inFlight = false;
 
+  /// Set when publishFull is called while a publish is already running.
+  /// The in-flight call loops one more time before releasing the guard,
+  /// so a library change that lands mid-publish (e.g. a download import
+  /// finishing while a scan's publish RPC is in the air) is never
+  /// silently dropped. Before this, the second call returned immediately
+  /// and the new song sat un-announced (swarmSize 0 → invisible in
+  /// Discover) until the next 30-minute scan.
+  static bool _rerunRequested = false;
+
   /// Digest of the hash-set we last SUCCESSFULLY published this session.
   /// In-memory (cleared on app restart) so we still re-publish once per launch
   /// — covering the node ever losing the record — but skip the redundant
@@ -35,8 +44,22 @@ class LibraryPublisher {
   /// library, or a reachable full node. Safe to call repeatedly — the node's
   /// version gate makes it idempotent.
   static Future<void> publishFull() async {
-    if (_inFlight) return;
+    if (_inFlight) {
+      _rerunRequested = true;
+      return;
+    }
     _inFlight = true;
+    try {
+      do {
+        _rerunRequested = false;
+        await _publishOnce();
+      } while (_rerunRequested);
+    } finally {
+      _inFlight = false;
+    }
+  }
+
+  static Future<void> _publishOnce() async {
     try {
       final wp = WalletProvider.active;
       final info = wp?.info;
@@ -140,8 +163,6 @@ class LibraryPublisher {
     } catch (e) {
       // ignore: avoid_print
       print('[db2] publishFull failed: $e');
-    } finally {
-      _inFlight = false;
     }
   }
 
