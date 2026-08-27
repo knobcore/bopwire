@@ -73,68 +73,112 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Home/Browse + the network toggles + the search field used to share
+    // one Row unconditionally. On a portrait phone that is three
+    // competing widths in one line, and the search box — the one thing
+    // people actually type into — got squeezed down to whatever space
+    // the other two left over. Landscape has the width to spare, so it
+    // keeps the original single-row layout; portrait gets the search box
+    // its own full-width row underneath instead.
+    final tabsRow = Row(
+      children: [
+        SegmentedButton<int>(
+          segments: const [
+            ButtonSegment(value: 0,
+                icon: Icon(Icons.auto_awesome, size: 16),
+                label: Text('Home')),
+            ButtonSegment(value: 1,
+                icon: Icon(Icons.grid_view, size: 16),
+                label: Text('Browse')),
+          ],
+          selected: {_tab},
+          showSelectedIcon: false,
+          onSelectionChanged: (s) => setState(() => _tab = s.first),
+        ),
+        const SizedBox(width: 8),
+        // Per-network toggles: turning Soulseek or napstr into a query is
+        // a one-tap decision at the moment you search, not a trip into
+        // Settings. In the single-row (landscape) layout this sits right
+        // beside the search box instead of trailing the tabs.
+        const _NetworkToggles(),
+      ],
+    );
+
+    final searchField = SizedBox(
+      height: 38,
+      child: TextField(
+        controller: _searchCtrl,
+        onChanged: _onSearchChanged,
+        onSubmitted: (v) {
+          _searchDebounce?.cancel();
+          setState(() {
+            _query = v.trim();
+            _searchNonce++;   // force a re-query
+          });
+        },
+        textInputAction: TextInputAction.search,
+        decoration: InputDecoration(
+          hintText: 'Search…',
+          prefixIcon: const Icon(Icons.search, size: 18),
+          suffixIcon: _query.isEmpty
+              ? null
+              : IconButton(
+                  icon: const Icon(Icons.close, size: 16),
+                  onPressed: () {
+                    _searchCtrl.clear();
+                    _searchDebounce?.cancel();
+                    setState(() => _query = '');
+                  },
+                ),
+          isDense: true,
+          contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(999),
+          ),
+        ),
+      ),
+    );
+
     return Column(
       children: [
         Padding(
           padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-          child: Row(
-            children: [
-              SegmentedButton<int>(
-                segments: const [
-                  ButtonSegment(value: 0,
-                      icon: Icon(Icons.auto_awesome, size: 16),
-                      label: Text('Home')),
-                  ButtonSegment(value: 1,
-                      icon: Icon(Icons.grid_view, size: 16),
-                      label: Text('Browse')),
-                ],
-                selected: {_tab},
-                showSelectedIcon: false,
-                onSelectionChanged: (s) => setState(() => _tab = s.first),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: SizedBox(
-                  height: 38,
-                  child: TextField(
-                    controller: _searchCtrl,
-                    onChanged: _onSearchChanged,
-                    onSubmitted: (v) {
-                      _searchDebounce?.cancel();
-                      setState(() {
-                        _query = v.trim();
-                        _searchNonce++;   // force a re-query
-                      });
-                    },
-                    textInputAction: TextInputAction.search,
-                    decoration: InputDecoration(
-                      hintText: 'Search…',
-                      prefixIcon: const Icon(Icons.search, size: 18),
-                      suffixIcon: _query.isEmpty
-                          ? null
-                          : IconButton(
-                              icon: const Icon(Icons.close, size: 16),
-                              onPressed: () {
-                                _searchCtrl.clear();
-                                _searchDebounce?.cancel();
-                                setState(() => _query = '');
-                              },
-                            ),
-                      isDense: true,
-                      contentPadding:
-                          const EdgeInsets.symmetric(horizontal: 12),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(999),
-                      ),
+          child: OrientationBuilder(
+            builder: (context, orientation) {
+              if (orientation == Orientation.landscape) {
+                // Unchanged: tabs, search, and network toggles all in one
+                // row, exactly as before this change.
+                return Row(
+                  children: [
+                    SegmentedButton<int>(
+                      segments: const [
+                        ButtonSegment(value: 0,
+                            icon: Icon(Icons.auto_awesome, size: 16),
+                            label: Text('Home')),
+                        ButtonSegment(value: 1,
+                            icon: Icon(Icons.grid_view, size: 16),
+                            label: Text('Browse')),
+                      ],
+                      selected: {_tab},
+                      showSelectedIcon: false,
+                      onSelectionChanged: (s) => setState(() => _tab = s.first),
                     ),
-                  ),
-                ),
-              ),
-              // Per-network toggles right beside the search box, so turning
-              // Soulseek or napstr into a query is a one-tap decision at
-              // the moment you search — not a trip into Settings.
-              const _NetworkToggles(),
-            ],
+                    const SizedBox(width: 8),
+                    Expanded(child: searchField),
+                    const _NetworkToggles(),
+                  ],
+                );
+              }
+              // Portrait: tabs + toggles on top, search gets its own
+              // full-width row below.
+              return Column(
+                children: [
+                  tabsRow,
+                  const SizedBox(height: 8),
+                  searchField,
+                ],
+              );
+            },
           ),
         ),
         Expanded(
