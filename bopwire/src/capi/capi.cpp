@@ -10,6 +10,7 @@
 #include "../crypto/signature.h"
 #include "../crypto/bip39.h"
 #include "../audio/ogg_validator.h"
+#include "../audio/multi_decoder.h"
 #include "../audio/ogg_decoder.h"
 #include "../audio/fingerprint.h"
 #include "../core/block.h"
@@ -186,6 +187,45 @@ mc_decoder_t mc_decoder_open(const uint8_t* data, size_t len) {
         set_error(e.what());
         return nullptr;
     }
+}
+
+int mc_decode_any(const uint8_t* data, size_t len,
+                  int16_t** out_pcm, size_t* out_samples,
+                  int* out_sample_rate, int* out_channels) {
+    if (out_pcm)         *out_pcm         = nullptr;
+    if (out_samples)     *out_samples     = 0;
+    if (out_sample_rate) *out_sample_rate = 0;
+    if (out_channels)    *out_channels    = 0;
+    if (!data || len == 0 || !out_pcm || !out_samples) {
+        set_error("mc_decode_any: bad arguments");
+        return 1;
+    }
+    try {
+        auto pcm = mc::audio::decode_any(data, len);
+        if (pcm.samples.empty() || pcm.sample_rate <= 0 || pcm.channels <= 0) {
+            set_error("decode_any produced no audio (unsupported codec or "
+                      "corrupt file)");
+            return 2;
+        }
+        // Hand ownership to the caller: the std::vector dies with this
+        // frame, so copy into a malloc'd block the FFI side can free.
+        const size_t n = pcm.samples.size();
+        auto* buf = static_cast<int16_t*>(std::malloc(n * sizeof(int16_t)));
+        if (!buf) { set_error("mc_decode_any: out of memory"); return 3; }
+        std::memcpy(buf, pcm.samples.data(), n * sizeof(int16_t));
+        *out_pcm     = buf;
+        *out_samples = n;
+        if (out_sample_rate) *out_sample_rate = pcm.sample_rate;
+        if (out_channels)    *out_channels    = pcm.channels;
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return 4;
+    }
+}
+
+void mc_pcm_free(int16_t* pcm) {
+    std::free(pcm);
 }
 
 void mc_decoder_free(mc_decoder_t decoder) {

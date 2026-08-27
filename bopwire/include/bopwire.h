@@ -164,6 +164,25 @@ BOPWIRE_API uint32_t mc_decoder_get_duration_ms(mc_decoder_t decoder);
  *  Returns number of samples decoded, 0 at EOF, -1 on error. */
 BOPWIRE_API int mc_decoder_read(mc_decoder_t decoder, int16_t* buf, int max_samples);
 
+/* ---- General-purpose audio decode -------------------------------------
+ * mc_decoder_* above is Ogg/Vorbis ONLY (it wraps mc::audio::OggDecoder).
+ * The player has to fingerprint whatever the user actually has — FLAC,
+ * MP3, M4A, WAV — so it needs mc::audio::decode_any, which covers every
+ * container FFmpeg can read. Without this export the Flutter client had
+ * no decode path on Linux/macOS at all and NOTHING could be
+ * fingerprinted there.
+ *
+ * Decodes `len` bytes of a complete audio file to interleaved int16 PCM.
+ * On success returns 0 and fills the out params; *out_pcm must be freed
+ * with mc_pcm_free. On failure returns non-zero and leaves them zeroed.
+ */
+BOPWIRE_API int mc_decode_any(const uint8_t* data, size_t len,
+                              int16_t** out_pcm, size_t* out_samples,
+                              int* out_sample_rate, int* out_channels);
+
+/* Frees a buffer returned by mc_decode_any. */
+BOPWIRE_API void mc_pcm_free(int16_t* pcm);
+
 /** Seek to position in milliseconds. Returns 0 on success. */
 BOPWIRE_API int mc_decoder_seek(mc_decoder_t decoder, uint32_t position_ms);
 

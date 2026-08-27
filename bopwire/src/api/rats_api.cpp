@@ -1181,11 +1181,90 @@ void RatsApi::handle_request(const std::string& peer_id,
             // moderator address list; the mini-node caches it (TTL) to
             // authorize global-mod chat.moderate actions.
             json arr = json::array();
+            // ADDITIVE: `moderators` keeps its original shape (a flat array
+            // of hex addresses) because the mini-node caches it for
+            // chat.moderate authorization. `levels` and `founder` are new
+            // fields the moderator TUI needs — without them a client can
+            // see WHO the moderators are but not their rank, and cannot
+            // tell whether a founder exists at all.
+            json levels = json::object();
             for (const auto& a : db_.list_active_moderators()) {
-                arr.push_back(crypto::to_hex(a.data(), a.size()));
+                const std::string ahex = crypto::to_hex(a.data(), a.size());
+                arr.push_back(ahex);
+                levels[ahex] = static_cast<int>(db_.get_mod_level(a));
             }
+            json mbody = {{"moderators", std::move(arr)},
+                          {"levels",     std::move(levels)}};
+            if (auto f = db_.get_founder())
+                mbody["founder"] = crypto::to_hex(f->data(), f->size());
             reply = {{"req_id", req_id}, {"status", "ok"},
-                     {"body", {{"moderators", std::move(arr)}}}};
+                     {"body", std::move(mbody)}};
+        }
+        // ---- moderator-only reads -----------------------------------
+        //
+        // Unlike the listing verbs above, these are gated: the request must
+        // carry a moderation envelope signed by a current moderator (same
+        // shape mod.submit uses, with `action` naming the verb). Public
+        // full-node operators must not be able to enumerate the moderation
+        // surface just by reaching the node.
+        else if (type == "mod.list_songs" || type == "mod.list_hidden" ||
+                 type == "mod.list_labels") {
+            mc::moderation::Envelope env;
+            if (!mc::moderation::from_json(in, env) ||
+                !mc::moderation::verify(env, db_)) {
+                reply = {{"req_id", req_id}, {"status", "denied"},
+                         {"error", "moderator signature required"}};
+            } else if (type == "mod.list_songs") {
+                // The FULL catalogue, hidden entries included. songs.list is
+                // deliberately "online files only" for the Discover surface;
+                // a moderator has to see everything in order to moderate it.
+                json arr = json::array();
+                for (const auto& ch : db_.get_all_song_hashes()) {
+                    auto m = db_.get_song_meta(ch);
+                    if (!m) continue;
+                    arr.push_back({
+                        {"contentHash", crypto::to_hex(ch.data(), ch.size())},
+                        {"title",       m->title},
+                        {"artist",      m->artist},
+                        {"album",       m->album},
+                        {"genre",       m->genre},
+                        {"durationMs",  m->duration_ms},
+                        {"year",        m->year},
+                        {"trackNumber", m->track_number},
+                        {"hidden",      db_.is_song_deleted(ch)},
+                    });
+                }
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {{"total", arr.size()},
+                                   {"songs", std::move(arr)}}}};
+            } else if (type == "mod.list_hidden") {
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {{"titles",  db_.list_hidden_titles()},
+                                   {"artists", db_.list_hidden_artists()},
+                                   {"albums",  db_.list_hidden_albums()}}}};
+            } else {
+                // mod.list_labels — names plus each label's splits, so the
+                // TUI can render the label page without a second round trip.
+                json arr = json::array();
+                for (const auto& name : db_.list_labels()) {
+                    json entry = {{"name", name}};
+                    if (auto def = db_.get_label(name)) {
+                        entry["display_name"] = def->display_name;
+                        json splits = json::array();
+                        for (const auto& sp : def->splits) {
+                            splits.push_back({
+                                {"wallet", crypto::to_hex(sp.wallet.data(),
+                                                          sp.wallet.size())},
+                                {"basis_points", sp.basis_points},
+                            });
+                        }
+                        entry["splits"] = std::move(splits);
+                    }
+                    arr.push_back(std::move(entry));
+                }
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {{"labels", std::move(arr)}}}};
+            }
         }
         else if (type == "mod.list_proposals") {
             // -> {proposals:[{hash,kind,target_addr,amount,proposer,votes,

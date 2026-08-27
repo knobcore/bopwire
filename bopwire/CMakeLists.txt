@@ -233,6 +233,35 @@ set_target_properties(roaring PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     C_STANDARD 11
     C_STANDARD_REQUIRED ON)
+# libsodium — src/crypto/keys.cpp calls crypto_pwhash (Argon2) for the
+# keystore KDF, but nothing ever linked it. Shared libs tolerate undefined
+# symbols, so libbopwire.so linked "fine" and only resolved crypto_pwhash
+# at runtime by accident, when linuxdeploy happened to bundle libsodium as
+# a dependency of libzmq. Static consumers had no such luck and failed
+# outright at link time (bopwire-modclient).
+# Declaring it here fixes all three: the .so now records a real DT_NEEDED,
+# and every executable that pulls in bopwire_static links it too.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(SODIUM QUIET libsodium)
+endif()
+if(SODIUM_FOUND)
+  list(APPEND MC_INCLUDE_DIRS ${SODIUM_INCLUDE_DIRS})
+  list(APPEND MC_LINK_LIBS ${SODIUM_LIBRARIES})
+  link_directories(${SODIUM_LIBRARY_DIRS})
+  message(STATUS "libsodium: ${SODIUM_VERSION} (pkg-config)")
+else()
+  find_library(SODIUM_LIB NAMES sodium libsodium)
+  find_path(SODIUM_INC NAMES sodium.h)
+  if(SODIUM_LIB AND SODIUM_INC)
+    list(APPEND MC_INCLUDE_DIRS ${SODIUM_INC})
+    list(APPEND MC_LINK_LIBS ${SODIUM_LIB})
+    message(STATUS "libsodium: ${SODIUM_LIB}")
+  else()
+    message(WARNING "libsodium not found — crypto_pwhash will be unresolved")
+  endif()
+endif()
+
 list(APPEND MC_LINK_LIBS roaring)
 list(APPEND MC_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/deps/croaring")
 
@@ -365,12 +394,75 @@ if(MC_WITH_ART AND NOT MC_MINI_NODE_ONLY)
   message(STATUS "MC_WITH_ART: album art ON (sacad via ${CARGO_EXECUTABLE})")
 endif()
 
+# ---- Tor (Arti) as a static library -------------------------------------
+#
+# napstr downloads run over Tor onion services with no clearnet fallback,
+# so the PLAYER needs a Tor client on every platform it ships to. Shelling
+# out to a `tor` binary is fine on desktop but not on Android, so Arti (the
+# Rust Tor implementation) is linked in as a static archive instead — same
+# vendored-Rust pattern as sacad above.
+#
+# Scope: this is a transport for ONE foreign network. librats and the
+# bopwire swarm are untouched and stay on clearnet.
+#
+# Linked into the SHARED bopwire library (not the node), because it is the
+# player that talks to napstr. Off by default so a node build never pays
+# Arti's compile time.
+option(MC_WITH_TOR "Embed Arti (Tor) as a static lib for napstr downloads" OFF)
+if(MC_WITH_TOR)
+  if(NOT CARGO_EXECUTABLE)
+    find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{HOME}/.cargo/bin")
+  endif()
+  if(NOT CARGO_EXECUTABLE)
+    message(WARNING "MC_WITH_TOR=ON but 'cargo' (Rust) not found — building "
+                    "WITHOUT embedded Tor. napstr downloads will then need a "
+                    "system Tor or Orbot on 127.0.0.1:9050.")
+    set(MC_WITH_TOR OFF)
+  else()
+    set(TOR_FFI_DIR        ${CMAKE_CURRENT_SOURCE_DIR}/deps/tor-ffi)
+    set(TOR_FFI_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/tor-ffi-target)
+    set(TOR_FFI_LIB        ${TOR_FFI_TARGET_DIR}/release/libtor_ffi.a)
+    file(GLOB_RECURSE TOR_FFI_SRCS
+         ${TOR_FFI_DIR}/src/*.rs ${TOR_FFI_DIR}/Cargo.toml)
+    add_custom_command(
+      OUTPUT ${TOR_FFI_LIB}
+      COMMAND ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${TOR_FFI_TARGET_DIR}
+              ${CARGO_EXECUTABLE} build --release --manifest-path ${TOR_FFI_DIR}/Cargo.toml
+      DEPENDS ${TOR_FFI_SRCS}
+      COMMENT "Building Arti/Tor static library (cargo --release, first build is slow)"
+      USES_TERMINAL VERBATIM)
+    add_custom_target(tor_ffi_build DEPENDS ${TOR_FFI_LIB})
+    message(STATUS "MC_WITH_TOR: embedded Tor ON (arti via ${CARGO_EXECUTABLE})")
+  endif()
+endif()
+
 if(NOT MC_MINI_NODE_ONLY)
 
 # Shared library (C API for Flutter FFI)
 add_library(bopwire SHARED ${MC_SOURCES})
 target_include_directories(bopwire PUBLIC ${MC_INCLUDE_DIRS})
 target_link_libraries(bopwire PUBLIC ${MC_LINK_LIBS})
+# Embedded Tor goes into the player's shared lib, so Dart reaches
+# tor_ffi_start/stop through the same FFI handle as everything else.
+if(MC_WITH_TOR)
+  add_dependencies(bopwire tor_ffi_build)
+  target_compile_definitions(bopwire PRIVATE MC_WITH_TOR=1)
+  # --whole-archive is required, not stylistic: no C++ translation unit
+  # calls tor_ffi_start (Dart reaches it through FFI at runtime), so the
+  # linker would otherwise discard every member of the archive as unused
+  # and the symbols would simply not exist in the .so.
+  if(APPLE)
+    target_link_libraries(bopwire PRIVATE -Wl,-force_load,${TOR_FFI_LIB})
+  elseif(MSVC)
+    target_link_libraries(bopwire PRIVATE ${TOR_FFI_LIB})
+    set_property(TARGET bopwire APPEND_STRING PROPERTY LINK_FLAGS
+                 " /WHOLEARCHIVE:${TOR_FFI_LIB}")
+  else()
+    target_link_libraries(bopwire PRIVATE
+      -Wl,--whole-archive ${TOR_FFI_LIB} -Wl,--no-whole-archive)
+    target_link_libraries(bopwire PRIVATE pthread dl m)
+  endif()
+endif()
 target_compile_definitions(bopwire PRIVATE BUILDING_BOPWIRE_DLL)
 set_target_properties(bopwire PROPERTIES
   VERSION ${PROJECT_VERSION}
@@ -535,8 +627,16 @@ endif()
 # --------------------------------------------------------------------
 if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/modclient_main.cpp")
   message(STATUS "bopwire-modclient: private source found — ENABLED")
+  # The moderator program: console half (modclient_main.cpp) plus the
+  # moderator TUI — admin_tui.cpp, which already implements search/hide,
+  # DMCA review and KYC escrow review with attachment download. It reaches
+  # the chain over RPC (mod_backend_rpc.h) so it can run alongside a live
+  # node instead of needing the DB lock, and MC_MODERATOR_RPC_ONLY keeps
+  # the in-process adapter (and therefore leveldb) out of this binary.
   add_executable(bopwire-modclient
     tools/admin/modclient_main.cpp
+    tools/admin/moderator_tui.cpp
+    tools/admin/admin_tui.cpp
     src/crypto/hash.cpp
     src/crypto/keys.cpp
     src/crypto/keystore.cpp
@@ -547,11 +647,16 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/modclient_main.cpp")
     src/core/block.cpp
     src/core/transaction.cpp)
   target_link_libraries(bopwire-modclient PRIVATE
+    bopwire_static
     rats
     wallycore
     secp256k1
     ${MC_OPENSSL_SSL}
-    ${MC_OPENSSL_CRYPTO})
+    ${MC_OPENSSL_CRYPTO}
+    # This target compiles src/crypto/keys.cpp directly and keeps its own
+    # link list rather than using MC_LINK_LIBS, so libsodium has to be
+    # named here too or crypto_pwhash stays unresolved.
+    ${SODIUM_LIBRARIES}${SODIUM_LIB})
   target_include_directories(bopwire-modclient PRIVATE
     ${MC_INCLUDE_DIRS}
     ${OPENSSL_INCLUDE_DIR}
@@ -563,12 +668,24 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/modclient_main.cpp")
   if(NOT MSVC)
     target_link_libraries(bopwire-modclient PRIVATE Threads::Threads)
   endif()
+  target_compile_definitions(bopwire-modclient PRIVATE MC_MODERATOR_RPC_ONLY=1)
+  if (WIN32)
+    find_package(unofficial-pdcurses CONFIG REQUIRED)
+    target_link_libraries(bopwire-modclient PRIVATE unofficial::pdcurses::pdcurses)
+    target_compile_definitions(bopwire-modclient PRIVATE MC_TUI_PDCURSES=1)
+  else()
+    set(CURSES_NEED_NCURSES TRUE)
+    find_package(Curses REQUIRED)
+    target_include_directories(bopwire-modclient PRIVATE ${CURSES_INCLUDE_DIRS})
+    target_link_libraries(bopwire-modclient PRIVATE ${CURSES_LIBRARIES})
+  endif()
   if(NOT MSVC AND NOT APPLE AND NOT ANDROID)
     target_link_options(bopwire-modclient PRIVATE -static-libstdc++ -static-libgcc)
   endif()
 else()
   message(STATUS "bopwire-modclient: private source absent — skipped")
 endif()
+
 
 # (h3_smoke removed — HTTP/3 surface gone)
 
