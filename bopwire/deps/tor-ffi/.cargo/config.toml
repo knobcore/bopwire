@@ -1,0 +1,17 @@
+# Android cross-compile settings for the embedded Tor (Arti) static lib.
+#
+# The crate is designed to ship on Android (see the [lib] comment in
+# Cargo.toml), but nothing here ever pointed cargo at the NDK, so the
+# aarch64 build was never actually produced and libbopwire.so shipped
+# without any tor_ffi_* symbols — napstr has no transport without them.
+#
+# API 24 matches the rest of the Android build (the existing arm64
+# libbopwire.so reports "for Android 24"); using a different level here
+# would produce an archive linked against a libc the app doesn't target.
+[target.aarch64-linux-android]
+linker = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+ar     = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+
+[target.armv7-linux-androideabi]
+linker = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang"
+ar     = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"

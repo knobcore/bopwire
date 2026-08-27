@@ -1,0 +1,25 @@
+# Linker version script for libbopwire.so (Android).
+#
+# Tor's archive statically bundles its own SQLite (rusqlite "bundled"),
+# and --whole-archive necessarily pulls all of it in. That would publish
+# ~280 sqlite3_* symbols from THIS library into the global dynamic symbol
+# table — while the APK separately ships its own lib/<abi>/libsqlite3.so
+# for sqflite. Two different SQLite builds exporting the same symbol
+# names in one process is a real hazard: the dynamic linker resolves by
+# name, so sqflite's calls could bind to Tor's copy (or vice versa)
+# depending on load order, which is exactly the kind of bug that only
+# shows up on some devices.
+#
+# Making them local keeps Tor's SQLite private to this library. Nothing
+# breaks internally: static linking already resolved those references
+# inside the archive at link time; visibility only affects what the
+# DYNAMIC linker exposes to other libraries.
+#
+# Everything else keeps its default visibility, so mc_* (the bopwire.h C
+# API) and tor_ffi_* (looked up by Dart at runtime) stay exported. They
+# are deliberately NOT hidden here — hiding tor_ffi_* is precisely the
+# bug this whole change exists to fix.
+{
+  local:
+    sqlite3_*;
+};

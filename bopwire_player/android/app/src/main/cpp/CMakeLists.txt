@@ -63,6 +63,25 @@ add_library(openssl_crypto_static STATIC IMPORTED)
 set_target_properties(openssl_crypto_static PROPERTIES
     IMPORTED_LOCATION "${MC_OPENSSL_ANDROID_ROOT}/${ANDROID_ABI}/libcrypto.a")
 
+# ---- Embedded Tor (Arti) for napstr --------------------------------
+#
+# napstr moves its bytes over Tor onion services with no clearnet
+# fallback, so without this there is no transport and napstr simply does
+# not work on Android. deps/tor-ffi was written for exactly this ("Tor
+# ships on EVERY platform the player builds for — including Android,
+# where spawning a `tor` binary is not an option") but nothing here ever
+# pointed at it, so libbopwire.so shipped with zero tor_ffi_* symbols and
+# TorBindings.maybe silently returned null.
+#
+# Built by cargo for aarch64-linux-android (see deps/tor-ffi/.cargo/
+# config.toml, which points cargo's linker at this same NDK at API 24).
+# It is a prebuilt input here rather than a cargo invocation driven from
+# CMake: the Gradle/CMake step runs per-ABI on every build, and Arti's
+# dep tree takes minutes to compile — rebuilding it inside the APK build
+# would make every Flutter build unusably slow.
+set(TOR_FFI_ANDROID_LIB
+    "${MC_ROOT}/deps/tor-ffi/target/aarch64-linux-android/release/libtor_ffi.a")
+
 # ---- Build the bopwire shared library -----------------------------
 add_library(bopwire SHARED
     bopwire_android.c
@@ -84,6 +103,36 @@ target_compile_definitions(bopwire PRIVATE BOPWIRE_BUILD=1)
 # links its own OpenSSL. Only the bopwire.h C API (mc_*, already covered by
 # BOPWIRE_API's default visibility) needs to be exported.
 target_link_options(bopwire PRIVATE "-Wl,--exclude-libs,libcrypto.a")
+
+# Link the Tor archive when it has been built for this ABI. Only arm64 is
+# produced today; on any other ABI the app degrades exactly as it did
+# before (TorBindings.maybe returns null, napstr is unavailable, nothing
+# crashes) rather than failing the build.
+if(EXISTS "${TOR_FFI_ANDROID_LIB}" AND ANDROID_ABI STREQUAL "arm64-v8a")
+  # --whole-archive is required, not stylistic, and for the same reason
+  # the desktop build documents: no C++ translation unit calls
+  # tor_ffi_start — Dart reaches it only through a runtime FFI symbol
+  # lookup — so without this the linker discards every member of the
+  # archive as unreferenced and the symbols simply do not exist.
+  #
+  # NOTE: deliberately NOT --exclude-libs here, unlike libcrypto.a above.
+  # That flag makes an archive's symbols local, which is right for
+  # OpenSSL (nothing outside needs them) and would be exactly wrong here:
+  # it would hide the tor_ffi_* entry points Dart has to find, silently
+  # reproducing the bug this is fixing.
+  target_link_libraries(bopwire PRIVATE
+      -Wl,--whole-archive "${TOR_FFI_ANDROID_LIB}" -Wl,--no-whole-archive)
+  # Keep Tor's statically-bundled SQLite private — see bopwire.map. The
+  # APK ships its own libsqlite3.so for sqflite, and two SQLite builds
+  # exporting the same names into one process resolve by load order.
+  target_link_options(bopwire PRIVATE
+      "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/bopwire.map")
+  target_compile_definitions(bopwire PRIVATE MC_WITH_TOR=1)
+  message(STATUS "bopwire: embedded Tor ON (${TOR_FFI_ANDROID_LIB})")
+else()
+  message(STATUS "bopwire: embedded Tor OFF for ABI ${ANDROID_ABI} "
+                 "(no libtor_ffi.a) — napstr will be unavailable")
+endif()
 
 # ---- librats shared library (loaded via Dart FFI at runtime) ---------
 set(LIBRATS_DIR "${MC_ROOT}/deps/librats")
