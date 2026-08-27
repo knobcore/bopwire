@@ -37,6 +37,10 @@ dependencies:
 
   # Local database for cache index
   sqflite: ^2.3.0
+  # Desktop (Linux/Windows/macOS) has no platform sqflite implementation;
+  # without this the app throws "databaseFactory not initialized" the
+  # moment anything touches the library DB.
+  sqflite_common_ffi: ^2.3.0
 
   # Cryptographic utilities
   crypto: ^3.0.3

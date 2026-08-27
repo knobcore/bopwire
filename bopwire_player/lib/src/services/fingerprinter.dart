@@ -118,10 +118,22 @@ class Fingerprinter {
       sampleRate   = sr;
       channelCount = cc;
     } else if (Platform.isWindows) {
-      final d = MediaFoundationDecoder.instance.decode(path);
-      pcm          = d.pcm;
-      sampleRate   = d.sampleRate;
-      channelCount = d.channelCount;
+      // Prefer MediaFoundation, but do NOT let a missing mc_decoder.dll
+      // kill the scan: that DLL is not currently among the shipped
+      // player DLLs, and an unhandled failure here is the same bug that
+      // made Linux unable to fingerprint anything. mc_decode_any is
+      // compiled into bopwire.dll, so it is always available as a
+      // fallback.
+      DecodedAudio? viaNative;
+      DecodedPcm?   viaMf;
+      try {
+        viaMf = MediaFoundationDecoder.instance.decode(path);
+      } catch (_) {
+        viaNative = NativeDecoder.instance.decodeFile(path);
+      }
+      pcm          = viaMf?.pcm          ?? viaNative!.pcm;
+      sampleRate   = viaMf?.sampleRate   ?? viaNative!.sampleRate;
+      channelCount = viaMf?.channelCount ?? viaNative!.channelCount;
     } else if (NativeDecoder.supported) {
       // Linux / macOS: decode with the FFmpeg-backed decoder already
       // compiled into libbopwire.so (bopwire.h mc_decoder_*). This branch

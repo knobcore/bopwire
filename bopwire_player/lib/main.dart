@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 // AppExitResponse lives in dart:ui, not package:flutter/services.
 import 'dart:ui' show AppExitResponse;
 import 'package:media_kit/media_kit.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:provider/provider.dart';
 
 import 'src/ffi/native_library.dart';
@@ -170,6 +171,20 @@ void main() async {
     } catch (e) {
       // ignore: avoid_print
       print('[bgscan] init failed: $e');
+    }
+  }
+
+  // Desktop has no platform sqflite implementation, so the factory must
+  // be installed before ANYTHING touches the library DB — otherwise every
+  // access throws "Bad state: databaseFactory not initialized", which is
+  // what the AppImage was doing on every scan.
+  if (Platform.isLinux || Platform.isWindows || Platform.isMacOS) {
+    try {
+      sqfliteFfiInit();
+      databaseFactory = databaseFactoryFfi;
+    } catch (e) {
+      // ignore: avoid_print
+      print('[db] sqflite ffi init failed: $e');
     }
   }
 

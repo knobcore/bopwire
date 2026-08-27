@@ -16,6 +16,8 @@
 //   chromaprint_free                 → free the context
 
 import 'dart:ffi';
+
+import 'native_library.dart';
 import 'dart:io';
 
 import 'package:ffi/ffi.dart';
@@ -71,8 +73,21 @@ class ChromaprintBindings {
   static DynamicLibrary _loadLibrary() {
     if (Platform.isAndroid) return DynamicLibrary.open('libchromaprint.so');
     if (Platform.isWindows) return DynamicLibrary.open('chromaprint.dll');
-    if (Platform.isLinux)   return DynamicLibrary.open('libchromaprint.so');
-    if (Platform.isMacOS)   return DynamicLibrary.open('libchromaprint.dylib');
+    // Linux/macOS: chromaprint is built STATIC and linked into
+    // libbopwire.so (verify with `nm -D` — chromaprint_feed et al are
+    // exported from it), so there is no standalone libchromaprint.so to
+    // open. Trying to was why every fingerprint failed on the AppImage
+    // with "cannot open shared object file", which meant nothing could
+    // be chain-registered even after audio decode started working.
+    if (Platform.isLinux || Platform.isMacOS) {
+      try {
+        return NativeLibrary.lib;
+      } catch (_) {
+        // Fall back to a standalone build if someone ships one.
+        return DynamicLibrary.open(
+            Platform.isMacOS ? 'libchromaprint.dylib' : 'libchromaprint.so');
+      }
+    }
     throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
   }
 }

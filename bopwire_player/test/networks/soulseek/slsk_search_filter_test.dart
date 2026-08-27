@@ -1,8 +1,11 @@
-// Search results from peers who cannot serve immediately are dropped at
-// the source: a peer with no free upload slot (or a non-empty queue)
-// would just queue our request, and the user asked for those rows to
-// never appear at all. The UI layer knows nothing about slot state, so
-// the filtering must happen here, in the network's search stream.
+// Search results from peers who cannot serve are dropped at the source:
+// a peer with no free upload slot, or one behind a queue deeper than
+// kMaxAcceptableQueue, would keep our request waiting indefinitely, and
+// the user asked for those rows to never appear at all. A SHALLOW queue is
+// accepted — live measurement showed a non-empty queue is the normal state
+// on Soulseek, and the old strict rule (any queue > 0) hid ~99% of
+// results. The UI layer knows nothing about slot state, so the filtering
+// must happen here, in the network's search stream.
 
 import 'dart:io';
 
@@ -130,7 +133,7 @@ void main() {
         ),
         'no-slot');
 
-    // Free slot but a non-empty queue -> contradictory report, dropped.
+    // Free slot, shallow queue -> shown (queues are normal on Soulseek).
     final busy2 = await deliverResponse(
         server.waitPort!,
         FileSearchResponse(
@@ -141,6 +144,18 @@ void main() {
           queueLength: 12,
         ),
         'queued-up');
+
+    // Free slot but a queue deeper than kMaxAcceptableQueue -> dropped.
+    final busy3 = await deliverResponse(
+        server.waitPort!,
+        FileSearchResponse(
+          username: 'deep-queue',
+          token: token,
+          files: [song('Longest Line')],
+          freeUploadSlots: true,
+          queueLength: kMaxAcceptableQueue + 1,
+        ),
+        'deep-queue');
 
     // Free slot, empty queue -> shown.
     final free = await deliverResponse(
@@ -160,16 +175,17 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 300));
 
     final owners = tracks.map((t) => t.owner).toSet();
-    expect(owners, {'servable'},
-        reason: 'only the peer with a free slot and an empty queue may '
-            'appear, got: $owners');
-    // Both files, plus the folder row the network synthesises for a
-    // multi-file directory.
-    expect(tracks.where((t) => !t.isFolder).length, 2);
+    expect(owners, {'servable', 'queued-up'},
+        reason: 'peers with a free slot and an acceptable queue may appear; '
+            'no-slot and deep-queue peers may not, got: $owners');
+    // servable's two files + queued-up's one; the folder row the network
+    // synthesises for a multi-file directory is excluded by isFolder.
+    expect(tracks.where((t) => !t.isFolder).length, 3);
 
     await sub.cancel();
     busy1.destroy();
     busy2.destroy();
+    busy3.destroy();
     free.destroy();
     await net.dispose();
     await server.close();

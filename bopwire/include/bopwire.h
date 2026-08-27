@@ -268,6 +268,38 @@ BOPWIRE_API int mc_validate_audio(const uint8_t* data, size_t len, char** error_
 /** Get duration in ms from any supported audio file. Returns 0 on error. */
 BOPWIRE_API uint32_t mc_audio_duration_ms(const uint8_t* data, size_t len);
 
+// ---- NAT port mapping (UPnP IGD / NAT-PMP) --------------------------
+//
+// Asks the LAN gateway to forward an external TCP port to a local one so
+// that inbound peer connections (e.g. the Soulseek listen port announced
+// via SetWaitPort) can reach this host from the internet even behind NAT.
+// Both backends (UPnP IGD and NAT-PMP, from deps/librats) are tried in
+// parallel; whichever the router supports wins.
+
+/** Map local TCP `port` on the gateway and keep the lease refreshed until
+ *  mc_portmap_close_tcp(port) is called.
+ *
+ *  Blocks the calling thread up to `timeout_ms` (<= 0 means a default of
+ *  8000 ms) waiting for a mapping to be confirmed.
+ *
+ *  On success returns the EXTERNAL port the router assigned (usually equal
+ *  to `port`, but the router may pick another) and, if `out_ip` is
+ *  non-NULL, writes the discovered public IPv4 address as a null-terminated
+ *  string into out_ip[out_ip_len] (empty string when the gateway did not
+ *  report one). Mappings whose reported external IP is itself private
+ *  (double NAT) are rejected — they would not make us reachable.
+ *
+ *  Returns 0 on failure (no UPnP/NAT-PMP gateway answered, or double NAT);
+ *  see mc_last_error() for the reason. Calling again for a port that is
+ *  already mapped returns the existing mapping. */
+BOPWIRE_API uint16_t mc_portmap_open_tcp(uint16_t port, int timeout_ms,
+                                         char* out_ip, size_t out_ip_len);
+
+/** Remove the mapping for local TCP `port` (best-effort DeletePortMapping
+ *  on the gateway) and stop refreshing its lease. Safe to call for a port
+ *  that was never mapped. */
+BOPWIRE_API void mc_portmap_close_tcp(uint16_t port);
+
 /** Legacy aliases (Ogg only) — kept for backwards compatibility. */
 static inline int mc_validate_ogg(const uint8_t* data, size_t len, char** error_out) {
     return mc_validate_audio(data, len, error_out);

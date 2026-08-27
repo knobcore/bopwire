@@ -16,9 +16,20 @@
 #include "../core/block.h"
 #include "../util/hw_fingerprint.h"
 
+// librats NAT traversal backends for mc_portmap_* (UPnP IGD + NAT-PMP).
+// Headers are pulled in by explicit relative path so they can never be
+// shadowed by src/network/upnp.h; the symbols come from the `rats` shared
+// library that libbopwire already links (MC_LINK_LIBS).
+#include "../../deps/librats/src/upnp.h"
+#include "../../deps/librats/src/natpmp.h"
+#include "../../deps/librats/src/network_utils.h"
+
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <string>
 #include <memory>
 #include <utility>
@@ -395,4 +406,148 @@ int mc_validate_audio(const uint8_t* data, size_t len, char** error_out) {
 uint32_t mc_audio_duration_ms(const uint8_t* data, size_t len) {
     auto result = mc::audio::validate_audio(data, len);
     return result.valid ? result.info.duration_ms : 0;
+}
+
+// ---- NAT port mapping (UPnP IGD / NAT-PMP) --------------------------
+//
+// Thin synchronous facade over librats' UpnpClient + NatPmpClient. Both
+// backends run in parallel; the first confirmed TCP mapping with a public
+// (or unreported) external IP wins. The backends stay alive after
+// mc_portmap_open_tcp returns so they keep the lease refreshed; they are
+// only torn down (which also sends the best-effort delete to the gateway)
+// by mc_portmap_close_tcp.
+
+namespace {
+
+struct PortMapSession {
+    std::unique_ptr<librats::UpnpClient>   upnp;
+    std::unique_ptr<librats::NatPmpClient> natpmp;
+
+    std::mutex              m;
+    std::condition_variable cv;
+    bool        have_result   = false;
+    uint16_t    external_port = 0;
+    std::string external_ip;
+    std::string last_error;   // most recent failure reason from a backend
+    bool        saw_double_nat = false;
+};
+
+// Heap-allocated and deliberately never freed: destroying UpnpClient /
+// NatPmpClient joins their worker threads, and doing that from a static
+// destructor during process exit can deadlock. The player releases
+// mappings explicitly via mc_portmap_close_tcp.
+std::mutex g_portmap_mutex;
+auto* g_portmap_sessions =
+    new std::map<uint16_t, std::shared_ptr<PortMapSession>>();
+
+} // namespace
+
+uint16_t mc_portmap_open_tcp(uint16_t port, int timeout_ms,
+                             char* out_ip, size_t out_ip_len) {
+    if (out_ip && out_ip_len) out_ip[0] = '\0';
+    if (port == 0) {
+        set_error("mc_portmap_open_tcp: port must be non-zero");
+        return 0;
+    }
+    if (timeout_ms <= 0) timeout_ms = 8000;
+
+    std::shared_ptr<PortMapSession> sess;
+    {
+        std::lock_guard<std::mutex> lock(g_portmap_mutex);
+        auto it = g_portmap_sessions->find(port);
+        if (it != g_portmap_sessions->end()) {
+            // Already mapped (or still being attempted): reuse the session.
+            sess = it->second;
+        } else {
+            sess = std::make_shared<PortMapSession>();
+            (*g_portmap_sessions)[port] = sess;
+
+            auto on_result = [sess](const librats::PortMapResult& r) {
+                if (r.protocol != librats::PortMapProtocol::TCP) return;
+                std::lock_guard<std::mutex> lk(sess->m);
+                if (!r.success) {
+                    if (!r.error.empty()) sess->last_error = r.error;
+                    return;
+                }
+                // A "successful" mapping on a gateway whose own external IP
+                // is private is a double NAT: the port forward stops at the
+                // inner router and we are still unreachable. Not a result.
+                if (!r.external_ip.empty() &&
+                    !librats::network_utils::is_public_ip(r.external_ip)) {
+                    sess->saw_double_nat = true;
+                    sess->last_error = "gateway is double-NATed (external IP " +
+                                       r.external_ip + " is private)";
+                    return;
+                }
+                if (sess->have_result) return;
+                sess->have_result   = true;
+                sess->external_port = r.external_port;
+                sess->external_ip   = r.external_ip;
+                sess->cv.notify_all();
+            };
+
+            sess->upnp = std::make_unique<librats::UpnpClient>();
+            sess->upnp->set_callback(on_result);
+            sess->upnp->add_mapping(librats::PortMapProtocol::TCP, port,
+                                    /*external_port=*/0, "bopwire");
+            sess->upnp->start();
+
+            sess->natpmp = std::make_unique<librats::NatPmpClient>();
+            sess->natpmp->set_callback(on_result);
+            sess->natpmp->add_mapping(librats::PortMapProtocol::TCP, port);
+            sess->natpmp->start();
+        }
+    }
+
+    // Wait for the first confirmed mapping (or the timeout).
+    std::unique_lock<std::mutex> lk(sess->m);
+    sess->cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                      [&] { return sess->have_result; });
+
+    if (!sess->have_result) {
+        std::string why = sess->saw_double_nat || !sess->last_error.empty()
+            ? sess->last_error
+            : "no UPnP/NAT-PMP gateway answered within " +
+              std::to_string(timeout_ms) + " ms";
+        lk.unlock();
+        // Tear the session down so a later retry starts fresh. stop() joins
+        // the worker threads, which may briefly block on the delete request.
+        std::shared_ptr<PortMapSession> doomed;
+        {
+            std::lock_guard<std::mutex> lock(g_portmap_mutex);
+            auto it = g_portmap_sessions->find(port);
+            if (it != g_portmap_sessions->end() && it->second == sess) {
+                doomed = it->second;
+                g_portmap_sessions->erase(it);
+            }
+        }
+        if (doomed) {
+            if (doomed->upnp)   doomed->upnp->stop();
+            if (doomed->natpmp) doomed->natpmp->stop();
+        }
+        set_error("mc_portmap_open_tcp: " + why);
+        return 0;
+    }
+
+    if (out_ip && out_ip_len) {
+        const size_t n = std::min(sess->external_ip.size(), out_ip_len - 1);
+        std::memcpy(out_ip, sess->external_ip.data(), n);
+        out_ip[n] = '\0';
+    }
+    return sess->external_port;
+}
+
+void mc_portmap_close_tcp(uint16_t port) {
+    std::shared_ptr<PortMapSession> sess;
+    {
+        std::lock_guard<std::mutex> lock(g_portmap_mutex);
+        auto it = g_portmap_sessions->find(port);
+        if (it == g_portmap_sessions->end()) return;
+        sess = it->second;
+        g_portmap_sessions->erase(it);
+    }
+    // stop() removes the mapping on the gateway (best-effort) and joins the
+    // backend's worker thread.
+    if (sess->upnp)   sess->upnp->stop();
+    if (sess->natpmp) sess->natpmp->stop();
 }

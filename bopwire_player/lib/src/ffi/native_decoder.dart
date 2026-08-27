@@ -69,10 +69,14 @@ class NativeDecoder {
   final _DecodeDart _decode;
   final _PcmFreeDart _pcmFree;
 
-  /// True where this is the decode path we should use. Android keeps its
-  /// MediaCodec channel (hardware decode, much better on battery) and
-  /// Windows keeps mc_decoder.dll.
-  static bool get supported => Platform.isLinux || Platform.isMacOS;
+  /// True where this decode path is usable. mc_decode_any is compiled
+  /// into the main library on every desktop target (bopwire.dll on
+  /// Windows, libbopwire.so/.dylib elsewhere), so this works anywhere
+  /// that library is loaded. Android is excluded on purpose: its
+  /// MediaCodec channel is hardware-accelerated and much kinder to
+  /// battery.
+  static bool get supported =>
+      Platform.isLinux || Platform.isMacOS || Platform.isWindows;
 
   /// Decode [path] fully to interleaved 16-bit PCM.
   DecodedAudio decodeFile(String path) =>

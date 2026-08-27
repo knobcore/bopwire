@@ -34,6 +34,7 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import '../../../ffi/portmap_bindings.dart';
 import '../external_network.dart';
 import '../network_credentials.dart';
 import 'slsk_codec.dart';
@@ -48,6 +49,11 @@ const String kSoulseekNetworkId = 'slsk';
 const String kSoulseekServerHost = 'server.slsknet.org';
 const List<int> kSoulseekServerPorts = [2242, 2416];
 
+/// Deepest queue we will still show a result for. Soulseek peers almost
+/// always report SOME queue; dropping every one of them hid ~99% of
+/// results in live testing.
+const int kMaxAcceptableQueue = 25;
+
 class SoulseekNetwork implements ExternalNetwork {
   SoulseekNetwork({
     String serverHost = kSoulseekServerHost,
@@ -55,11 +61,19 @@ class SoulseekNetwork implements ExternalNetwork {
     void Function(String)? logger,
     String? usernameOverride,
     String? passwordOverride,
+    Future<PortMapping?> Function(int port)? portMapOpen,
+    Future<void> Function(int port)? portMapClose,
   })  : _serverHost = serverHost,
         _serverPorts = serverPorts,
         _usernameOverride = usernameOverride,
         _passwordOverride = passwordOverride,
+        _portMapOpen = portMapOpen ?? _defaultPortMapOpen,
+        _portMapClose = portMapClose ?? _defaultPortMapClose,
         _log = logger ?? _defaultLog;
+
+  static Future<PortMapping?> _defaultPortMapOpen(int port) =>
+      PortMap.openTcp(port);
+  static Future<void> _defaultPortMapClose(int port) => PortMap.closeTcp(port);
 
   static void _defaultLog(String m) {
     assert(() {
@@ -145,6 +159,80 @@ class SoulseekNetwork implements ExternalNetwork {
 
   String? _username;
   int? _listenPort;
+
+  // --- NAT port mapping (ported behaviour from Nicotine+) ------------------
+  //
+  // Nicotine+ keeps its listen port reachable by asking the router for a
+  // UPnP mapping; without one, two NATed peers can never transfer (neither
+  // side can accept the other's connection, and the ConnectToPeer fallback
+  // has nowhere to land). We do the same via libbopwire's UPnP/NAT-PMP
+  // clients: request a mapping as soon as the listen port binds, announce
+  // the EXTERNAL port to the server (SetWaitPort), release on teardown.
+
+  /// UPnP/NAT-PMP mapper, injectable for tests.
+  final Future<PortMapping?> Function(int port) _portMapOpen;
+  final Future<void> Function(int port) _portMapClose;
+
+  /// Local port a mapping was REQUESTED for (close target), and the external
+  /// port the router confirmed (what we announce via SetWaitPort).
+  int? _portMapRequestedPort;
+  int? _externalPort;
+
+  /// Bumped on every teardown so a mapping that resolves late (after a
+  /// reconnect or shutdown) cannot announce a stale port.
+  int _portMapGeneration = 0;
+
+  /// In-flight mapping attempt; tests await it via [debugPortMapAttempt].
+  Future<void>? _portMapAttempt;
+
+  /// Test-only: completes when the current mapping attempt has finished
+  /// (successfully or not) and any re-announce has been sent.
+  Future<void>? get debugPortMapAttempt => _portMapAttempt;
+
+  void _startPortMapping(int localPort) {
+    _portMapRequestedPort = localPort;
+    final generation = _portMapGeneration;
+    _portMapAttempt = () async {
+      PortMapping? mapping;
+      try {
+        mapping = await _portMapOpen(localPort);
+      } catch (e) {
+        _log('port mapping error: $e');
+        mapping = null;
+      }
+      if (generation != _portMapGeneration) {
+        // Torn down while we were waiting. _teardown already sent a close,
+        // but if the native session registered only after that close ran,
+        // it would leak — release it again now (idempotent).
+        try {
+          await _portMapClose(localPort);
+        } catch (_) {}
+        return;
+      }
+      if (mapping == null) {
+        _log('no UPnP/NAT-PMP mapping; port $localPort is not reachable '
+            'from the internet, so only directly-reachable peers can '
+            'serve you');
+        return;
+      }
+      _externalPort = mapping.externalPort;
+      final where =
+          mapping.externalIp.isEmpty ? 'external' : mapping.externalIp;
+      _log('port mapping up: local $localPort reachable at '
+          '$where:${mapping.externalPort}');
+      // The login-time SetWaitPort may have announced the (unreachable)
+      // internal port, or may not have happened yet. Announce the external
+      // port now; re-sending SetWaitPort is idempotent and is exactly what
+      // Nicotine+ does when its port changes.
+      final server = _server;
+      if (server != null && server.isConnected) {
+        server.send(
+            ServerCode.setWaitPort, SlskOut.setWaitPort(mapping.externalPort));
+        _log('announced mapped listen port ${mapping.externalPort} '
+            'to the server');
+      }
+    }();
+  }
 
   final Random _rng = Random.secure();
   late int _token = _rng.nextInt(0x3FFFFFFF) + 1;
@@ -265,6 +353,9 @@ class SoulseekNetwork implements ExternalNetwork {
     _listenPort = await listener.bind();
     _listener = listener;
     _listenSub = listener.incoming.listen(_onIncomingPeer);
+    // Start the UPnP/NAT-PMP mapping in parallel with the login: it takes
+    // seconds, and when it lands we (re-)announce the external port.
+    if (_listenPort != null) _startPortMapping(_listenPort!);
 
     final waiter = _loginWaiter = Completer<LoginResponse>();
     server.send(ServerCode.login, SlskOut.login(user, pass));
@@ -288,22 +379,34 @@ class SoulseekNetwork implements ExternalNetwork {
     }
 
     // Post-login housekeeping, in the order Nicotine+ sends it.
-    server.send(ServerCode.setWaitPort, SlskOut.setWaitPort(_listenPort ?? 0));
+    // Announce the EXTERNAL port when the router mapping already landed;
+    // otherwise the internal one for now (the mapping attempt re-announces
+    // when it completes). Announcing an unreachable internal port forever
+    // was the bug that made NAT-to-NAT transfers impossible.
+    server.send(ServerCode.setWaitPort,
+        SlskOut.setWaitPort(_externalPort ?? _listenPort ?? 0));
     server.send(ServerCode.setStatus, SlskOut.setStatus(2)); // online
     // Announce our one shared folder. Announcing 0/0 made every peer that
     // refuses non-sharers reject our downloads before they started
     // (UploadDenied "Banned"). See slsk_share.dart: we share a single
     // explanatory text file, NOT the user's library.
+    // The announce resolves asynchronously; the connection may be gone by
+    // then (fast disconnect), so it must not throw into the void.
+    void announceShare(int folders, int files) {
+      if (!server.isConnected) return;
+      try {
+        server.send(ServerCode.sharedFoldersFiles,
+            SlskOut.sharedFoldersFiles(folders, files));
+      } catch (_) {}
+    }
+
     unawaited(SlskShare.instance.ensureReady().then((_) {
-      server.send(
-          ServerCode.sharedFoldersFiles,
-          SlskOut.sharedFoldersFiles(
-              SlskShare.instance.folderCount, SlskShare.instance.fileCount));
+      announceShare(
+          SlskShare.instance.folderCount, SlskShare.instance.fileCount);
     }).catchError((Object _) {
       // Could not create the share file — fall back to honest zeros
       // rather than claiming a share we cannot serve.
-      server.send(
-          ServerCode.sharedFoldersFiles, SlskOut.sharedFoldersFiles(0, 0));
+      announceShare(0, 0);
     }));
     // We do not participate in the distributed search overlay — we only issue
     // our own searches — so we declare ourselves a childless branch root.
@@ -374,6 +477,23 @@ class SoulseekNetwork implements ExternalNetwork {
     await _server?.close();
     _server = null;
     _listenPort = null;
+
+    // Release the router mapping (best-effort; the C side also refuses to
+    // hold mappings for ports nobody asked about). Invalidate any pending
+    // attempt first so a late success cannot announce a stale port.
+    _portMapGeneration++;
+    _externalPort = null;
+    final mappedPort = _portMapRequestedPort;
+    _portMapRequestedPort = null;
+    _portMapAttempt = null;
+    if (mappedPort != null) {
+      try {
+        await _portMapClose(mappedPort)
+            .timeout(const Duration(seconds: 5), onTimeout: () {});
+      } catch (e) {
+        _log('port mapping release failed: $e');
+      }
+    }
 
     if (!keepStatus) _setStatus(NetworkStatus.disconnected);
   }
@@ -561,7 +681,20 @@ class SoulseekNetwork implements ExternalNetwork {
             // here (not dimming in the UI) is deliberate: a row that
             // sits queued when tapped is a row the user should never
             // have seen. The UI layer knows nothing about slot state.
-            if (!resp.freeUploadSlots || resp.queueLength > 0) {
+            // Rule relaxed after live measurement. The stricter form
+            // (!freeUploadSlots || queueLength > 0) dropped 6 of 7 peers
+            // and 1448 of ~1450 files on a real "nofx" search, leaving
+            // nothing downloadable — on Soulseek a non-empty queue is the
+            // normal state, not a red flag, so queueLength alone is not
+            // evidence a peer won't serve you.
+            //
+            // What we still drop is the peer that has told us outright it
+            // has no free slot, plus anyone sitting behind a queue deep
+            // enough that tapping the row means waiting a long time. The
+            // threshold is a judgement call; it is here as a named
+            // constant so it can be tuned against real searches.
+            if (!resp.freeUploadSlots ||
+                resp.queueLength > kMaxAcceptableQueue) {
               search.dropBusy(resp);
             } else {
               search.add(resp);

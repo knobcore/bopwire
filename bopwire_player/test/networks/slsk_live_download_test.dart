@@ -18,6 +18,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:bopwire_player/src/ffi/portmap_bindings.dart';
 import 'package:bopwire_player/src/services/networks/external_network.dart';
 import 'package:bopwire_player/src/services/networks/soulseek/slsk_share.dart';
 import 'package:bopwire_player/src/services/networks/soulseek/soulseek_network.dart';
@@ -28,6 +29,16 @@ void main() {
   test('soulseek: search "nofx" then download real files', () async {
     final user = Platform.environment['SLSK_USER'] ?? 'knobcore';
     final pass = Platform.environment['SLSK_PASS'];
+
+    // flutter test has no bundled libbopwire.so on the loader path, so point
+    // the UPnP/NAT-PMP mapper at a real one (BOPWIRE_LIB overrides). If the
+    // library predates the mc_portmap_* exports the client just logs the
+    // honest "no mapping" line and continues.
+    final portmapLib = Platform.environment['BOPWIRE_LIB'] ??
+        '/home/lain/blockchain/bopwire/build-linux-x64/Release/libbopwire.so';
+    if (File(portmapLib).existsSync()) {
+      PortMap.libraryPathOverride = portmapLib;
+    }
     if (pass == null || pass.isEmpty) {
       markTestSkipped(
           'Set SLSK_USER and SLSK_PASS to run the live Soulseek test. '
