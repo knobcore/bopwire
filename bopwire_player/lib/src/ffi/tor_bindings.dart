@@ -27,6 +27,8 @@ typedef _StopNative = Void Function();
 typedef _StopDart   = void Function();
 typedef _ErrNative = Pointer<Utf8> Function();
 typedef _ErrDart   = Pointer<Utf8> Function();
+typedef _SetDirNative = Int32 Function(Pointer<Utf8>);
+typedef _SetDirDart   = int Function(Pointer<Utf8>);
 
 class TorBindings {
   TorBindings._(this._start, this._status, this._stop, this._lastError);
@@ -71,6 +73,44 @@ class TorBindings {
   /// Returns as soon as the port is bound; bootstrapping the Tor directory
   /// continues in the background, so poll [state] before expecting a
   /// download to succeed.
+  /// Point Arti at a writable directory for its state + cache, before
+  /// [start].
+  ///
+  /// TorClientConfig's defaults resolve from platform conventions, which
+  /// on ANDROID expand to paths outside the app sandbox that the process
+  /// cannot create — bootstrap then fails and no proxy ever appears,
+  /// which surfaced as "napstr downloads run over Tor... set the Tor
+  /// SOCKS5 proxy field". Desktop is unaffected and does not need this.
+  ///
+  /// Looked up separately from the rest so a library built before this
+  /// existed still loads: the symbol is simply absent and this no-ops.
+  void setStateDir(String path) {
+    final lib = _libOrNull;
+    if (lib == null) return;
+    final _SetDirDart fn;
+    try {
+      fn = lib
+          .lookup<NativeFunction<_SetDirNative>>('tor_ffi_set_state_dir')
+          .asFunction<_SetDirDart>();
+    } catch (_) {
+      return; // older library without the setter
+    }
+    final p = path.toNativeUtf8();
+    try {
+      fn(p);
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  static DynamicLibrary? get _libOrNull {
+    try {
+      return NativeLibrary.lib;
+    } catch (_) {
+      return null;
+    }
+  }
+
   int? start({int port = 0}) {
     final rc = _start(port);
     if (rc <= 0) return null;

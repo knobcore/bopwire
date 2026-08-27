@@ -74,10 +74,33 @@ class NetworkRegistry extends ChangeNotifier {
 
     // Connecting is best-effort: a failure surfaces through the
     // network's own status stream, which we're already listening to.
-    if (value && n.isConfigured && n.status == NetworkStatus.disconnected) {
-      unawaited(n.connect().catchError((_) {}));
+    //
+    // This used to require status == disconnected exactly, which meant a
+    // network sitting in `error` after a failed attempt ignored the
+    // switch entirely — the user had to toggle OFF (forcing it back to
+    // disconnected) and ON again before anything happened. That is the
+    // "flip it a few times before it works" behaviour. Retrying from
+    // `error` is the whole point of flipping it on again, so the guard
+    // now only skips work that is already done or already underway.
+    //
+    // Future.sync + catchError, rather than n.connect().catchError:
+    // catchError only handles errors the returned Future carries. A
+    // network whose connect() throws SYNCHRONOUSLY (before its first
+    // await) escapes that entirely and takes down the app, which matches
+    // the reported crash when toggling a half-connected network.
+    if (value &&
+        n.isConfigured &&
+        n.status != NetworkStatus.connected &&
+        n.status != NetworkStatus.connecting) {
+      unawaited(Future.sync(n.connect).catchError((Object e) {
+        // ignore: avoid_print
+        print('[networks] ${n.id} connect failed: $e');
+      }));
     } else if (!value && n.status != NetworkStatus.disconnected) {
-      unawaited(n.disconnect().catchError((_) {}));
+      unawaited(Future.sync(n.disconnect).catchError((Object e) {
+        // ignore: avoid_print
+        print('[networks] ${n.id} disconnect failed: $e');
+      }));
     }
   }
 
@@ -89,7 +112,11 @@ class NetworkRegistry extends ChangeNotifier {
     await NetworkCredentials.instance.load(n.id, n.credentialFields);
     notifyListeners();
     if (n.enabled && n.isConfigured) {
-      unawaited(n.connect().catchError((_) {}));
+      // Same synchronous-throw hazard as setEnabled above.
+      unawaited(Future.sync(n.connect).catchError((Object e) {
+        // ignore: avoid_print
+        print('[networks] ${n.id} reconnect failed: $e');
+      }));
     }
   }
 

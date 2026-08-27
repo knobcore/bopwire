@@ -26,6 +26,8 @@
 
 import 'dart:async';
 
+import 'package:path_provider/path_provider.dart';
+
 import '../../../ffi/tor_bindings.dart';
 import 'socks5.dart';
 
@@ -135,6 +137,24 @@ class TorService {
         '(it listens on 127.0.0.1:9050) or set a SOCKS proxy in '
         'Settings → Other networks.',
       ));
+    }
+
+    // Arti needs a writable place for its directory cache and state.
+    // Its defaults resolve from platform conventions, which on Android
+    // point outside the app sandbox — bootstrap then fails and no proxy
+    // ever appears, which is what produced "napstr downloads run over
+    // Tor... set the Tor SOCKS5 proxy field" on the APK. Handing it the
+    // app-private support directory fixes that; on desktop this is
+    // equally valid and keeps Tor's files with the app's own data.
+    try {
+      final dir = await getApplicationSupportDirectory();
+      tor.setStateDir('${dir.path}/tor');
+    } catch (e) {
+      // Non-fatal: without this Arti falls back to its platform default,
+      // which is correct on desktop and only fails on Android — where the
+      // error below will say so rather than this silently mattering.
+      // ignore: avoid_print
+      print('[tor] could not set state dir: $e');
     }
 
     // Port 0: let the OS choose, so we never collide with a system tor.

@@ -15,3 +15,14 @@ ar     = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linu
 [target.armv7-linux-androideabi]
 linker = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang"
 ar     = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+
+# ring and libsqlite3-sys compile C code via the `cc` crate, which does NOT
+# read the [target] linker above — it looks for CC_<target>/AR_<target>.
+# Without these, both fail their build scripts ("failed to run custom build
+# command") and the Android build cannot complete. Pinning them here keeps
+# the cross-compile reproducible instead of depending on the caller's shell.
+[env]
+CC_aarch64-linux-android = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+AR_aarch64-linux-android = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+CC_armv7-linux-androideabi = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang"
+AR_armv7-linux-androideabi = "/home/lain/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"

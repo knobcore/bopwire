@@ -31,6 +31,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use arti_client::config::TorClientConfigBuilder;
 use arti_client::{TorClient, TorClientConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -49,6 +50,9 @@ const ERR_BIND: i32 = -3;
 static STATUS: AtomicI32 = AtomicI32::new(TOR_STOPPED);
 static LAST_ERROR: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
 static STATE: OnceLock<Mutex<Option<State>>> = OnceLock::new();
+/// Caller-supplied base directory for Arti's state + cache. See
+/// tor_ffi_set_state_dir.
+static STATE_DIR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 struct State {
     runtime: Runtime,
@@ -67,6 +71,50 @@ fn set_error(msg: impl Into<String>) {
     let s = msg.into();
     if let Ok(mut slot) = errors().lock() {
         *slot = CString::new(s).ok();
+    }
+}
+
+fn state_dir() -> &'static Mutex<Option<String>> {
+    STATE_DIR.get_or_init(|| Mutex::new(None))
+}
+
+/// Tell Arti where to keep its state and cache, before calling
+/// tor_ffi_start.
+///
+/// Why this is necessary: TorClientConfig::default() resolves its
+/// directories from platform conventions (${ARTI_LOCAL_DATA} /
+/// ${ARTI_CACHE}). That works on desktop, but on ANDROID those expand to
+/// paths outside the app sandbox that the process cannot create or write,
+/// so create_bootstrapped fails and the client never produces a usable
+/// proxy — which surfaced to users as "napstr downloads run over Tor...
+/// set the Tor SOCKS5 proxy field", because the endpoint came back null.
+///
+/// Callers on Android pass their app-private directory. Passing NULL (or
+/// never calling this) keeps the platform defaults, so desktop behaviour
+/// is unchanged.
+///
+/// Returns 0 on success, negative on bad input.
+#[no_mangle]
+pub extern "C" fn tor_ffi_set_state_dir(path: *const c_char) -> c_int {
+    let value = if path.is_null() {
+        None
+    } else {
+        // SAFETY: caller contract is a NUL-terminated C string.
+        match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+            Ok(s) if !s.is_empty() => Some(s.to_owned()),
+            Ok(_) => None,
+            Err(_) => {
+                set_error("state dir is not valid UTF-8");
+                return -1;
+            }
+        }
+    };
+    match state_dir().lock() {
+        Ok(mut slot) => {
+            *slot = value;
+            0
+        }
+        Err(_) => -1,
     }
 }
 
@@ -131,7 +179,32 @@ pub extern "C" fn tor_ffi_start(port: u16) -> c_int {
     STATUS.store(TOR_BOOTSTRAPPING, Ordering::SeqCst);
 
     runtime.spawn(async move {
-        let config = TorClientConfig::default();
+        // Honour a caller-supplied directory (Android must supply one —
+        // see tor_ffi_set_state_dir). Fall back to platform defaults when
+        // none was set, which is the desktop path and unchanged.
+        let dir = state_dir().lock().ok().and_then(|d| d.clone());
+        let config = match dir {
+            Some(base) => {
+                let state = format!("{base}/arti-state");
+                let cache = format!("{base}/arti-cache");
+                if let Err(e) = std::fs::create_dir_all(&state)
+                    .and_then(|_| std::fs::create_dir_all(&cache))
+                {
+                    set_error(format!("tor state dir {base}: {e}"));
+                    STATUS.store(TOR_ERROR, Ordering::SeqCst);
+                    return;
+                }
+                match TorClientConfigBuilder::from_directories(&state, &cache).build() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        set_error(format!("tor config: {e}"));
+                        STATUS.store(TOR_ERROR, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            }
+            None => TorClientConfig::default(),
+        };
         let client = match TorClient::create_bootstrapped(config).await {
             Ok(c) => c,
             Err(e) => {
