@@ -144,24 +144,51 @@ bool check_play(const PlayProof& proof, const Database& db, std::string& error) 
         error = "insufficient heartbeat count";
         return false;
     }
-    // Serving-node signature over the proof, verified against the "v:" registry.
-    // node_entry format: 33-byte pubkey + endpoint.
-    auto node_entry = db.get("v:" + db.hex(proof.serving_node_id));
-    if (!node_entry) {
-        error = "serving node not registered";
+    // ---- v3 three-party co-signature (NO founder v: grant) -------------------
+    // The serving-node pubkey travels IN the proof; the identity is bound by
+    // serving_node_id == sha256(pubkey). Any node can attest a play — forgery is
+    // prevented by the LISTENER + MINI co-signatures, not by a founder whitelist.
+    if (proof.version < 3) {
+        error = "legacy proof: founder v: grant retired, v3 co-signed proof required";
         return false;
     }
-    if (node_entry->size() < 33) {
-        error = "invalid validator entry";
+    Hash256 derived_node_id = crypto::sha256(proof.serving_node_pubkey.data(), 33);
+    if (std::memcmp(derived_node_id.data(), proof.serving_node_id.data(), 32) != 0) {
+        error = "serving_node_id != sha256(serving_node_pubkey)";
         return false;
     }
-    PubKey33 pubkey;
-    std::copy(node_entry->begin(), node_entry->begin() + 33, pubkey.begin());
     auto sign_msg = proof.sign_message();
     auto hash     = crypto::sha256(sign_msg.data(), sign_msg.size());
-    if (!crypto::verify_ecdsa(hash, proof.node_signature, pubkey)) {
+    if (!crypto::verify_ecdsa(hash, proof.node_signature, proof.serving_node_pubkey)) {
         error = "invalid node signature";
         return false;
+    }
+
+    // Listener co-signature — the EARNER authorizes the mint, so a serving node
+    // can't fabricate a play (it lacks the player key). Verified whenever a
+    // player_pubkey is carried; becomes mandatory once clients sign (Stage 2).
+    static const PubKey33 kZeroPubkey{};
+    if (std::memcmp(proof.player_pubkey.data(), kZeroPubkey.data(), 33) != 0) {
+        if (crypto::address_from_pubkey(proof.player_pubkey) != proof.player_address) {
+            error = "player_pubkey does not match player_address";
+            return false;
+        }
+        if (!crypto::verify_ecdsa(hash, proof.player_signature, proof.player_pubkey)) {
+            error = "invalid listener signature";
+            return false;
+        }
+    }
+    // Mini-node co-signature — the RELAY attests it carried the stream. Every
+    // earning play travels through a mini, so this is mandatory once minis sign.
+    if (std::memcmp(proof.mini_node_pubkey.data(), kZeroPubkey.data(), 33) != 0) {
+        if (crypto::address_from_pubkey(proof.mini_node_pubkey) != proof.mini_node_address) {
+            error = "mini_node_pubkey does not match mini_node_address";
+            return false;
+        }
+        if (!crypto::verify_ecdsa(hash, proof.mini_node_signature, proof.mini_node_pubkey)) {
+            error = "invalid mini-node signature";
+            return false;
+        }
     }
     return true;
 }
@@ -169,17 +196,12 @@ bool check_play(const PlayProof& proof, const Database& db, std::string& error) 
 bool recompute_mint(const PlayProof& proof, const Database& db,
                     std::vector<MintOutput>& outputs, uint64_t& burn,
                     std::string& error) {
-    // Serving-node wallet is BOUND to the registered pubkey (H6): the node that
+    // Serving-node wallet is BOUND to the pubkey carried in the proof (v3),
+    // whose sha256 == serving_node_id (checked in check_play): the node that
     // signed the proof is the node that earns the node lane — a mint can't
-    // redirect the node reward to an arbitrary address.
-    auto node_entry = db.get("v:" + db.hex(proof.serving_node_id));
-    if (!node_entry || node_entry->size() < 33) {
-        error = "serving node not registered";
-        return false;
-    }
-    PubKey33 pubkey;
-    std::copy(node_entry->begin(), node_entry->begin() + 33, pubkey.begin());
-    const Address serving_node_address = crypto::address_from_pubkey(pubkey);
+    // redirect the node reward to an arbitrary address. No v: registry lookup.
+    const Address serving_node_address =
+        crypto::address_from_pubkey(proof.serving_node_pubkey);
 
     // Authoritative SongSection from the block store (artist_address +
     // royalty_splits). SongMeta/sm: does not carry these, so we read the block.

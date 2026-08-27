@@ -1121,7 +1121,13 @@ std::pair<int, std::string> HttpServer::post_session_complete(
     } catch (...) { /* no body / not JSON -> use session.start values */ }
     proof.seeder_address    = seeder_addr;
     proof.mini_node_address = mini_addr;
-    proof.version           = 2;
+    // v3: carry the serving-node pubkey so any validator verifies the node
+    // signature WITHOUT the founder v: registry (serving_node_id ==
+    // sha256(pubkey)). The listener + mini co-signatures (player_*/mini_*) fill
+    // in once those parties sign (Stage 2); until then they stay zero and
+    // validate_mint skips them, so a node-signed v3 proof still mints.
+    proof.serving_node_pubkey = node_keypair_.public_key;
+    proof.version           = 3;
 
     // Node signs the proof
     auto sign_msg = proof.sign_message();

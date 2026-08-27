@@ -108,7 +108,25 @@ struct PlayProof {
     // node builds a new proof; it is NOT itself serialized.
     Address  seeder_address{};       // peer that served the bytes (v2)
     Address  mini_node_address{};    // relay that carried the stream (v2)
-    uint8_t  version = 1;            // 1=legacy, 2=seeder+mini lanes
+
+    // Proof version 3 — three-party co-signature, so NO single party can forge a
+    // play and the founder validator grant (v:) is gone entirely:
+    //   * serving_node_pubkey: lets ANY node verify node_signature WITHOUT the v:
+    //     registry (serving_node_id == sha256(serving_node_pubkey)).
+    //   * player_*: the LISTENER authorizes the mint (native wallet / web tracking
+    //     wallet). A serving node can't fabricate a play — it lacks the player key.
+    //   * mini_*: the RELAY attests it carried the stream. Every earning play must
+    //     travel through a mini-node, so this signature is always required.
+    // All three sign the SAME sign_message() preimage (the play facts + the three
+    // pubkeys, never the signatures). v1/v2 proofs omit all of these and keep
+    // verifying under their own (shorter) sign_message.
+    PubKey33 serving_node_pubkey{};
+    PubKey33 player_pubkey{};
+    Sig64    player_signature{};
+    PubKey33 mini_node_pubkey{};
+    Sig64    mini_node_signature{};
+
+    uint8_t  version = 1;            // 1=legacy, 2=seeder+mini lanes, 3=+co-sigs
 
     std::vector<uint8_t> serialize() const;
     static bool deserialize(const uint8_t* data, size_t len, PlayProof& out);

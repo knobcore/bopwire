@@ -89,6 +89,15 @@ std::vector<uint8_t> PlayProof::sign_message() const {
         write_bytes(msg, seeder_address.data(), 20);
         write_bytes(msg, mini_node_address.data(), 20);
     }
+    // v3: all three co-signers (node, listener, mini) sign over the SAME preimage
+    // — the play facts above plus the three public identities, but NOT any of the
+    // signatures. Binding the pubkeys in means a mint can't graft one party's
+    // signature onto a different identity.
+    if (version >= 3) {
+        write_bytes(msg, serving_node_pubkey.data(), 33);
+        write_bytes(msg, player_pubkey.data(), 33);
+        write_bytes(msg, mini_node_pubkey.data(), 33);
+    }
     return msg;
 }
 
@@ -110,6 +119,15 @@ std::vector<uint8_t> PlayProof::serialize() const {
     if (version >= 2) {
         write_bytes(buf, seeder_address.data(), 20);
         write_bytes(buf, mini_node_address.data(), 20);
+    }
+    // v3 trailing block (227 bytes): 3x PubKey33 + 2x Sig64. Present only when
+    // version>=3, so v1/v2 proofs serialize byte-identically as before.
+    if (version >= 3) {
+        write_bytes(buf, serving_node_pubkey.data(), 33);
+        write_bytes(buf, player_pubkey.data(), 33);
+        write_bytes(buf, player_signature.data(), 64);
+        write_bytes(buf, mini_node_pubkey.data(), 33);
+        write_bytes(buf, mini_node_signature.data(), 64);
     }
     return buf;
 }
@@ -135,6 +153,16 @@ bool PlayProof::deserialize(const uint8_t* data, size_t len, PlayProof& out) {
         if (!read_bytes(p, end, out.seeder_address.data(), 20)) return false;
         if (!read_bytes(p, end, out.mini_node_address.data(), 20)) return false;
         out.version = 2;
+        // v3: optional 227-byte co-signature block (3x PubKey33 + 2x Sig64).
+        // Absent => stays v2; present => the node/listener/mini co-signed proof.
+        if (p + 227 <= end) {
+            if (!read_bytes(p, end, out.serving_node_pubkey.data(),   33)) return false;
+            if (!read_bytes(p, end, out.player_pubkey.data(),         33)) return false;
+            if (!read_bytes(p, end, out.player_signature.data(),      64)) return false;
+            if (!read_bytes(p, end, out.mini_node_pubkey.data(),      33)) return false;
+            if (!read_bytes(p, end, out.mini_node_signature.data(),   64)) return false;
+            out.version = 3;
+        }
     } else {
         out.version = 1;
     }

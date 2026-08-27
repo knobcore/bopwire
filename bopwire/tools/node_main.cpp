@@ -388,6 +388,26 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     }
     if (wallet_password.empty()) wallet_password = g_wallet_password_cfg;
 
+    // Founder-key migration bridge (keystore -> founder.seed). The validator
+    // self-grant emitter (node_auth_thread) and the relay-reward sweep sign with
+    // the founder key read from <data_dir>/founder.seed. Bootstrap now stores the
+    // founder as a password-protected keystore at <data_dir>/founder-wallet.json
+    // (the "file + password" wallet model) and no longer writes founder.seed, so
+    // without this bridge the node can never issue its own NodeAuthTx, never lands
+    // in v:, and EVERY play's mint is rejected "serving node not registered".
+    // If founder.seed is absent but the keystore is present, derive the seed from
+    // it (same password as the node wallet). Runs on every boot, so it self-heals
+    // after a redeploy that only ships the keystore.
+    {
+        const std::string fseed   = cfg.data_dir + "/founder.seed";
+        const std::string fwallet = cfg.data_dir + "/founder-wallet.json";
+        if (!fs::exists(fseed) && fs::exists(fwallet) && !wallet_password.empty()) {
+            std::cerr << "[wallet] founder.seed absent; deriving from "
+                      << fwallet << "\n";
+            import_wallet_keystore(cfg.data_dir, fwallet, wallet_password);
+        }
+    }
+
     std::cout << "[node] data_dir : " << cfg.data_dir << "\n";
     std::cout << "[node] rats port: " << cfg.rats_port
               << " (TCP — all librats RPC + bulk traffic)\n";
@@ -767,7 +787,14 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         // and only when this node holds the founder.seed that owns the chain
         // founder (a relay/non-founder node never authorizes anyone).
         std::thread node_auth_thread([&db, &cfg, &keypair, &rats_api]() {
-            for (;;) {
+            // v3: the founder validator grant (v:) is RETIRED. A node now
+            // self-attests by carrying serving_node_pubkey in the PlayProof
+            // (serving_node_id == sha256(pubkey)); forgery is stopped by the
+            // listener + mini co-signatures, not a founder whitelist. So this
+            // emitter is disabled — nothing to grant.
+            (void)db; (void)cfg; (void)keypair; (void)rats_api;
+            return;
+            for (;;) {   // unreachable; retained for diff history
                 std::this_thread::sleep_for(std::chrono::seconds(30));
                 if (db.get("va:" + db.hex(cfg.node_id)).has_value()) return;  // on chain
                 auto chain_founder = db.get_founder();
