@@ -205,7 +205,21 @@ class LibraryPublisher {
     } else {
       final wp = WalletProvider.active;
       final info = wp?.info;
-      if (wp == null || info == null) return;
+      if (wp == null || info == null) {
+        // No wallet yet — at boot the wallet gate is still locked, so the
+        // boot-time reAnnounce lands here. This USED to return in silence,
+        // which hid a real bug: presence.hello self-heals (its heartbeat is
+        // a no-op until a wallet loads, then just starts working), but the
+        // library publish had no equivalent retry. So after unlocking, the
+        // wallet went LIVE while its library was never republished, and the
+        // node kept serving whatever snapshot it last received — deleted
+        // songs stayed "online" indefinitely. WalletGate now re-announces on
+        // unlock; this log is here so a silent skip can never hide again.
+        // ignore: avoid_print
+        print('[db2] library.delta skipped — no wallet loaded yet '
+            '(will republish when the wallet unlocks)');
+        return;
+      }
       address = info.address;
       pubkey  = info.publicKey;
       signer  = wp.sign;
@@ -215,7 +229,11 @@ class LibraryPublisher {
     final homePid = dbgRequest != null
         ? 'debug'
         : await NodeService.getRatsPeerId(waitFor: const Duration(seconds: 8));
-    if (homePid.isEmpty) return;
+    if (homePid.isEmpty) {
+      // ignore: avoid_print
+      print('[db2] library.delta skipped — no home node peer id yet');
+      return;
+    }
 
     // version == ts (wall-clock ms): monotonic without a stored counter, and
     // roughly consistent across a user's devices (the later edit wins).

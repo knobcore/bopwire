@@ -9,12 +9,15 @@
 // We do this at the top of the widget tree (above HomeScreen) so the
 // rest of the app can assume there's always a logged-in wallet.
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../services/wallet_service.dart';
 import 'wallet_first_launch_screen.dart';
 import 'wallet_login_screen.dart';
 import 'wallet_unlock_screen.dart';
+import '../services/library_scanner.dart';
 
 enum _GateState { loading, firstLaunch, locked, login, home }
 
@@ -70,6 +73,23 @@ class _WalletGateState extends State<WalletGate> {
       // ignore: avoid_print
       print('[wallet-gate] _state -> home (rebuild scheduled)');
     }
+
+    // Re-announce now that a wallet actually exists.
+    //
+    // Everything that publishes the library — reAnnounce — fires only on VPS
+    // reconnect, auto-node change, or a scan. NONE of those happen when the
+    // user unlocks. The boot-time reAnnounce ran while the gate was still
+    // locked, so its publish bailed for lack of a wallet and nothing retried.
+    // presence.hello has no such gap (its heartbeat is deliberately "a no-op
+    // until a wallet loads"), so after unlocking the wallet went LIVE while
+    // its library was never republished: the full node kept serving the last
+    // snapshot it ever received, and songs deleted in the meantime — or a
+    // library emptied entirely — stayed listed as online forever.
+    //
+    // reAnnounce covers presence AND the library publish, and is idempotent
+    // (digest-gated client-side, version-gated node-side), so firing it here
+    // is safe even when the boot-time one did get through.
+    unawaited(LibraryScanner.instance.reAnnounce());
   }
 
   @override
