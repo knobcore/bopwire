@@ -172,6 +172,41 @@ class NodeClient {
     }
   }
 
+  /// Contribute a cover that was embedded in a local audio file (ID3 APIC /
+  /// FLAC PICTURE / MP4 covr) to the node, so every client sees it and the
+  /// scraper never has to fetch one for this album.
+  ///
+  /// The embedded image beats a scraped one: it shipped with the release, so
+  /// it is correct for that exact pressing, and contributing it costs the
+  /// upstream art sources nothing.
+  ///
+  /// The node is gap-fill only — if it already holds art for the album it
+  /// keeps what it has and reports stored=false. That is a NORMAL outcome,
+  /// not a failure, so this returns false rather than throwing: a library
+  /// import would otherwise log a line per already-covered track.
+  ///
+  /// Returns true only when the node actually stored these bytes.
+  Future<bool> contributeAlbumArt(
+      String artist, String album, Uint8List image) async {
+    if (artist.trim().isEmpty || image.isEmpty) return false;
+    try {
+      final r = await _rpc(
+          'art.put',
+          {
+            'artist': artist,
+            'album': album,
+            'data_b64': base64Encode(image),
+          },
+          timeout: const Duration(seconds: 20));
+      return r is Map && r['stored'] == true;
+    } catch (_) {
+      // Contributing art is best-effort decoration. A node that is offline,
+      // old enough not to know art.put, or simply busy must never affect the
+      // import that triggered this.
+      return false;
+    }
+  }
+
   Future<List<Song>> searchSongs(String query) async =>
       _decodeSongs(await _rpc('songs.search', {'q': query}));
 

@@ -948,6 +948,87 @@ void RatsApi::handle_request(const std::string& peer_id,
                 reply = {{"req_id", req_id}, {"status", "ok"},
                          {"body", {{"found", false}}}};
             }
+        } else if (type == "art.put") {
+            // A client contributing the cover that was embedded in its own
+            // audio file (ID3 APIC / FLAC PICTURE / MP4 covr). That image is
+            // better than anything we could scrape: it shipped with the
+            // release, so it is the right art for that exact pressing, and it
+            // costs the upstream sources nothing. Keying goes through
+            // album_key.h exactly like art.get, so a contributed cover and a
+            // scraped one land on the same key.
+            //
+            // This endpoint is open by design — requiring moderator signing
+            // would defeat the point — so it is deliberately narrow:
+            //
+            //   * gap-fill only. If art already exists for the album we keep
+            //     what we have. First writer wins, which means a contributed
+            //     cover can never overwrite a scraped one (or another user's),
+            //     and the endpoint cannot be used to vandalise existing art.
+            //   * the payload must actually be a JPEG or PNG by magic bytes,
+            //     and be of plausible size. Without this the art keyspace is a
+            //     free blob store for arbitrary data.
+            //   * a moderator-signed request MAY overwrite, so bad art that
+            //     did get in first is fixable through the existing moderation
+            //     path rather than needing a new tool.
+            const std::string artist = in.value("artist", "");
+            const std::string album  = in.value("album", "");
+            const std::string b64    = in.value("data_b64", "");
+
+            // Bounds before decode: refuse an absurd payload without
+            // allocating it. base64 is 4/3 of the raw size.
+            constexpr size_t kMinArtBytes = 512;
+            constexpr size_t kMaxArtBytes = 4ull * 1024 * 1024;
+
+            mc::moderation::Envelope env;
+            const bool moderator = mc::moderation::from_json(in, env) &&
+                                   mc::moderation::verify(env, db_);
+
+            if (artist.empty()) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "artist required"}};
+            } else if (b64.empty() || b64.size() > (kMaxArtBytes / 3) * 4 + 8) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "missing or oversized image"}};
+            } else {
+                const std::vector<uint8_t> img = mc::audio::base64_decode(b64);
+                // JPEG starts FF D8 FF; PNG starts 89 50 4E 47 0D 0A 1A 0A.
+                const bool is_jpeg = img.size() >= 3 && img[0] == 0xFF &&
+                                     img[1] == 0xD8 && img[2] == 0xFF;
+                const bool is_png  = img.size() >= 8 && img[0] == 0x89 &&
+                                     img[1] == 0x50 && img[2] == 0x4E &&
+                                     img[3] == 0x47 && img[4] == 0x0D &&
+                                     img[5] == 0x0A && img[6] == 0x1A &&
+                                     img[7] == 0x0A;
+                const std::string blob_key = mc::art::art_blob_key(artist, album);
+                auto existing = db_.get(blob_key);
+                const bool have_art = existing && !existing->empty();
+
+                if (img.size() < kMinArtBytes || img.size() > kMaxArtBytes) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "image size out of range"}};
+                } else if (!is_jpeg && !is_png) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "image must be JPEG or PNG"}};
+                } else if (have_art && !moderator) {
+                    // Not an error: the caller did nothing wrong, we simply
+                    // already have art. Clients treat this as success so a
+                    // whole library import does not log noise per track.
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {{"stored", false},
+                                       {"reason", "album already has art"}}}};
+                } else if (!db_.put(blob_key, img)) {
+                    reply = {{"req_id", req_id}, {"status", "error"},
+                             {"error", "could not store art"}};
+                } else {
+                    // Drop any miss tombstone so the scraper stops retrying an
+                    // album that is now covered.
+                    db_.del(mc::art::art_status_key(artist, album));
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {{"stored", true},
+                                       {"bytes", static_cast<uint64_t>(img.size())},
+                                       {"replaced", have_art}}}};
+                }
+            }
         } else if (type == "songs.get") {
             const std::string hash = in.value("content_hash", "");
             reply = wrap_handler_result(req_id, http_.verb_song_get(hash));
