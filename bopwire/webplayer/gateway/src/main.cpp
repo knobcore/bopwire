@@ -296,6 +296,15 @@ int main() {
     std::mutex art_mu;
     std::unordered_map<std::string, ArtEnt> art_cache;
 
+    // Lyrics cache. Same shape as the art cache: lyrics for a given
+    // artist+title never change, so a hit is served forever and a miss is
+    // re-checked after a short window (a client may contribute lyrics at any
+    // moment, and we don't want a 404 pinned for the rest of the process).
+    struct LyrEnt { std::string json_body; bool found = false;
+                    std::chrono::steady_clock::time_point at; };
+    std::mutex lyr_mu;
+    std::unordered_map<std::string, LyrEnt> lyr_cache;
+
     // ───────────────────────── HTTP ─────────────────────────
     httplib::Server svr;
 
@@ -471,6 +480,63 @@ int main() {
             res.set_content(jpeg, "image/jpeg");
         } else {
             err(res, 404, "no_art");
+        }
+    });
+
+    // /api/lyrics — time-synced (LRC) + plain lyrics for a song, keyed on
+    // artist+title so any encoding of the track resolves to the same entry.
+    // Off-chain: the node holds these under lyr:, contributed by players that
+    // fetched them, exactly like album art.
+    svr.Get("/api/lyrics", [&](const httplib::Request& req, httplib::Response& res) {
+        const std::string artist = req.get_param_value("artist");
+        const std::string title  = req.get_param_value("title");
+        if (artist.empty() || title.empty()) {
+            err(res, 400, "artist and title required"); return;
+        }
+        const std::string key = artist + std::string(1, '\x1f') + title;
+
+        {   // cache lookup
+            std::lock_guard<std::mutex> lk(lyr_mu);
+            auto it = lyr_cache.find(key);
+            if (it != lyr_cache.end()) {
+                if (it->second.found) {
+                    res.set_header("Cache-Control", "public, max-age=86400");
+                    res.set_content(it->second.json_body, "application/json");
+                    return;
+                }
+                if (std::chrono::steady_clock::now() - it->second.at <
+                    std::chrono::seconds(120)) { err(res, 404, "no_lyrics"); return; }
+            }
+        }
+
+        std::string body_str;
+        bool found = false;
+        try {
+            const std::string node = link.pick_full_node();
+            if (node.empty()) throw std::runtime_error("no_node");
+            json r = link.rpc_via_relay(node, "lyrics.get",
+                                        json{{"artist", artist}, {"title", title}}, 12000);
+            const json body = r.value("body", json::object());
+            if (body.is_object() && body.value("found", false)) {
+                body_str = body.dump();
+                found    = true;
+            }
+        } catch (const std::exception&) {
+            // transient node/relay error — don't negative-cache it.
+            err(res, 404, "no_lyrics");
+            return;
+        }
+
+        {   // bounded cache update
+            std::lock_guard<std::mutex> lk(lyr_mu);
+            if (lyr_cache.size() > 4096) lyr_cache.clear();
+            lyr_cache[key] = LyrEnt{body_str, found, std::chrono::steady_clock::now()};
+        }
+        if (found) {
+            res.set_header("Cache-Control", "public, max-age=86400");
+            res.set_content(body_str, "application/json");
+        } else {
+            err(res, 404, "no_lyrics");
         }
     });
 

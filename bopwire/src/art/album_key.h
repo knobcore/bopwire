@@ -52,4 +52,23 @@ inline std::string art_status_key(const std::string& artist, const std::string& 
     return "arts:" + album_key_hex(artist, album);
 }
 
+// Lyrics keying. Lives here so it shares norm_key with the art keys above —
+// one normalization, no cross-impl drift, exactly the reason album_key_hex is
+// centralised.
+//
+// Keyed on artist+TITLE, not content hash: lyrics belong to the song, not to a
+// particular encoding of it. A FLAC and a 192k MP3 of the same track have
+// different content hashes but identical lyrics, and keying on the hash would
+// re-fetch (and re-store) them per encoding.
+inline std::string lyrics_key_hex(const std::string& artist, const std::string& title) {
+    std::string composite = norm_key(artist);
+    composite.push_back('\x1f');
+    composite += norm_key(title);
+    return crypto::to_hex(crypto::sha256(composite));
+}
+
+inline std::string lyrics_blob_key(const std::string& artist, const std::string& title) {
+    return "lyr:" + lyrics_key_hex(artist, title);
+}
+
 }  // namespace mc::art

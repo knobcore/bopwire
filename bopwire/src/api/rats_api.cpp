@@ -1029,6 +1029,94 @@ void RatsApi::handle_request(const std::string& peer_id,
                                        {"replaced", have_art}}}};
                 }
             }
+        } else if (type == "lyrics.get") {
+            // Time-synced (LRC) + plain lyrics for a song. Keyed on
+            // artist+title via lyrics_key.h, so any encoding of the track
+            // resolves to the same entry. Off-chain by design: lyrics are
+            // kilobytes per song and would bloat SongMeta for every listener,
+            // and they carry a licensing question that titles and fingerprints
+            // do not. A miss returns found=false and the client shows nothing.
+            const std::string artist = in.value("artist", "");
+            const std::string title  = in.value("title", "");
+            if (artist.empty() || title.empty()) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "artist and title required"}};
+            } else if (auto blob = db_.get(mc::art::lyrics_blob_key(artist, title));
+                       blob && !blob->empty()) {
+                json stored = json::parse(
+                    std::string(blob->begin(), blob->end()), nullptr, false);
+                if (stored.is_discarded() || !stored.is_object()) {
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {{"found", false}}}};
+                } else {
+                    stored["found"] = true;
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", std::move(stored)}};
+                }
+            } else {
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {{"found", false}}}};
+            }
+        } else if (type == "lyrics.put") {
+            // A client contributing lyrics it fetched (LRCLIB). Same shape and
+            // same reasoning as art.put: open by design, because ordinary
+            // clients are the contributors, so kept narrow instead.
+            //
+            //   * gap-fill only — existing lyrics are never overwritten, so
+            //     this cannot be used to vandalise good lyrics.
+            //   * bounded size, and the payload must parse as an object with
+            //     at least one non-empty lyrics field. Without that the
+            //     keyspace is a free blob store.
+            //   * a moderator-signed request MAY overwrite, so bad lyrics that
+            //     got in first are fixable through the existing moderation
+            //     path rather than needing a new tool.
+            constexpr size_t kMaxLyricsBytes = 128 * 1024;
+
+            const std::string artist = in.value("artist", "");
+            const std::string title  = in.value("title", "");
+            const std::string plain  = in.value("plain", "");
+            const std::string synced = in.value("synced", "");
+            const bool instrumental  = in.value("instrumental", false);
+
+            mc::moderation::Envelope env;
+            const bool moderator = mc::moderation::from_json(in, env) &&
+                                   mc::moderation::verify(env, db_);
+
+            if (artist.empty() || title.empty()) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "artist and title required"}};
+            } else if (plain.empty() && synced.empty() && !instrumental) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "no lyrics content"}};
+            } else if (plain.size() + synced.size() > kMaxLyricsBytes) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "lyrics too large"}};
+            } else {
+                const std::string key = mc::art::lyrics_blob_key(artist, title);
+                auto existing = db_.get(key);
+                const bool have = existing && !existing->empty();
+                if (have && !moderator) {
+                    // Not an error: we simply already have them. Clients treat
+                    // this as success so an import logs no noise per track.
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {{"stored", false},
+                                       {"reason", "already have lyrics"}}}};
+                } else {
+                    const json doc = {{"plain", plain},
+                                      {"synced", synced},
+                                      {"instrumental", instrumental}};
+                    const std::string ser = doc.dump();
+                    const std::vector<uint8_t> bytes(ser.begin(), ser.end());
+                    if (!db_.put(key, bytes)) {
+                        reply = {{"req_id", req_id}, {"status", "error"},
+                                 {"error", "could not store lyrics"}};
+                    } else {
+                        reply = {{"req_id", req_id}, {"status", "ok"},
+                                 {"body", {{"stored", true},
+                                           {"replaced", have}}}};
+                    }
+                }
+            }
         } else if (type == "songs.get") {
             const std::string hash = in.value("content_hash", "");
             reply = wrap_handler_result(req_id, http_.verb_song_get(hash));

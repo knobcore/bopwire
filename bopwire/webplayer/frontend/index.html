@@ -83,6 +83,21 @@
       </div>
     </section>
 
+    <!-- Lyrics: takes over the main area, synced to the playing track -->
+    <section class="view view-lyrics" id="lyrics" hidden>
+      <div class="lyr-wrap">
+        <div class="lyr-head">
+          <div class="lyr-meta">
+            <div class="lyr-title" id="lyr-title">—</div>
+            <div class="lyr-artist" id="lyr-artist">—</div>
+          </div>
+          <button class="btn-ghost" id="lyr-close">Close</button>
+        </div>
+        <div class="lyr-body" id="lyr-body"></div>
+        <div class="empty" id="lyr-empty" hidden>No lyrics found for this track.</div>
+      </div>
+    </section>
+
     <!-- List: "See all" for a collection / search results -->
     <section class="view view-list" id="list" hidden>
       <div class="list-scroll">
@@ -101,9 +116,9 @@
       <div class="np-artist" id="np-artist">—</div>
     </div>
     <div class="np-controls">
-      <button id="np-prev" class="np-btn np-side" aria-label="Previous">⏮</button>
-      <button id="np-toggle" class="np-btn" aria-label="Play/Pause">▶</button>
-      <button id="np-next" class="np-btn np-side" aria-label="Next">⏭</button>
+      <button id="np-prev" class="np-btn np-side" aria-label="Previous"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 6v12H5V6h2zm12 0v12l-9-6 9-6z"/></svg></button>
+      <button id="np-toggle" class="np-btn" aria-label="Play/Pause"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5z"/></svg></button>
+      <button id="np-next" class="np-btn np-side" aria-label="Next"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 6v12h2V6h-2zM5 6v12l9-6-9-6z"/></svg></button>
       <div class="np-seek">
         <span id="np-cur">0:00</span>
         <input id="np-bar" type="range" min="0" max="1000" value="0" step="1" />

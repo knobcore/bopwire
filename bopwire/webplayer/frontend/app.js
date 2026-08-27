@@ -205,21 +205,35 @@
     return Array.isArray(r) ? r : (r.songs || []);
   }
 
+  // ── Transport icons ────────────────────────────────────────────────────
+  // Drawn as SVG rather than ⏮ ▶ ⏸ ⏭: those code points default to EMOJI
+  // presentation in many font stacks, so the colour-emoji font drew them and
+  // ignored the button colour — the play button came out as a coloured box
+  // instead of a solid shape. SVG inherits currentColor everywhere.
+  const ICON = {
+    play:  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5z"/></svg>',
+    pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7V5zm6 0h4v14h-4V5z"/></svg>',
+  };
+
   // ───────────────────── View switching ────────────────────
   function showView(v) {
     state.view = v;
-    if (v !== 'list') state.lastView = v;
+    if (v !== 'list' && v !== 'lyrics') state.lastView = v;
     $('home').hidden   = v !== 'home';
     $('browse').hidden = v !== 'browse';
     $('list').hidden   = v !== 'list';
+    $('lyrics').hidden = v !== 'lyrics';
     document.querySelectorAll('#viewnav .vn-btn').forEach((b) =>
       b.setAttribute('aria-selected', String(b.dataset.view === v ||
-        (v === 'list' && b.dataset.view === state.lastView))));
+        ((v === 'list' || v === 'lyrics') && b.dataset.view === state.lastView))));
   }
   function renderView() {
     if (state.view === 'home')   renderHome();
     if (state.view === 'browse') renderBrowse();
     if (state.view === 'list')   renderList();
+    // 'lyrics' renders on open and then updates from playback, so it is
+    // deliberately not re-rendered here — a re-render mid-song would drop
+    // the scroll position and the active-line highlight.
   }
 
   // ─────────────────────── Home render ─────────────────────
@@ -260,7 +274,7 @@
           <div class="hero-title">${esc(s.title) || '(untitled)'}</div>
           <div class="hero-sub">${esc(s.artist)}${s.playCount ? ` · ${fmtPlays(s.playCount)} plays` : ''}</div>
           <div class="hero-actions">
-            <button class="btn-play" id="hero-play">▶ Play</button>
+            <button class="btn-play" id="hero-play">${ICON.play} Play</button>
             <button class="btn-ghost" id="hero-more">Explore Rising</button>
           </div>
         </div>
@@ -367,7 +381,7 @@
         <div class="list-title">${esc(L.title)}</div>
         <div class="list-sub">${esc(L.sub)}</div>
         <div class="list-actions">
-          <button class="btn-play" id="list-play" ${playable.length ? '' : 'disabled'}>▶ Play all</button>
+          <button class="btn-play" id="list-play" ${playable.length ? '' : 'disabled'}>${ICON.play} Play all</button>
           <button class="btn-ghost" id="list-shuffle" ${playable.length ? '' : 'disabled'}>🔀 Shuffle</button>
         </div>
       </div>
@@ -565,19 +579,144 @@
           <div class="t-artist">${esc(s.artist)}</div>
         </div>
         <div class="t-plays">${fmtPlays(s.playCount)} plays</div>
+        <button class="t-lyr" data-lyr="${i}" title="Lyrics">Lyrics</button>
         <div class="t-dur">${fmtDur(s.durationMs)}</div>
-        <div class="t-play">${off ? '' : '▶'}</div>
+        <div class="t-play">${off ? '' : ICON.play}</div>
       </div>`;
     }).join('');
     list.querySelectorAll('.track').forEach((el) => {
-      el.onclick = () => {
+      el.onclick = (ev) => {
+        // The Lyrics button lives inside the row, whose click starts
+        // playback. Without this the button would always play the track too.
+        if (ev.target.closest('.t-lyr')) return;
         const s = tracks[+el.dataset.i];
         if (!avail(s)) { toast('No seeders online for this track right now.'); return; }
         state.queue = playable;
         playFromQueue(playable.findIndex((p) => p.contentHash === s.contentHash));
       };
     });
+    list.querySelectorAll('.t-lyr').forEach((b) => {
+      b.onclick = (ev) => { ev.stopPropagation(); openLyrics(tracks[+b.dataset.lyr]); };
+    });
   }
+
+  // ─────────────────────── Lyrics ──────────────────────────
+  // Lyrics live off-chain on the node (lyr: keyspace, contributed by players
+  // that fetched them from LRCLIB) and reach us through /api/lyrics. They are
+  // deliberately NOT on chain: kilobytes per song would bloat SongMeta for
+  // every listener, and they carry a licensing question that a title does not.
+
+  const lyrState = { song: null, lines: [], synced: false, active: -1 };
+  const lyrCache = new Map();   // "artist\x1ftitle" -> {plain, synced} | null
+
+  // Parse LRC. Lines look like "[01:23.45] text", may carry SEVERAL stamps for
+  // a repeated line, and metadata tags ([ar:], [ti:]…) must not become lyrics.
+  function parseLRC(lrc) {
+    const out = [];
+    for (const raw of String(lrc).split(/\r?\n/)) {
+      const stamps = [...raw.matchAll(/\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]/g)];
+      if (!stamps.length) continue;
+      const text = raw.replace(/\[[^\]]*\]/g, '').trim();
+      for (const m of stamps) {
+        // A 2-digit fraction is centiseconds, 3-digit is milliseconds.
+        const frac = m[3] ? (m[3].length === 3 ? +m[3] : +m[3] * 10) : 0;
+        out.push({ t: (+m[1]) * 60 + (+m[2]) + frac / 1000, text });
+      }
+    }
+    return out.sort((a, b) => a.t - b.t);
+  }
+
+  async function fetchLyrics(song) {
+    const key = `${song.artist || ''}\x1f${song.title || ''}`;
+    if (lyrCache.has(key)) return lyrCache.get(key);
+    let val = null;
+    try {
+      val = await apiGet(`/api/lyrics?artist=${encodeURIComponent(song.artist || '')}` +
+                         `&title=${encodeURIComponent(song.title || '')}`);
+    } catch (_) {
+      // 404 (no lyrics stored) and a network failure are the same outcome for
+      // the reader: nothing to show. apiGet throws on both.
+    }
+    lyrCache.set(key, val);
+    return val;
+  }
+
+  async function openLyrics(song) {
+    if (!song) return;
+    lyrState.song = song;
+    lyrState.lines = []; lyrState.synced = false; lyrState.active = -1;
+    $('lyr-title').textContent  = song.title || '(untitled)';
+    $('lyr-artist').textContent = song.artist || '';
+    $('lyr-body').innerHTML = '';
+    $('lyr-empty').hidden = true;
+    showView('lyrics');
+
+    const res = await fetchLyrics(song);
+    // The user may have closed the view or opened another song while this was
+    // in flight; dropping a stale reply keeps the wrong lyrics off the screen.
+    if (lyrState.song !== song || state.view !== 'lyrics') return;
+
+    if (!res || (!res.synced && !res.plain)) {
+      $('lyr-empty').hidden = false;
+      $('lyr-empty').textContent = res && res.instrumental
+        ? 'This track is instrumental.'
+        : 'No lyrics found for this track.';
+      return;
+    }
+
+    const body = $('lyr-body');
+    if (res.synced) {
+      lyrState.lines  = parseLRC(res.synced);
+      lyrState.synced = lyrState.lines.length > 0;
+    }
+    if (lyrState.synced) {
+      body.className = 'lyr-body synced';
+      body.innerHTML = lyrState.lines
+        .map((l, i) => `<div class="lyr-line" data-i="${i}">${esc(l.text) || '&nbsp;'}</div>`)
+        .join('');
+      body.querySelectorAll('.lyr-line').forEach((el) => {
+        el.onclick = () => seekTo(lyrState.lines[+el.dataset.i].t);
+      });
+      syncLyrics();
+    } else {
+      body.className = 'lyr-body plain';
+      body.innerHTML = String(res.plain).split(/\r?\n/)
+        .map((l) => `<div class="lyr-line">${esc(l) || '&nbsp;'}</div>`).join('');
+    }
+  }
+
+  // Highlight the line for the current playback position. Only meaningful
+  // while the lyrics on screen belong to the track actually playing — opening
+  // lyrics for some OTHER song must not follow the current one's clock.
+  function syncLyrics() {
+    if (state.view !== 'lyrics' || !lyrState.synced) return;
+    if (!lyrState.song || state.playing !== lyrState.song.contentHash) return;
+    const t = engCurSec();
+    let i = -1;
+    // Small linear walk: lyric line counts are in the dozens.
+    for (let k = 0; k < lyrState.lines.length; k++) {
+      if (lyrState.lines[k].t <= t) i = k; else break;
+    }
+    if (i === lyrState.active) return;
+    lyrState.active = i;
+    const body = $('lyr-body');
+    body.querySelectorAll('.lyr-line.active').forEach((e) => e.classList.remove('active'));
+    if (i < 0) return;
+    const el = body.querySelector(`.lyr-line[data-i="${i}"]`);
+    if (!el) return;
+    el.classList.add('active');
+    // Keep the active line around a third from the top rather than snapping
+    // it to the very edge, so upcoming lines stay readable.
+    body.scrollTop = el.offsetTop - body.clientHeight / 3;
+  }
+
+  function seekTo(sec) {
+    if (!lyrState.song || state.playing !== lyrState.song.contentHash) return;
+    if (engine === 'wasm' && wasm) wasm.seek(sec);
+    else if (audio.duration) audio.currentTime = sec;
+  }
+
+  $('lyr-close').onclick = () => showView(state.lastView || 'home');
 
   // ─────────────────────── Search ──────────────────────────
   async function runSearch(q) {
@@ -608,8 +747,9 @@
   const engCurSec = () => ((engine === 'wasm' && wasm ? wasm.currentTime : audio.currentTime) || 0);
   const engDurSec = () => (engine === 'wasm' && wasm ? wasm.duration : (audio.duration || 0));
 
-  function npToggleIcon() { $('np-toggle').textContent = engPaused() ? '▶' : '⏸'; }
+  function npToggleIcon() { $('np-toggle').innerHTML = engPaused() ? ICON.play : ICON.pause; }
   function npProgress() {
+    syncLyrics();
     const cur = engCurSec(), dur = engDurSec();
     $('np-cur').textContent = fmtDur(cur * 1000);
     if (dur) { $('np-dur').textContent = fmtDur(dur * 1000); $('np-bar').value = Math.round((cur / dur) * 1000); }
@@ -638,7 +778,7 @@
     $('np-cur').textContent = '0:00'; $('np-bar').value = 0;
     $('np-dur').textContent = fmtDur(song.durationMs || 0);
     $('np-spin').hidden = false;
-    $('np-toggle').textContent = '⏸';
+    $('np-toggle').innerHTML = ICON.pause;
     startEngine(song);
     startPlay(song);                // open reward session (artist/seeder/mini mint)
     renderView();                   // refresh playing highlights wherever we are
@@ -685,7 +825,7 @@
       playFromQueue(state.qIndex + 1);   // play() finalizes the finished session
     } else {
       completePlay();
-      state.playing = null; $('np-toggle').textContent = '▶'; renderView();
+      state.playing = null; $('np-toggle').innerHTML = ICON.play; renderView();
     }
   }
 

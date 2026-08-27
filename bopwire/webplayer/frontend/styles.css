@@ -246,7 +246,7 @@ body {
 
 .tracks { display: flex; flex-direction: column; }
 .track {
-  display: grid; grid-template-columns: 28px 34px 1fr auto auto 40px;
+  display: grid; grid-template-columns: 28px 34px 1fr auto auto auto 40px;
   align-items: center; gap: 12px;
   padding: 7px 8px; border-radius: 8px; cursor: pointer;
 }
@@ -332,9 +332,69 @@ body {
   .hero-title { font-size: 20px; white-space: normal; }
   .np-meta { width: 120px; }
   .np-btn.np-side { display: none; }
-  .track { grid-template-columns: 24px 30px 1fr auto 36px; }
+  .track { grid-template-columns: 24px 30px 1fr auto auto 36px; }
   .track .t-plays { display: none; }
   .list-art { width: 92px; height: 92px; }
   .list-title { font-size: 19px; }
   .cta { font-size: 12px; padding: 0 10px; text-align: center; }
+}
+
+/* ── Transport icons ───────────────────────────────────────────────────
+   The transport buttons used ⏮ ▶ ⏭ (U+23EE/U+25B6/U+23ED). Those code
+   points default to EMOJI presentation in many font stacks, so the glyph
+   was drawn by the colour-emoji font and ignored the button's colour —
+   which is why the play button showed a coloured box instead of a solid
+   shape. Inline SVG inherits currentColor on every platform, so the icon
+   is now always the button's own colour. */
+.np-btn svg { width: 16px; height: 16px; fill: currentColor; display: block; margin: auto; }
+.np-btn.np-side svg { width: 14px; height: 14px; }
+.btn-play svg { width: 14px; height: 14px; fill: currentColor; }
+.t-play svg   { width: 15px; height: 15px; fill: currentColor; display: block; margin: 0 auto; }
+
+/* Buttons should never show the UA's focus box on mouse use, but keyboard
+   users still need a visible ring — :focus-visible gives exactly that. */
+.np-btn, .btn-play, .btn-ghost, .t-lyr { -webkit-tap-highlight-color: transparent; }
+.np-btn:focus, .btn-play:focus, .btn-ghost:focus, .t-lyr:focus { outline: none; }
+.np-btn:focus-visible, .btn-play:focus-visible,
+.btn-ghost:focus-visible, .t-lyr:focus-visible {
+  outline: 2px solid var(--accent-2); outline-offset: 2px;
+}
+
+/* ── Lyrics view ──────────────────────────────────────────────────────── */
+.t-lyr {
+  opacity: .75; background: none; border: 0; padding: 0 6px; cursor: pointer;
+  color: var(--text-dim); font: inherit; font-size: 11px; font-weight: 800;
+  letter-spacing: .08em; text-transform: uppercase;
+}
+@media (hover: hover) {
+  /* Reveal on row hover only on pointer devices — on touch there is no hover
+     state, so the button must stay visible or it can never be pressed. */
+  .t-lyr { opacity: 0; }
+  .track:hover .t-lyr { opacity: 1; }
+  .t-lyr:hover { color: var(--accent); }
+}
+
+.view-lyrics { min-height: 0; }
+.lyr-wrap { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; padding: 18px 22px; }
+.lyr-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.lyr-title  { font-size: 24px; font-weight: 800; line-height: 1.15; }
+.lyr-artist { color: var(--text-dim); font-size: 14px; margin-top: 2px; }
+.lyr-body { flex: 1; min-height: 0; overflow-y: auto; scroll-behavior: smooth; padding: 8px 0 40vh; }
+
+.lyr-line {
+  font-size: 19px; line-height: 1.62; font-weight: 600;
+  color: var(--text-dim); opacity: .5;
+  padding: 3px 0; transition: color .18s ease, opacity .18s ease;
+}
+/* Synced lyrics are clickable: tapping a line seeks the track to it. */
+.lyr-body.synced .lyr-line { cursor: pointer; }
+.lyr-body.synced .lyr-line:hover { opacity: .8; }
+.lyr-line.active { color: var(--text); opacity: 1; }
+/* Plain (unsynced) lyrics have no current line, so nothing is dimmed. */
+.lyr-body.plain .lyr-line { opacity: .88; color: var(--text); font-size: 17px; }
+
+@media (max-width: 720px) {
+  .lyr-wrap { padding: 14px 16px; }
+  .lyr-title { font-size: 20px; }
+  .lyr-line { font-size: 17px; }
 }
