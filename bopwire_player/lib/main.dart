@@ -243,6 +243,13 @@ void main() async {
   // the framework, so the CANCEL frames actually get to leave.
   final exitListener = AppLifecycleListener(
     onExitRequested: () async {
+      // Say goodbye FIRST: this is what stops our songs showing as online on
+      // the website and in other players the moment we quit, instead of
+      // lingering for the node's 3-minute presence TTL. It is bounded and
+      // never throws, so it cannot hold up the shutdown below.
+      try {
+        await PresencePublisher.goodbye();
+      } catch (_) {}
       try {
         await PredownloadCache.instance.shutdown();
       } catch (_) {}

@@ -112,6 +112,76 @@ class PresencePublisher {
     }
   }
 
+  /// Tell the node we are going offline NOW, instead of letting the binding
+  /// lapse.
+  ///
+  /// The node keeps a wallet discoverable for kPresenceTtlMs (3 min) after its
+  /// last signed hello. That window is deliberately generous so a download
+  /// saturating the relay can't make a live player flap offline — but it means
+  /// an INTENTIONAL exit (sign-out, going offline, closing the app, emptying
+  /// the library) left the user's songs listed as online on the website and in
+  /// other players for up to three minutes. TTL is the right answer for a
+  /// crash; this is the right answer for a clean exit, which is the common one.
+  ///
+  /// Signed exactly like [announce] but under a DIFFERENT domain tag, so a
+  /// captured hello can never be replayed as a goodbye or the reverse:
+  ///   canon = "mcbye1" || wallet(20) || ts(8 LE) || peer_id(raw UTF-8)
+  ///
+  /// Stops the heartbeat first — otherwise a beat already in flight (or the
+  /// next one, ~22-38 s later) would re-announce us and undo the withdrawal.
+  /// Best effort and never throws: if it can't be delivered the TTL still
+  /// expires us, just more slowly.
+  static Future<void> goodbye() async {
+    stopHeartbeat();
+    try {
+      final wp = WalletProvider.active;
+      final info = wp?.info;
+      if (wp == null || info == null) return;
+
+      // Short waits: this runs on the way out, and blocking an app exit for
+      // 8 s to say goodbye is a worse bug than the delay it prevents.
+      final homePid =
+          await NodeService.getRatsPeerId(waitFor: const Duration(seconds: 2));
+      if (homePid.isEmpty) return;
+
+      final peerId = RatsClient.instance.ownPeerId;
+      if (peerId.isEmpty) return;
+
+      final wallet20 = _hexToBytes(info.address, 20);
+      if (wallet20 == null) return;
+
+      final ts = DateTime.now().millisecondsSinceEpoch;
+
+      final canon = BytesBuilder();
+      canon.add(ascii.encode('mcbye1')); // 6-byte domain tag, NOT mcprs1
+      canon.add(wallet20);
+      canon.add(_u64le(ts));
+      canon.add(utf8.encode(peerId));
+
+      final sig = wp.sign(Uint8List.fromList(canon.toBytes()));
+
+      final reply = await RatsClient.instance.request(
+        homePid,
+        'presence.bye',
+        {
+          'peer_id': peerId,
+          'wallet': info.address,
+          'pubkey': info.publicKey,
+          'ts': ts,
+          'sig': sig,
+        },
+        timeout: const Duration(seconds: 4),
+      );
+
+      final ok = (reply is Map) && (reply['withdrawn'] == true);
+      // ignore: avoid_print
+      print('[db2] presence.bye ts=$ts peer=$peerId withdrawn=$ok');
+    } catch (e) {
+      // ignore: avoid_print
+      print('[db2] presence.bye failed (TTL will expire us): $e');
+    }
+  }
+
   static Uint8List _u64le(int x) {
     final b = Uint8List(8);
     for (int i = 0; i < 8; i++) {
