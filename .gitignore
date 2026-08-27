@@ -167,3 +167,15 @@ moderation.key
 
 # Rust build artifacts for the embedded Tor (Arti) static lib
 bopwire/deps/tor-ffi/target/
+
+# Node runtime state — regenerated on every run, churns constantly.
+bopwire/config.json
+bopwire/dht_routing_*.json
+bopwire/winbuild-status.txt
+
+# Stale build artifact under the pre-rebrand name (musicchain -> bopwire).
+musicchain_player/
+
+# Local editor/agent state and downloaded tooling.
+.claude/
+*.vsix
