@@ -15,8 +15,11 @@ import 'package:audio_metadata_reader/audio_metadata_reader.dart';
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:permission_handler/permission_handler.dart';
 
+import 'album_art_cache.dart';
 import 'fingerprinter.dart';
 import 'library_publisher.dart';
+import 'metadata_lookup.dart';
+import 'node_client.dart';
 import 'presence_publisher.dart';
 import 'playlist_service.dart';
 import 'library_service.dart';
@@ -465,16 +468,18 @@ class LibraryScanner {
       final stem   = dotIdx > 0 ? fname.substring(0, dotIdx) : fname;
       final fileTitle = stem.replaceAll('_', ' ').trim();
 
-      final title  = _pick(tag?.title, fileTitle);
-      final artist = _pick(tag?.artist, '');
-      final album  = _pick(tag?.album,  '');
+      // `var`, not `final`: the online metadata enrichment below may
+      // replace these with looked-up values before submit/upsert.
+      var title  = _pick(tag?.title, fileTitle);
+      var artist = _pick(tag?.artist, '');
+      var album  = _pick(tag?.album,  '');
       final genre  = (tag?.genres.isNotEmpty == true)
                        ? tag!.genres.first
                        : '';
       // ID3 numerics: 0 means "tag didn't carry it." The full node
       // treats 0 as "unknown" and the UI hides the chip when it's 0.
-      final year         = tag?.year?.year ?? 0;
-      final trackNumber  = tag?.trackNumber ?? 0;
+      var year         = tag?.year?.year ?? 0;
+      var trackNumber  = tag?.trackNumber ?? 0;
       // Container reports bitrate in bits/sec. The full node stores it
       // with the SwarmMember so the download dialog can let the user
       // pick a quality and streaming defaults to the lowest.
@@ -500,6 +505,46 @@ class LibraryScanner {
       final durationMs = (tagDurMs > 0 && tagDurMs < kMaxSaneDurationMs)
           ? tagDurMs
           : (pcmDurMs > 0 && pcmDurMs < kMaxSaneDurationMs ? pcmDurMs : 0);
+
+      // ---- Optional online metadata enrichment (opt-in via Settings,
+      // default OFF). AcoustID (uses the chromaprint we just computed)
+      // first, MusicBrainz text search second, Genius as fuzzy rescue.
+      // Runs BEFORE fingerprint.submit and lib.upsert so both the chain
+      // registration and the local library row carry the corrected tags.
+      // Merge policy lives in TagMerge (unit-tested): blanks always
+      // filled, populated tags only corrected on a high-confidence match,
+      // filename-derived titles count as weak. enrich() catches its own
+      // errors and returns null — plus this belt-and-braces try, because a
+      // swallowed exception in this function already bit us once: log,
+      // never silent, NEVER block or fail the scan. Results (and misses)
+      // are cached by fingerprint/content hash so a rescan doesn't
+      // re-query.
+      try {
+        final enriched = await MetadataLookup.instance.enrich(
+          current: CurrentTags(
+            title: title, artist: artist, album: album,
+            year: year, trackNumber: trackNumber,
+            titleIsFromFilename: (tag?.title ?? '').trim().isEmpty,
+          ),
+          fingerprint: fp?.compressed ?? '',
+          durationMs: durationMs,
+          cacheKey: (fp != null && fp.fingerprintHash.isNotEmpty)
+              ? fp.fingerprintHash
+              : contentHash,
+        );
+        if (enriched != null && enriched.changed) {
+          // Originals of corrected fields are in the log line below AND
+          // persisted in the lookup cache ('replaced') — never discarded.
+          _ilog('metadata[${enriched.source}]: ${enriched.describe()}');
+          title       = enriched.title;
+          artist      = enriched.artist;
+          album       = enriched.album;
+          year        = enriched.year;
+          trackNumber = enriched.trackNumber;
+        }
+      } catch (e) {
+        _ilog('metadata enrichment failed (ignored, keeping file tags): $e');
+      }
 
       final fmt = _formatFromPath(file.path);
 
@@ -599,6 +644,60 @@ class LibraryScanner {
         addedAtMs:       DateTime.now().millisecondsSinceEpoch,
       ));
       _ilog('ADDED "$title" by "$artist" (${file.path})');
+
+      // Embedded album art: runs AFTER tag enrichment so the cache key
+      // uses the CORRECTED artist/album (art filed under a misspelled
+      // album would never be found again). The main tag read above keeps
+      // getImage:false; extractFromAudioFile re-reads WITH the image only
+      // when this album has no cached art yet, so a rescan decodes zero
+      // images and a fresh import decodes one per album, not per track.
+      // Fire-and-forget: neither the extract nor the node contribution
+      // can delay or fail the import (both catch internally; this closure
+      // adds a belt-and-braces catch of its own).
+      //
+      // When art was NEWLY extracted (non-null return — never on dedupe
+      // hits, so a 200-track import uploads at most once per album), it's
+      // also offered to the full node via art.put (gap-fill only; the
+      // node keeps whatever art it already has). `false` from
+      // contributeAlbumArt is a NORMAL outcome (node already had art, or
+      // no node) — not logged as a failure, never retried here. Only
+      // bytes that actually came out of the file are uploaded, and only
+      // JPEG/PNG, which is all the node accepts.
+      final artHomePid = homePid;
+      unawaited(() async {
+        try {
+          final artBytes =
+              await AlbumArtCache.extractFromAudioFile(file, artist, album);
+          if (artBytes == null || artHomePid.isEmpty) return;
+          final ext = AlbumArtCache.sniffExtension(artBytes);
+          if (ext != 'jpg' && ext != 'png') return; // node rejects others
+          final ok = await NodeClient(ratsPeerId: artHomePid)
+              .contributeAlbumArt(artist, album, artBytes);
+          if (ok) {
+            _ilog('album art for "$artist / $album" contributed to node');
+          }
+        } catch (e) {
+          _ilog('album art handling failed (ignored): $e');
+        }
+      }());
+
+      // Lyrics (separate opt-in, default OFF): fetched from LRCLIB AFTER
+      // tag enrichment so the corrected artist/title are the lookup key,
+      // and AFTER the upsert + submit because lyrics are optional and
+      // strictly local — never sent to the chain, stored per-song by the
+      // library's songId. Fire-and-forget: a lyrics failure must never
+      // affect the library entry or the chain registration, and the
+      // service's internal serial queue + per-song miss cache keep a big
+      // scan from hammering lrclib.net.
+      unawaited(MetadataLookup.instance.fetchLyricsIfEnabled(
+        songKey: (chainHash.isNotEmpty && chainHash != contentHash)
+            ? chainHash
+            : contentHash,
+        title: title,
+        artist: artist,
+        album: album,
+        durationMs: durationMs,
+      ));
     } catch (e, st) {
       // This used to be `catch (_) { _errors += 1; }` — a completely
       // silent swallow. A file that failed to fingerprint, or hit any

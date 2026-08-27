@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/librats_discovery.dart';
+import '../services/metadata_lookup.dart';
 import '../widgets/network_settings_section.dart';
 import 'dmca_screen.dart';
 import 'escrow_claim_screen.dart';
@@ -16,6 +17,10 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   final _cacheMbCtrl = TextEditingController();
+  final _acoustIdKeyCtrl = TextEditingController();
+  final _geniusTokenCtrl = TextEditingController();
+  bool _metaLookupEnabled = false;
+  bool _lyricsEnabled = false;
 
   @override
   void initState() {
@@ -28,6 +33,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() {
       _cacheMbCtrl.text =
           (prefs.getInt('cache_max_mb') ?? 1000).toString();
+      _metaLookupEnabled =
+          prefs.getBool(MetadataLookupPrefs.enabled) ?? false;
+      _lyricsEnabled =
+          prefs.getBool(MetadataLookupPrefs.lyricsEnabled) ?? false;
+      _acoustIdKeyCtrl.text =
+          prefs.getString(MetadataLookupPrefs.acoustIdKey) ?? '';
+      _geniusTokenCtrl.text =
+          prefs.getString(MetadataLookupPrefs.geniusToken) ?? '';
     });
   }
 
@@ -155,6 +168,80 @@ class _SettingsScreenState extends State<SettingsScreen> {
             }),
 
           const NetworkSettingsSection(),
+
+          const Divider(height: 32),
+          const Text('Online metadata',
+              style: TextStyle(fontWeight: FontWeight.bold)),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _metaLookupEnabled,
+            onChanged: (v) async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setBool(MetadataLookupPrefs.enabled, v);
+              setState(() => _metaLookupEnabled = v);
+            },
+            title: const Text('Fix song tags online'),
+            subtitle: Text(
+              'When scanning or importing a song, look up missing or wrong '
+              'ID3 tags online. This sends the song\'s audio fingerprint to '
+              'AcoustID (only if an API key is set below) and/or its '
+              'artist/title to MusicBrainz and Genius — third-party '
+              'services. Off by default.',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade400),
+            ),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _lyricsEnabled,
+            onChanged: (v) async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setBool(MetadataLookupPrefs.lyricsEnabled, v);
+              setState(() => _lyricsEnabled = v);
+            },
+            title: const Text('Fetch lyrics'),
+            subtitle: Text(
+              'Look up lyrics on LRCLIB (lrclib.net) — a third-party '
+              'service that receives the song\'s artist/title. Lyrics are '
+              'stored on this device only, never on the chain. Off by '
+              'default.',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade400),
+            ),
+          ),
+          if (_metaLookupEnabled) ...[
+            const SizedBox(height: 8),
+            TextField(
+              controller: _acoustIdKeyCtrl,
+              decoration: const InputDecoration(
+                labelText: 'AcoustID API key (optional)',
+                helperText: 'Free application key from acoustid.org — '
+                    'enables exact fingerprint matching. Without it only '
+                    'the text search routes are used.',
+                helperMaxLines: 3,
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (v) async {
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setString(
+                    MetadataLookupPrefs.acoustIdKey, v.trim());
+              },
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _geniusTokenCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Genius access token (optional)',
+                helperText: 'Free token from genius.com/api-clients — used '
+                    'as a last-resort fuzzy match for messy filenames.',
+                helperMaxLines: 3,
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (v) async {
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setString(
+                    MetadataLookupPrefs.geniusToken, v.trim());
+              },
+            ),
+          ],
 
           const Divider(height: 32),
           const Text('Legal', style: TextStyle(fontWeight: FontWeight.bold)),
