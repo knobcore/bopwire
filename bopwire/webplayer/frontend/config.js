@@ -10,9 +10,11 @@ window.BOPWIRE = {
 
   // "Click here" → download the native app (where the listener DOES earn).
   // Release assets live on knobcore/bopwire (releases/latest).
+  //
+  // Linux only, deliberately. The Windows installer and Android APK were
+  // removed from the release, so advertising them here pointed users at
+  // 404s. Only list a platform once its asset actually exists.
   downloads: {
-    linux:   'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-linux-x86_64.AppImage',
-    android: 'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-android.apk',
-    windows: 'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-windows-x64-setup.exe',
+    linux: 'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-linux-x86_64.AppImage',
   },
 };

@@ -135,16 +135,13 @@
       Want to earn crypto listening to artists with less than 10,000 plays?
     </span>
     <span class="cta-menu">
-      <button id="cta-link" class="cta-click" aria-haspopup="true" aria-expanded="false">
+      <!-- Straight to the Linux AppImage. This used to open a menu of
+           Windows / Android / Linux, but the Windows and Android assets no
+           longer exist on the release, so two of the three were 404s. One
+           real download beats a menu of dead ends. -->
+      <a id="cta-link" class="cta-click" data-os="linux" href="#" rel="noopener">
         Click here
-      </button>
-      <div class="cta-dropdown" id="cta-dropdown" role="menu" hidden>
-        <img class="cta-logo" src="logo.png" alt="Bopwire app" width="72" height="72" />
-        <div class="cta-dd-title">Get the Bopwire app</div>
-        <a class="cta-opt" data-os="windows" href="#" role="menuitem"><span>🪟</span> Windows Installer</a>
-        <a class="cta-opt" data-os="android" href="#" role="menuitem"><span>🤖</span> Android APK</a>
-        <a class="cta-opt" data-os="linux"   href="#" role="menuitem"><span>🐧</span> Linux AppImage</a>
-      </div>
+      </a>
     </span>
   </footer>
 

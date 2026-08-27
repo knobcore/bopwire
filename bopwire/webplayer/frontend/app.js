@@ -976,15 +976,11 @@
       }, 250);
     });
 
-    // CTA download dropdown
-    const link = $('cta-link'), dd = $('cta-dropdown');
-    document.querySelectorAll('.cta-opt').forEach((a) => { a.href = CFG.downloads[a.dataset.os] || '#'; });
-    link.onclick = (e) => {
-      e.stopPropagation();
-      const open = dd.hidden;
-      dd.hidden = !open; link.setAttribute('aria-expanded', String(open));
-    };
-    document.addEventListener('click', () => { dd.hidden = true; link.setAttribute('aria-expanded', 'false'); });
+    // CTA download — a direct link to the Linux AppImage. No dropdown: the
+    // Windows and Android assets were removed from the release, so a menu
+    // offering them just sent people to 404s.
+    const ctaLink = $('cta-link');
+    if (ctaLink) ctaLink.href = CFG.downloads.linux || '#';
 
     // Draggable pane divider
     const divider = $('divider'), chipPane = $('chip-pane');
