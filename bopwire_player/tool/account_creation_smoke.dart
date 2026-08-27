@@ -102,10 +102,15 @@ Future<void> main() async {
   // hangs.
   final ts       = DateTime.now().millisecondsSinceEpoch;
   final username = 'smoke_$ts';
+  // The vault password is set separately from wallet creation:
+  // createWalletFromMnemonic takes no password, so without createVault
+  // first there is nothing to encrypt the key material under. This tool
+  // passed `password:` to createWalletFromMnemonic, which has never been a
+  // parameter it accepts — the smoke test could not have compiled.
+  await timed('ws.createVault', () => ws.createVault(mnemonic));
   final info = await timed('ws.createWalletFromMnemonic',
       () => ws.createWalletFromMnemonic(
             mnemonic: mnemonic,
-            password: mnemonic,
             username: username,
           ));
   log('  addr     : ${info.address}');

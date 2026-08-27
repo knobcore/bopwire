@@ -41,6 +41,28 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
 
+  // Desktop has no platform sqflite implementation, so the factory must be
+  // installed before ANYTHING touches the library DB — otherwise every access
+  // throws "Bad state: databaseFactory not initialized".
+  //
+  // This sits immediately after ensureInitialized on purpose. It used to live
+  // ~80 lines further down, BELOW OfflineSubmitService.start() and
+  // LibraryScanner.scanOnce(), so the very thing the comment warns about was
+  // happening on every launch: the AppImage logged
+  // "[offline-play-log] init failed: Bad state: databaseFactory not
+  // initialized" before the factory existed. Keep it first; anything added
+  // above it must not touch the database.
+  if (Platform.isLinux || Platform.isWindows || Platform.isMacOS) {
+    try {
+      sqfliteFfiInit();
+      databaseFactory = databaseFactoryFfi;
+    } catch (e) {
+      // ignore: avoid_print
+      print('[db] sqflite ffi init failed: $e');
+    }
+  }
+
+
   // Initialize native library
   await NativeLibrary.initialize();
 
@@ -174,19 +196,6 @@ void main() async {
     }
   }
 
-  // Desktop has no platform sqflite implementation, so the factory must
-  // be installed before ANYTHING touches the library DB — otherwise every
-  // access throws "Bad state: databaseFactory not initialized", which is
-  // what the AppImage was doing on every scan.
-  if (Platform.isLinux || Platform.isWindows || Platform.isMacOS) {
-    try {
-      sqfliteFfiInit();
-      databaseFactory = databaseFactoryFfi;
-    } catch (e) {
-      // ignore: avoid_print
-      print('[db] sqflite ffi init failed: $e');
-    }
-  }
 
   // Sweep the pre-download cache before anything can use it. It
   // self-initialises on first use, but doing it here is what actually
