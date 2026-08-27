@@ -60,6 +60,9 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'node_client.dart';
+import 'node_service.dart';
+
 /// SharedPreferences keys shared with the Settings screen. Both features
 /// are strictly opt-in: no pref → disabled.
 class MetadataLookupPrefs {
@@ -459,8 +462,39 @@ class MetadataLookup {
           : 'lyrics: stored for "$artist - $title" '
             '(synced=${res.synced.isNotEmpty}, '
             'plain=${res.plain.isNotEmpty})');
+
+      // Hand them to the node so every client gets them without each one
+      // querying LRCLIB for the same song — and so the WEBSITE can show
+      // them at all, since it can only read from the node.
+      //
+      // Deliberately not awaited into the caller's critical path and never
+      // allowed to throw: contributing is decoration, and an import must
+      // finish identically whether the node is present, absent or slow.
+      if (res != null && res.hasAny) unawaited(_contributeLyrics(artist, title, res));
     } catch (e) {
       _mlog('lyrics fetch failed (ignored): $e');
+    }
+  }
+
+  /// Offer freshly-fetched lyrics to the node. The node is gap-fill only, so
+  /// a `false` result usually just means it already had them — a normal
+  /// outcome that is not logged as a failure.
+  Future<void> _contributeLyrics(
+      String artist, String title, LyricsResult res) async {
+    try {
+      final pid = await NodeService.getRatsPeerId(
+          waitFor: const Duration(seconds: 5));
+      if (pid.isEmpty) return;
+      final ok = await NodeClient(ratsPeerId: pid).contributeLyrics(
+        artist: artist,
+        title: title,
+        plain: res.plain,
+        synced: res.synced,
+        instrumental: res.instrumental,
+      );
+      if (ok) _mlog('lyrics for "$artist - $title" contributed to node');
+    } catch (e) {
+      _mlog('lyrics contribute failed (ignored): $e');
     }
   }
 

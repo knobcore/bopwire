@@ -207,6 +207,59 @@ class NodeClient {
     }
   }
 
+  // ---- Lyrics ---------------------------------------------------------
+
+  /// Time-synced (LRC) + plain lyrics the node holds for a song, or null on
+  /// a miss. Keyed on artist+title, so any encoding of the track resolves to
+  /// the same entry.
+  Future<Map<String, dynamic>?> fetchLyrics(String artist, String title) async {
+    if (artist.trim().isEmpty || title.trim().isEmpty) return null;
+    try {
+      final r = await _rpc('lyrics.get', {'artist': artist, 'title': title},
+          timeout: const Duration(seconds: 12));
+      if (r is! Map || r['found'] != true) return null;
+      return Map<String, dynamic>.from(r);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Contribute lyrics we fetched (LRCLIB) so every client — including the
+  /// website, which can only read from the node — gets them, and so nobody
+  /// else has to query LRCLIB for the same song.
+  ///
+  /// The node is gap-fill only: if it already holds lyrics it keeps them and
+  /// reports stored=false. That is a NORMAL outcome, not a failure, so this
+  /// returns false rather than throwing — an import would otherwise log a
+  /// line per already-covered track.
+  Future<bool> contributeLyrics({
+    required String artist,
+    required String title,
+    String plain = '',
+    String synced = '',
+    bool instrumental = false,
+  }) async {
+    if (artist.trim().isEmpty || title.trim().isEmpty) return false;
+    if (plain.isEmpty && synced.isEmpty && !instrumental) return false;
+    try {
+      final r = await _rpc(
+          'lyrics.put',
+          {
+            'artist': artist,
+            'title': title,
+            'plain': plain,
+            'synced': synced,
+            'instrumental': instrumental,
+          },
+          timeout: const Duration(seconds: 20));
+      return r is Map && r['stored'] == true;
+    } catch (_) {
+      // Best-effort decoration. A node that is offline, or old enough not to
+      // know lyrics.put, must never affect the import that triggered this.
+      return false;
+    }
+  }
+
   Future<List<Song>> searchSongs(String query) async =>
       _decodeSongs(await _rpc('songs.search', {'q': query}));
 
