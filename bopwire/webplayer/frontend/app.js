@@ -176,21 +176,53 @@
       <rect width="96" height="96" fill="url(#${gid})"/>
       <g transform="rotate(${p.rot},48,48)">${m}</g>
     </svg>`;
-    // Real cover on top, when the caller has an artist to look one up by.
-    // The node scrapes real covers (sacad) AND takes contributed ones from
-    // players' own embedded art (art.put), both landing at /api/art. A miss
-    // is a normal 404 (nothing has been found for this album yet), so the
-    // <img> just removes itself on error and the generated art underneath
-    // shows through — no placeholder flash, no visible failure state. The
+    // Real cover(s) on top, when the caller has an artist to look one up
+    // by. The node scrapes real covers (sacad) AND takes contributed ones
+    // from players' own embedded art (art.put), both landing at /api/art. A
+    // miss is a normal 404 (nothing has been found for this album yet). The
     // wrapper carries its own position:relative so this works inside ANY
     // container regardless of that container's own CSS.
-    if (opts && opts.art && opts.art.artist) {
-      const url = `${CFG.gateway}/api/art?artist=${encodeURIComponent(opts.art.artist)}` +
-                  `&album=${encodeURIComponent(opts.art.album || '')}`;
-      return `<span class="art-wrap">${svg}` +
-             `<img class="art-real" src="${url}" alt="" loading="lazy" onerror="this.remove()"></span>`;
+    //
+    // opts.art may be ONE {artist,album} (a specific song/album — the
+    // common case) or an ARRAY of a few (an artist has several albums, a
+    // genre has several artists) — then it cross-fades between them every
+    // 6s, the same "gentle slideshow" ArtistArt does in the app. A dead
+    // (404) slide is marked and excluded from rotation rather than removed
+    // — removing it would shift every later index and desync which slide
+    // is "next".
+    const cands = opts && opts.art
+        ? (Array.isArray(opts.art) ? opts.art : [opts.art]).filter((a) => a && a.artist)
+        : [];
+    if (!cands.length) return svg;
+    const artUrl = (a) => `${CFG.gateway}/api/art?artist=${encodeURIComponent(a.artist)}` +
+                          `&album=${encodeURIComponent(a.album || '')}`;
+    if (cands.length === 1) {
+      return `<span class="art-wrap">${svg}<img class="art-real" src="${artUrl(cands[0])}" ` +
+             `alt="" loading="lazy" onerror="this.remove()"></span>`;
     }
-    return svg;
+    const slides = cands.map((cd, si) =>
+      `<img class="tile-slide${si === 0 ? ' active' : ''}" data-si="${si}" src="${artUrl(cd)}" ` +
+      `alt="" loading="lazy" onerror="this.dataset.dead='1'; this.classList.remove('active')">`
+    ).join('');
+    return `<span class="art-wrap art-rotate">${svg}${slides}</span>`;
+  }
+
+  // Drives every multi-slide cover on the page (genre tiles, and any
+  // rotating chip in Browse) from ONE timer rather than one per element —
+  // cheap, and re-armed whenever the containing view re-renders so a
+  // destroyed element can never be ticked into a leak.
+  let _artRotateTimer = null;
+  function startArtRotation(root) {
+    if (_artRotateTimer) clearInterval(_artRotateTimer);
+    _artRotateTimer = setInterval(() => {
+      root.querySelectorAll('.art-rotate').forEach((wrap) => {
+        const slides = [...wrap.querySelectorAll('.tile-slide')].filter((im) => !im.dataset.dead);
+        if (slides.length < 2) return;
+        const cur = slides.findIndex((im) => im.classList.contains('active'));
+        slides.forEach((im) => im.classList.remove('active'));
+        slides[(cur + 1) % slides.length].classList.add('active');
+      });
+    }, 6000);
   }
   // songArt fetches the real cover when the row has an artist to look one up
   // by (search results, library rows, anything server-backed). Collection
@@ -313,17 +345,12 @@
     $('hero-more').onclick = () => openCollection(rising);
   }
 
-  // Genre tiles cycle through a handful of real covers from songs in that
-  // genre, the same "gentle slideshow" ArtistArt does in the app for an
-  // artist's albums — one gradient tile felt static next to song cards that
-  // show a specific cover. One shared timer drives every tile (cheaper than
-  // one Timer per tile, and visually indistinguishable), and a slide that
-  // 404s is marked dead and skipped rather than retried or removed — removing
-  // it would shift every later index and desync which slide "1", "2"... mean.
-  let _tileCycleTimer = null;
-  const _tileCyclePeriodMs = 6000;
-
-  function _tileArtCandidates(songs) {
+  // A representative handful of an entity's distinct (artist, album) pairs,
+  // capped at 4 — feeds coverArt's rotation. Shared by genre tiles (several
+  // artists/albums in a genre) and Browse's artist-within-genre chips (one
+  // artist's several albums), which are the same "several covers for one
+  // bucket" situation ArtistArt exists for in the app.
+  function artCandidatesFrom(songs) {
     const seen = new Set();
     const out = [];
     for (const s of (songs || [])) {
@@ -338,14 +365,13 @@
   }
 
   function renderGenreTiles(cols) {
-    if (_tileCycleTimer) { clearInterval(_tileCycleTimer); _tileCycleTimer = null; }
     const genres = cols.filter((c) => c.kind === 'genre');
     const el = $('genre-tiles');
     if (!genres.length) { el.innerHTML = ''; return; }
     el.innerHTML = `
       <div class="tiles-title">Genres</div>
       <div class="tiles">${genres.map((c, i) => {
-        const cands = _tileArtCandidates(c.songs);
+        const cands = artCandidatesFrom(c.songs);
         const slides = cands.map((cd, si) => {
           const url = `${CFG.gateway}/api/art?artist=${encodeURIComponent(cd.artist)}` +
                       `&album=${encodeURIComponent(cd.album)}`;
@@ -353,7 +379,7 @@
                  `src="${url}" alt="" loading="lazy" ` +
                  `onerror="this.dataset.dead='1'; this.classList.remove('active')">`;
         }).join('');
-        return `<div class="tile" data-i="${i}" style="background:${tileGradient(c.facet)}">
+        return `<div class="tile art-rotate" data-i="${i}" style="background:${tileGradient(c.facet)}">
           ${slides}
           <span class="tile-count">${(c.songs || []).length}</span>
           <span class="tile-label">${esc(c.title.replace(/^Best of /, ''))}</span>
@@ -363,17 +389,6 @@
     el.querySelectorAll('.tile').forEach((t) => {
       t.onclick = () => openCollection(genres[+t.dataset.i]);
     });
-    if (genres.some((c) => _tileArtCandidates(c.songs).length > 1)) {
-      _tileCycleTimer = setInterval(() => {
-        el.querySelectorAll('.tile').forEach((t) => {
-          const slides = [...t.querySelectorAll('.tile-slide')].filter((im) => !im.dataset.dead);
-          if (slides.length < 2) return;
-          const cur = slides.findIndex((im) => im.classList.contains('active'));
-          slides.forEach((im) => im.classList.remove('active'));
-          slides[(cur + 1) % slides.length].classList.add('active');
-        });
-      }, _tileCyclePeriodMs);
-    }
   }
 
   function renderRows(cols) {
@@ -581,13 +596,29 @@
       return;
     }
     empty.hidden = true;
-    const ico = kind === 'genre' ? '🏷' : kind === 'artist' ? '👤' : '💿';
+    // Same card component Home uses, not a lookalike: real cover art when
+    // the bucket has song data to look it up by, generated art otherwise.
+    //   - root artist/genre names come straight from /api/facets (name +
+    //     count only, no songs), so there is nothing to fetch a cover BY —
+    //     generated art only, same as any song with no artist.
+    //   - an ALBUM bucket (b.items present, one artist + one album) gets a
+    //     single real cover, same as any song card.
+    //   - an ARTIST bucket drilled from a genre (b.items present, one
+    //     artist but possibly several albums) rotates through up to 4 real
+    //     covers — the same "several covers for one bucket" case ArtistArt
+    //     covers in the app, via the shared artCandidatesFrom/coverArt path.
     wrap.innerHTML = buckets.map((b, i) => {
       const active = (kind === 'album' && state.album && state.album.key === b.key) ? ' active' : '';
-      return `<button class="chip${active}" data-i="${i}">
-        <span class="c-ico">${ico}</span>
-        <span class="c-name">${esc(b.label)}</span>
-        <span class="c-count">${b.count}</span>
+      let art;
+      if (b.items && b.items.length) {
+        art = kind === 'album'
+          ? { artist: b.items[0].artist, album: b.label }
+          : artCandidatesFrom(b.items);
+      }
+      return `<button class="card chip${active}" data-i="${i}">
+        <div class="cover">${coverArt(seedFromName(b.label), art ? { art } : undefined)}</div>
+        <div class="c-title">${esc(b.label)}</div>
+        <div class="c-sub">${b.count} song${b.count === 1 ? '' : 's'}</div>
       </button>`;
     }).join('');
 
@@ -1070,6 +1101,11 @@
     refreshCollections();
     setInterval(refreshFacets, CFG.refreshMs);
     setInterval(refreshCollections, Math.max(CFG.refreshMs, 60000));
+    // One timer for the whole page: it re-scans the live DOM every tick, so
+    // it needs starting only once here, not re-armed on every render — a
+    // view swap (innerHTML =) simply removes its old .art-rotate elements
+    // from what the next tick finds, no leak and nothing to clean up.
+    startArtRotation(document);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
