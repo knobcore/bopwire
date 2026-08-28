@@ -676,26 +676,27 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // and retries until va:<node_id> confirms it landed on chain; mints from
     // this node validate once that tx mines (the pre-v: blocks carry no mints).
 
-    // Bootstrap first moderator wallet (runs once, guarded by sentinel key)
-    std::cerr << "[dbg] moderator bootstrap\n";
-    {
-        auto sentinel = db.get("moderator_initialized");
-        if (!sentinel) {
-            leveldb::WriteBatch mod_batch;
-            auto mod_kp = mc::crypto::generate_keypair();
-            std::ofstream mod_f(cfg.data_dir + "/moderator.txt");
-            mod_f << "Private Key: " << mc::crypto::to_hex(mod_kp.private_key.data(),
-                                                            mod_kp.private_key.size()) << "\n";
-            mod_f << "Address:     " << mc::crypto::to_checksum_hex(mod_kp.address) << "\n";
-            mod_f.close();
-            db.add_moderator(mod_batch, mod_kp.address);
-            db.put_batch(mod_batch, "moderator_initialized", {1});
-            db.write(mod_batch);
-            std::cout << "[node] moderator wallet created — " << cfg.data_dir << "/moderator.txt\n";
-            std::cout << "[node] moderator address: "
-                      << mc::crypto::to_checksum_hex(mod_kp.address) << "\n";
-        }
-    }
+    // NO moderator bootstrap here — deliberately.
+    //
+    // This used to generate a moderator keypair on first boot, write its
+    // PRIVATE KEY in plaintext to <data_dir>/moderator.txt, and grant that
+    // address moderator status via a direct db.add_moderator. Three things
+    // were wrong with it:
+    //
+    //   * it made every full-node operator a moderator of their own node,
+    //     which is exactly what the public/moderator split exists to prevent;
+    //   * granting is the BOOTSTRAP program's job (bopwire-bootstrap writes
+    //     the founder GRANT into genesis, and the founder grants moderators
+    //     from the moderator console) — a node granting itself is not part of
+    //     consensus and must not be;
+    //   * it is the same defect the comment above records being fixed for the
+    //     v: registry: a raw db write outside any block apply, so it never
+    //     entered a block, diverged the committed state_root, and differed per
+    //     node.
+    //
+    // Existing chains are unaffected: the write already happened and its
+    // sentinel is set, so nothing re-runs and no state changes. Nothing else
+    // in the tree reads "moderator_initialized".
 
     std::cerr << "[dbg] initializing chain\n";
     // Initialize chain
