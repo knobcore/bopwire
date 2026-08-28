@@ -475,8 +475,13 @@ add_library(bopwire_static STATIC ${MC_SOURCES})
 target_include_directories(bopwire_static PUBLIC ${MC_INCLUDE_DIRS})
 target_link_libraries(bopwire_static PUBLIC ${MC_LINK_LIBS})
 
-# Node executable (public). Read-only monitor TUI only — the moderation /
-# bootstrap TUI lives in the optional private bopwire-admin target below.
+# Node executable (public). Its screen is the shared monitor
+# (tools/monitor_tui.cpp: F1 status, F2 logs) PLUS the password-protected
+# wallet page it now offers (F3: unlock / address / balance / send /
+# receive), fed by the thin adapter in tools/node_tui_adapter.cpp. The
+# moderation / bootstrap TUIs live in the optional private
+# bopwire-bootstrap + bopwire-modclient targets below — no moderator surface
+# is compiled into this binary.
 add_executable(bopwire-node
     tools/node_main.cpp
     tools/node_tui_adapter.cpp
@@ -513,34 +518,41 @@ else()
 endif()
 
 # --------------------------------------------------------------------
-# bopwire-admin (PRIVATE, optional). The founder/moderator program: a full
-# founder BOOTSTRAP tool (genesis writer) — NOT a full node. It opens the
-# chain DB, writes block 1 (founder GRANT only, no premine) + the founder /
-# moderation keys, and exits; the full node reads that genesis on boot.
-# Ongoing moderation uses the thin RPC console bopwire-modclient. Its source
-# lives in tools/admin/ (.gitignored — copied to the operator's host, never
-# committed). Built only when that private source is present.
+# bopwire-bootstrap (PRIVATE, optional). The BOOTSTRAP program — one of the
+# project's separate programs, NOT a node and NOT the moderator console. It
+# creates the chain: opens the chain DB, writes block 1 (founder GRANT only,
+# no premine) and the founder / moderation keys, then exits. The wallet and
+# password it produces are what you then hand to the moderator console
+# (bopwire-modclient), which does the ongoing moderation.
+#
+# Named bopwire-admin until 2026-08-28. "admin" was ambiguous next to the
+# moderator console — this program's whole job is bootstrapping a chain, so
+# it says so.
+#
+# Source lives in tools/admin/ (.gitignored — copied to the operator's host,
+# never committed, so moderator/bootstrap tooling never ships in the public
+# repo). Built only when that private source is present.
 # --------------------------------------------------------------------
 if(EXISTS "${CMAKE_SOURCE_DIR}/tools/admin/admin_main.cpp")
-  message(STATUS "bopwire-admin: genesis-writer source found — ENABLED")
-  add_executable(bopwire-admin
+  message(STATUS "bopwire-bootstrap: genesis-writer source found — ENABLED")
+  add_executable(bopwire-bootstrap
       tools/admin/admin_main.cpp
       tools/admin/genesis_writer.cpp
       tools/node_wallet.cpp)
-  target_include_directories(bopwire-admin PRIVATE ${MC_INCLUDE_DIRS})
-  target_link_libraries(bopwire-admin PRIVATE bopwire_static)  # chain code to write block 1
+  target_include_directories(bopwire-bootstrap PRIVATE ${MC_INCLUDE_DIRS})
+  target_link_libraries(bopwire-bootstrap PRIVATE bopwire_static)  # chain code to write block 1
   if (WIN32)
     find_package(unofficial-pdcurses CONFIG REQUIRED)
-    target_link_libraries(bopwire-admin PRIVATE unofficial::pdcurses::pdcurses)
-    target_compile_definitions(bopwire-admin PRIVATE MC_TUI_PDCURSES=1)
+    target_link_libraries(bopwire-bootstrap PRIVATE unofficial::pdcurses::pdcurses)
+    target_compile_definitions(bopwire-bootstrap PRIVATE MC_TUI_PDCURSES=1)
   else()
     set(CURSES_NEED_NCURSES TRUE)
     find_package(Curses REQUIRED)
-    target_include_directories(bopwire-admin PRIVATE ${CURSES_INCLUDE_DIRS})
-    target_link_libraries(bopwire-admin PRIVATE ${CURSES_LIBRARIES})
+    target_include_directories(bopwire-bootstrap PRIVATE ${CURSES_INCLUDE_DIRS})
+    target_link_libraries(bopwire-bootstrap PRIVATE ${CURSES_LIBRARIES})
   endif()
 else()
-  message(STATUS "bopwire-admin: genesis-writer source absent — public node only")
+  message(STATUS "bopwire-bootstrap: genesis-writer source absent — public node only")
 endif()
 
 endif() # NOT MC_MINI_NODE_ONLY
@@ -554,7 +566,11 @@ endif() # NOT MC_MINI_NODE_ONLY
 # RELAY_REWARD tx type.
 add_executable(bopwire-mini-node
   tools/mini_node.cpp
-  tools/monitor_tui.cpp
+  # The mini-node's only screen is the password-protected wallet. It does NOT
+  # compile tools/monitor_tui.cpp (the full node's status/logs monitor) — the
+  # relay has no operator-facing status surface, and definitely no moderator
+  # surface, by design.
+  tools/mini_wallet_tui.cpp
   tools/node_wallet.cpp
   src/net/load_monitor.cpp
   src/crypto/hash.cpp
@@ -570,9 +586,17 @@ target_link_libraries(bopwire-mini-node PRIVATE
   wallycore
   secp256k1
   ${MC_OPENSSL_SSL}
-  ${MC_OPENSSL_CRYPTO})
+  ${MC_OPENSSL_CRYPTO}
+  # Same reason as bopwire-modclient: this target compiles src/crypto/keys.cpp
+  # directly with its own link list instead of MC_LINK_LIBS, so libsodium has
+  # to be named here or crypto_pwhash (Argon2id) stays unresolved.
+  ${SODIUM_LIBRARIES}${SODIUM_LIB})
 target_include_directories(bopwire-mini-node PRIVATE
   ${OPENSSL_INCLUDE_DIR}
+  # src/crypto/keystore.cpp (the wallet keystore the mini-node loads and
+  # --create-wallet writes) includes <nlohmann/json.hpp>. The vendored single
+  # header lives here; without it the mini-node target does not compile.
+  ${NLOHMANN_JSON_INCLUDE_DIRS}
   ${CMAKE_SOURCE_DIR}/deps/libwally-core/include
   ${CMAKE_SOURCE_DIR}/deps/libwally-core/src/secp256k1/include)
 if(WIN32)

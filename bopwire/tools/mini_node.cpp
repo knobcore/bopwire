@@ -20,12 +20,18 @@
 #include "../src/crypto/signature.h"  // sign_data for relay.report (#10), verify_data for chat
 #include "../src/crypto/bip39.h"   // bip39_generate_12 / bip39_mnemonic_to_keypair
 #include "../src/crypto/keystore.h" // wallet keystore (export/import, headless load)
-#include "monitor_tui.h"
+#include "../src/core/transaction.h" // TransferTx — operator wallet sends
+#include "mini_wallet_tui.h"        // the mini-node's ONLY screen: the wallet
 #include "node_wallet.h"
 #include <array>                    // DeliveryAccum delivery_id (#10)
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sys/stat.h>
+#ifndef _WIN32
+  #include <termios.h>   // echo-off password prompt for --create-wallet
+  #include <unistd.h>
+#endif
 
 // librats vendors nlohmann::json at src/json.hpp; reuse it here so we can
 // parse incoming RPC envelopes properly (the previous ad-hoc string-search
@@ -604,7 +610,13 @@ std::string fmt_short_peer(const std::string& peer_id) {
     return peer_id.substr(0, 12) + "...";
 }
 
+// Set once --tui is chosen. The plain ANSI event monitor below and the
+// curses wallet screen cannot share the terminal, so the monitor stands down
+// for the whole run when the TUI owns the tty.
+std::atomic<bool> g_tui_mode{false};
+
 void redraw_monitor() {
+    if (g_tui_mode.load()) return;
     // ANSI: clear screen + cursor home. Works on Windows 10+ conhost,
     // Windows Terminal, and every Linux terminal.
     std::ostringstream out;
@@ -2469,6 +2481,240 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
     rats_string_free(message_data);
 }
 
+// ---- Operator wallet RPC client -------------------------------------
+//
+// The mini-node deliberately holds no chain state, so the wallet screen's
+// balance and its outbound transfers are served by whichever FULL node we are
+// meshed with: we send the very same `bopwire.request` envelope a player would
+// send and wait for the matching `bopwire.reply`.
+//
+// Every req_id minted here is prefixed "wlt-" so on_relay_reply absorbs it
+// instead of trying to match it against the player relay table — exactly the
+// trick the "chatmods-" cache refresh already uses.
+//
+// These calls BLOCK, so they only ever run on the wallet TUI's own threads,
+// never on the librats io thread.
+
+struct WalletRpcSlot {
+    bool           done = false;
+    nlohmann::json reply;
+};
+std::mutex                                     g_wallet_rpc_mu;
+std::condition_variable                        g_wallet_rpc_cv;
+std::unordered_map<std::string, WalletRpcSlot> g_wallet_rpc;
+
+// Peer ids of the full nodes we currently know a route for.
+std::vector<std::string> full_node_targets() {
+    std::vector<std::string> out;
+    std::lock_guard<std::mutex> lk(g_routes_mu);
+    out.reserve(g_routes.size());
+    for (const auto& kv : g_routes) {
+        const std::string& pid = kv.second.rats_peer_id.empty()
+            ? kv.second.node_id : kv.second.rats_peer_id;
+        if (!pid.empty()) out.push_back(pid);
+    }
+    return out;
+}
+
+// One request/response round trip, tried against up to `kMaxTries` full nodes
+// so a single stale route doesn't strand the wallet. Returns true when a reply
+// with status "ok" arrived; `out_body` then holds its `body` object.
+bool wallet_rpc(const std::string& type, const nlohmann::json& body,
+                nlohmann::json& out_body, std::string& err,
+                int timeout_ms = 6000, size_t max_tries = 3) {
+    if (!g_client) { err = "not connected"; return false; }
+    auto targets = full_node_targets();
+    if (targets.empty()) { err = "no full node route known yet"; return false; }
+    if (max_tries == 0) max_tries = 1;
+    if (targets.size() > max_tries) targets.resize(max_tries);
+
+    for (const auto& target : targets) {
+        const std::string req_id = "wlt-" + new_relay_req_id();
+        {
+            std::lock_guard<std::mutex> lk(g_wallet_rpc_mu);
+            g_wallet_rpc[req_id] = WalletRpcSlot{};
+        }
+        nlohmann::json env = {{"req_id", req_id}, {"type", type}, {"body", body}};
+        const rats_error_t rc = rats_send_message(
+            g_client, target.c_str(), kRequestType, env.dump().c_str());
+        if (rc != RATS_SUCCESS) {
+            std::lock_guard<std::mutex> lk(g_wallet_rpc_mu);
+            g_wallet_rpc.erase(req_id);
+            err = "full node unreachable";
+            continue;
+        }
+        nlohmann::json reply;
+        bool got = false;
+        {
+            std::unique_lock<std::mutex> lk(g_wallet_rpc_mu);
+            g_wallet_rpc_cv.wait_for(
+                lk, std::chrono::milliseconds(timeout_ms),
+                [&] {
+                    auto it = g_wallet_rpc.find(req_id);
+                    return it == g_wallet_rpc.end() || it->second.done;
+                });
+            auto it = g_wallet_rpc.find(req_id);
+            if (it != g_wallet_rpc.end()) {
+                got   = it->second.done;
+                reply = it->second.reply;
+                g_wallet_rpc.erase(it);
+            }
+        }
+        if (!got) { err = "timed out waiting for a full node"; continue; }
+        const std::string status = reply.value("status", std::string());
+        if (status != "ok") {
+            // Surface the node's own error text — it is the difference between
+            // "insufficient balance" and "bad address".
+            err = reply.contains("error") && reply["error"].is_string()
+                      ? reply["error"].get<std::string>()
+                      : (status.empty() ? std::string("rejected") : status);
+            return false;
+        }
+        out_body = reply.value("body", nlohmann::json::object());
+        return true;
+    }
+    if (err.empty()) err = "no full node answered";
+    return false;
+}
+
+// 1 token = 1e8 internal units, matching mc::Ledger. Re-stated here because
+// the mini-node does not link the ledger translation unit.
+constexpr uint64_t kWalletTokenDecimals = 100000000ULL;
+
+// Same grammar as Ledger::parse_balance: optional fractional part, at most 8
+// digits. Used only to reject typos before we sign; the full node re-parses
+// the decimal string we send it.
+bool wallet_parse_amount(const std::string& s, uint64_t& out) {
+    if (s.empty()) return false;
+    const auto dot = s.find('.');
+    std::string whole_str = (dot == std::string::npos) ? s : s.substr(0, dot);
+    std::string frac_str  = (dot == std::string::npos) ? std::string("0")
+                                                      : s.substr(dot + 1);
+    if (whole_str.empty()) whole_str = "0";
+    if (dot != std::string::npos) {
+        if (frac_str.size() > 8) return false;
+        while (frac_str.size() < 8) frac_str += '0';
+    }
+    for (char c : whole_str) if (!std::isdigit((unsigned char)c)) return false;
+    for (char c : frac_str)  if (!std::isdigit((unsigned char)c)) return false;
+    try {
+        const uint64_t whole = std::stoull(whole_str);
+        const uint64_t frac  = std::stoull(frac_str);
+        if (whole > (UINT64_MAX - frac) / kWalletTokenDecimals) return false;
+        out = whole * kWalletTokenDecimals + frac;
+    } catch (...) { return false; }
+    return out > 0;
+}
+
+// Spendable balance of THIS wallet, as the decimal string the full node
+// formats. Empty on any failure — the screen renders that as "unavailable".
+std::string wallet_fetch_balance() {
+    nlohmann::json out;
+    std::string err;
+    // Deliberately short + few retries: this runs on the wallet screen's
+    // background refresher, which is joined on quit, so a wedged full node
+    // must not be able to hold up shutdown for long.
+    if (!wallet_rpc("wallet.balance",
+                    nlohmann::json{{"address", g_wallet_address_hex}}, out, err,
+                    /*timeout_ms=*/3000, /*max_tries=*/2))
+        return {};
+    if (out.contains("balance") && out["balance"].is_string())
+        return out["balance"].get<std::string>();
+    return {};
+}
+
+// Sign and submit a TransferTx from this mini-node's wallet.
+//
+// The private key never leaves this process: we fetch the next nonce, build
+// the canonical TransferTx, sign it locally, and hand the full node only the
+// signed fields — the same shape the player wallet posts. Returns false with
+// `msg` set on any rejection.
+bool wallet_send_tokens(const std::string& to_hex, const std::string& amount,
+                        std::string& msg) {
+    mc::Address to_addr{};
+    if (!mc::crypto::parse_address_checksummed(to_hex, to_addr)) {
+        msg = "bad recipient address";
+        return false;
+    }
+    uint64_t units = 0;
+    if (!wallet_parse_amount(amount, units)) {
+        msg = "bad amount (max 8 decimal places, must be > 0)";
+        return false;
+    }
+    if (g_mini_priv.empty()) { msg = "wallet key not loaded"; return false; }
+
+    nlohmann::json nonce_body;
+    std::string err;
+    if (!wallet_rpc("wallet.nonce",
+                    nlohmann::json{{"address", g_wallet_address_hex}},
+                    nonce_body, err)) {
+        msg = "nonce: " + err;
+        return false;
+    }
+    if (!nonce_body.contains("nonce") || !nonce_body["nonce"].is_number_unsigned()) {
+        msg = "nonce: malformed reply";
+        return false;
+    }
+
+    mc::TransferTx tx{};
+    tx.from_address = g_mini_addr20;
+    tx.to_address   = to_addr;
+    tx.amount       = units;
+    tx.nonce        = nonce_body["nonce"].get<uint64_t>();
+    tx.from_pubkey  = g_mini_pub;
+    const auto sign_msg = tx.sign_message();
+    tx.signature = mc::crypto::sign_data(sign_msg.data(), sign_msg.size(), g_mini_priv);
+    if (!tx.verify_signature()) { msg = "local signing failed"; return false; }
+
+    nlohmann::json body = {
+        {"from_address", mc::crypto::to_checksum_hex(tx.from_address)},
+        {"to_address",   mc::crypto::to_checksum_hex(tx.to_address)},
+        {"amount",       amount},
+        {"nonce",        tx.nonce},
+        {"from_pubkey",  mc::crypto::to_hex(std::vector<uint8_t>(
+                             tx.from_pubkey.begin(), tx.from_pubkey.end()))},
+        {"signature",    mc::crypto::to_hex(std::vector<uint8_t>(
+                             tx.signature.begin(), tx.signature.end()))},
+    };
+    nlohmann::json out;
+    if (!wallet_rpc("wallet.transfer", body, out, err, 10000)) {
+        msg = err;
+        return false;
+    }
+    const std::string h = out.value("tx_hash", std::string());
+    msg = h.empty() ? std::string("accepted")
+                    : ("tx " + h.substr(0, 16) + "...");
+    return true;
+}
+
+// Re-check an operator-typed password against the wallet keystore on disk.
+// Only ever used to gate the screen; the decrypted mnemonic is wiped
+// immediately and never leaves this function.
+std::string g_wallet_keystore_path;
+// Fallback gate for the --seed path, where the identity came straight off the
+// command line and there is no keystore to test a password against: compare
+// with the password the operator supplied at launch. Empty => the screen has
+// no lock, which is documented under --seed in --help.
+std::string g_wallet_screen_password;
+
+bool wallet_verify_password(const std::string& password) {
+    if (!g_wallet_keystore_path.empty()) {
+        std::ifstream f(g_wallet_keystore_path, std::ios::binary);
+        if (f) {
+            std::stringstream ss;
+            ss << f.rdbuf();
+            std::string mnemonic;
+            const bool ok =
+                mc::crypto::keystore_decrypt(ss.str(), password, mnemonic);
+            std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+            return ok;
+        }
+    }
+    if (!g_wallet_screen_password.empty())
+        return password == g_wallet_screen_password;
+    return false;
+}
+
 // ---- Relay reply interceptor ----------------------------------------
 //
 // Catches every `bopwire.reply` directed at the mini-node, checks whether
@@ -2527,6 +2773,25 @@ void on_relay_reply(void* /*ud*/, const char* peer_id, const char* message_data)
                 g_chat_mods_fetched_ms = now_ms();
             }
         } catch (const nlohmann::json::exception&) { /* keep old cache */ }
+        rats_string_free(peer_id);
+        rats_string_free(message_data);
+        return;
+    }
+
+    // A reply to one of OUR OWN operator-wallet RPCs (balance / nonce /
+    // transfer). Absorb it here for the same reason as the chatmods- refresh
+    // above: it is not a relayed player request, so it must never fall
+    // through to the pending-relay path.
+    if (req_id.rfind("wlt-", 0) == 0) {
+        {
+            std::lock_guard<std::mutex> lk(g_wallet_rpc_mu);
+            auto it = g_wallet_rpc.find(req_id);
+            if (it != g_wallet_rpc.end()) {
+                it->second.reply = env;
+                it->second.done  = true;
+            }
+        }
+        g_wallet_rpc_cv.notify_all();
         rats_string_free(peer_id);
         rats_string_free(message_data);
         return;
@@ -3056,6 +3321,168 @@ void mini_hello_heartbeat_loop() {
     }
 }
 
+// ---- Wallet password sources + `--create-wallet` ---------------------
+//
+// Password precedence is identical to bopwire-node: file > inline > env >
+// (interactive only) terminal prompt. A FILE is the documented form because,
+// unlike --wallet-password, it never appears in `ps` output or shell history.
+
+std::string read_password_file(const std::string& path) {
+    std::ifstream pf(path);
+    if (!pf) return {};
+    std::string pw;
+    std::getline(pf, pw);
+    while (!pw.empty() && (pw.back() == '\r' || pw.back() == '\n')) pw.pop_back();
+    return pw;
+}
+
+// Prompt on the controlling terminal with echo disabled. Only reached by
+// --create-wallet when the operator supplied no password source at all.
+std::string prompt_password_tty(const char* label) {
+    std::cout << label << std::flush;
+    std::string pw;
+#ifndef _WIN32
+    struct termios old_t{}, new_t{};
+    if (::isatty(STDIN_FILENO) != 0 && ::tcgetattr(STDIN_FILENO, &old_t) == 0) {
+        new_t = old_t;
+        new_t.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+        ::tcsetattr(STDIN_FILENO, TCSAFLUSH, &new_t);
+        std::getline(std::cin, pw);
+        ::tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_t);
+        std::cout << "\n";
+        return pw;
+    }
+#endif
+    std::getline(std::cin, pw);
+    std::cout << "\n";
+    return pw;
+}
+
+// Wrap an operator-supplied 12-word mnemonic in the standard node keystore.
+// Deliberately mirrors mc::create_node_wallet step for step (same policy
+// check, same keystore_encrypt call, same 0600 write via mc::write_secret_file)
+// so an imported wallet is byte-for-byte the same kind of artefact as a
+// freshly created one — and therefore just as portable across nodes.
+std::optional<mc::CreatedWallet> import_wallet_from_seed(
+    const std::string& out_path, const std::string& mnemonic,
+    const std::string& password, bool overwrite, std::string& err) {
+    err.clear();
+    const std::string perr = mc::crypto::password_policy_error(password);
+    if (!perr.empty()) { err = perr; return std::nullopt; }
+    if (!overwrite) {
+        std::ifstream probe(out_path, std::ios::binary);
+        if (probe) {
+            err = "refusing to overwrite existing wallet at " + out_path +
+                  " (pass --force to replace it)";
+            return std::nullopt;
+        }
+    }
+    if (!mc::crypto::bip39_validate(mnemonic)) {
+        err = "--seed is not a valid BIP39 phrase "
+              "(check the word count, spelling and order)";
+        return std::nullopt;
+    }
+    auto kp = mc::crypto::bip39_mnemonic_to_keypair(mnemonic, "");
+    if (!kp) { err = "--seed failed key derivation"; return std::nullopt; }
+    const std::string addr = mc::crypto::to_checksum_hex(kp->address);
+    const std::string ks   = mc::crypto::keystore_encrypt(mnemonic, password, addr);
+    if (ks.empty()) { err = "keystore encryption failed"; return std::nullopt; }
+    if (!mc::write_secret_file(out_path, ks)) {
+        err = "cannot write " + out_path;
+        return std::nullopt;
+    }
+    mc::CreatedWallet out;
+    out.mnemonic = mnemonic;
+    out.address  = addr;
+    out.path     = out_path;
+    return out;
+}
+
+// `bopwire-mini-node --create-wallet` — make a brand-new password-protected
+// wallet and exit. No config is written, no librats client is created, no
+// network is touched.
+//
+// The artefact is EXACTLY the keystore that --wallet-file already consumes
+// (mc::create_node_wallet: scrypt + AES-256-GCM around a 12-word BIP39
+// mnemonic, written 0600) — the same function `bopwire-node create-wallet`
+// calls — so the file + password pair loads into any bopwire node, full or
+// mini, and into several of them at the same time, because loading only ever
+// READS the keystore.
+//
+// The 12 words are printed once on stdout (or written 0600 with --seed-out).
+// They are never handed to a logger: this runs before the TUI's stdio capture
+// and the mini-node has no log file of its own.
+int run_create_wallet(const std::string& wallet_file,
+                      std::string        wallet_password,
+                      const std::string& wallet_password_file,
+                      const std::string& seed_words,
+                      const std::string& seed_out,
+                      bool               force) {
+    const std::string path =
+        wallet_file.empty() ? std::string("mini-node-wallet.json") : wallet_file;
+
+    if (wallet_password.empty() && !wallet_password_file.empty())
+        wallet_password = read_password_file(wallet_password_file);
+    if (wallet_password.empty()) {
+        if (const char* e = std::getenv("BOPWIRE_WALLET_PASSWORD")) wallet_password = e;
+    }
+    if (wallet_password.empty()) {
+        std::string p1 = prompt_password_tty(
+            "New wallet password (>=12 chars, 1 upper, 1 special): ");
+        std::string p2 = prompt_password_tty("Confirm password: ");
+        if (p1.empty() || p1 != p2) {
+            std::fill(p1.begin(), p1.end(), '\0');
+            std::fill(p2.begin(), p2.end(), '\0');
+            std::cerr << "[wallet] passwords empty or do not match — nothing written.\n"
+                         "         Non-interactively, pass --wallet-password-file PATH.\n";
+            return 1;
+        }
+        std::fill(p2.begin(), p2.end(), '\0');
+        wallet_password = p1;
+    }
+
+    std::string err;
+    std::optional<mc::CreatedWallet> created;
+    if (seed_words.empty()) {
+        // Fresh 12-word wallet. Same helper `bopwire-node create-wallet` uses,
+        // so the two programs emit byte-identical keystores.
+        created = mc::create_node_wallet(path, wallet_password, force, err);
+    } else {
+        // --seed: wrap an EXISTING mnemonic in the very same keystore format,
+        // so a phrase minted on one node can be re-homed onto this one.
+        created = import_wallet_from_seed(path, seed_words, wallet_password,
+                                          force, err);
+    }
+    std::fill(wallet_password.begin(), wallet_password.end(), '\0');
+    if (!created) {
+        std::cerr << "[wallet] --create-wallet failed: " << err << "\n";
+        return 1;
+    }
+    if (!seed_out.empty() &&
+        !mc::write_secret_file(seed_out, created->mnemonic + "\n")) {
+        std::cerr << "[wallet] WARNING: could not write seed to " << seed_out << "\n";
+    }
+
+    std::cout << "\nWallet created.\n"
+              << "  keystore : " << created->path    << "   (mode 0600)\n"
+              << "  address  : " << created->address << "\n"
+              << "  seed     : " << created->mnemonic << "\n";
+    if (!seed_out.empty())
+        std::cout << "  seed file: " << seed_out
+                  << "   (mode 0600 — delete once written down)\n";
+    std::cout <<
+        "\nWrite the 12 words down now: this is the only time they are shown.\n"
+        "Store the password in a file the node can read, e.g.\n"
+        "  install -m600 /dev/stdin /var/lib/bopwire/mini-wallet.pass\n"
+        "Then run the mini-node with:\n"
+        "  bopwire-mini-node --wallet-file " << created->path
+        << " --wallet-password-file <passfile>\n"
+        "The same keystore + password loads into ANY bopwire node — full or\n"
+        "mini — including several at once (the file is only ever read).\n";
+    std::fill(created->mnemonic.begin(), created->mnemonic.end(), '\0');
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -3064,6 +3491,12 @@ int main(int argc, char** argv) {
     mc::net::LoadConfig load_cfg;
     bool tui_enabled = false;  // --tui: run the interactive curses TUI
     std::string wallet_file, wallet_password, wallet_password_file;
+    // --create-wallet: mint a new keystore and exit (see run_create_wallet).
+    bool        create_wallet = false;
+    bool        force_wallet  = false;
+    std::string seed_out;
+    // --seed: the 12-word mnemonic given literally on the command line.
+    std::string seed_words;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -3112,6 +3545,14 @@ int main(int argc, char** argv) {
             wallet_password = argv[++i];
         } else if (a == "--wallet-password-file" && i + 1 < argc) {
             wallet_password_file = argv[++i];
+        } else if (a == "--seed" && i + 1 < argc) {
+            seed_words = argv[++i];
+        } else if (a == "--create-wallet") {
+            create_wallet = true;
+        } else if (a == "--seed-out" && i + 1 < argc) {
+            seed_out = argv[++i];
+        } else if (a == "--force") {
+            force_wallet = true;
         } else if (a == "-h" || a == "--help") {
             std::cout << "Usage: mini-node [--rats-port N] [--quiet]\n"
                       << "  --rats-port          librats TCP port (default " << kDefaultRatsPort << ")\n"
@@ -3122,7 +3563,37 @@ int main(int argc, char** argv) {
                       << "                       (for thousands of minis; default off)\n"
                       << "  --mesh-fanout N      peers per gossip round when --sparse-mesh (default 16)\n"
                       << "  --mininodes-list-max N  cap mininodes.list to N sampled peers (default 64)\n"
-                      << "  --require-signed-routes  drop routes without a valid signature (default off)\n";
+                      << "  --require-signed-routes  drop routes without a valid signature (default off)\n"
+                      << "\n Wallet (the mini-node's only operator surface):\n"
+                      << "  --tui                    run the password-protected wallet screen\n"
+                      << "                           (send / receive only - nothing else)\n"
+                      << "\n  Seed and password can be given either as a literal string or from\n"
+                      << "  a file. When both forms are given the STRING WINS:\n"
+                      << "    seed:      --seed  >  --wallet-file\n"
+                      << "    password:  --wallet-password  >  --wallet-password-file  >  env\n"
+                      << "\n"
+                      << "  --seed \"<12 words>\"      run from this BIP39 phrase directly; no\n"
+                      << "                           keystore is read or written. With\n"
+                      << "                           --create-wallet, imports the phrase instead\n"
+                      << "                           of generating one. (Appears in `ps` and\n"
+                      << "                           shell history.)\n"
+                      << "  --wallet-password PW     wallet password as a literal string.\n"
+                      << "                           (Appears in `ps` and shell history.)\n"
+                      << "  --wallet-file PATH       encrypted wallet keystore\n"
+                      << "                           (default ./mini-node-wallet.json)\n"
+                      << "  --wallet-password-file PATH  read the wallet password from PATH\n"
+                      << "                           $BOPWIRE_WALLET_PASSWORD is also honoured.\n"
+                      << "  --create-wallet          create a wallet keystore and exit. Uses the\n"
+                      << "                           password from the flags above, else asks on\n"
+                      << "                           the terminal with echo off. Generates a fresh\n"
+                      << "                           12-word seed, or imports --seed if given, and\n"
+                      << "                           prints the seed once. The keystore + password\n"
+                      << "                           load into ANY full or mini node, and into\n"
+                      << "                           several of them at the same time.\n"
+                      << "  --seed-out PATH          with --create-wallet: also write the 12 words\n"
+                      << "                           to PATH, mode 0600, instead of only showing them\n"
+                      << "  --force                  with --create-wallet: overwrite an existing\n"
+                      << "                           keystore at --wallet-file\n";
             return 0;
         } else {
             // legacy --http-port flag is silently accepted+ignored so existing
@@ -3132,6 +3603,19 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    // --create-wallet short-circuits EVERYTHING else: no config write, no
+    // load monitor, no librats client. Handled here, before the config block
+    // below, so creating a wallet can never disturb a deployed node's state.
+    if (create_wallet) {
+        return run_create_wallet(wallet_file, wallet_password,
+                                 wallet_password_file, seed_words, seed_out,
+                                 force_wallet);
+    }
+
+    // The curses wallet screen owns the terminal for the whole run, so the
+    // plain ANSI event monitor stands down (redraw_monitor() no-ops).
+    g_tui_mode.store(tui_enabled);
 
     // Load persisted config so a re-run of mini-node with no flags
     // reuses the same load-monitor settings + rats port. Config path
@@ -3238,23 +3722,48 @@ int main(int argc, char** argv) {
     // First run with --tui -> a wizard creates/imports it; headless -> loaded
     // with --wallet-file/--wallet-password (or config/env). This replaces the
     // old plaintext mini-node.seed auto-gen.
+    //
+    // Precedence, for both the seed and the password, is STRING BEATS FILE:
+    //   seed:     --seed <words>      >  --wallet-file <keystore>
+    //   password: --wallet-password   >  --wallet-password-file  >  env
+    // so an operator can override a deployed unit file from the command line
+    // without editing anything on disk.
     {
-        if (wallet_password.empty() && !wallet_password_file.empty()) {
-            std::ifstream pf(wallet_password_file);
-            if (pf) {
-                std::getline(pf, wallet_password);
-                while (!wallet_password.empty() &&
-                       (wallet_password.back() == '\r' || wallet_password.back() == '\n'))
-                    wallet_password.pop_back();
-            }
-        }
+        if (wallet_password.empty() && !wallet_password_file.empty())
+            wallet_password = read_password_file(wallet_password_file);
         if (wallet_password.empty()) {
             if (const char* e = std::getenv("BOPWIRE_WALLET_PASSWORD")) wallet_password = e;
         }
-        const std::string wf =
-            wallet_file.empty() ? std::string("mini-node-wallet.json") : wallet_file;
-        auto kp_opt = mc::load_or_setup_node_identity(
-            ".", wf, wallet_password, tui_enabled, "mini-node");
+        std::optional<mc::crypto::KeyPair> kp_opt;
+        if (!seed_words.empty()) {
+            // --seed: run straight off the supplied 12 words. No keystore is
+            // read and none is written — use --create-wallet --seed for that.
+            if (!mc::crypto::bip39_validate(seed_words)) {
+                std::cerr << "[mini-node] FATAL: --seed is not a valid BIP39 "
+                             "phrase (check word count, spelling and order)\n";
+                return 5;
+            }
+            kp_opt = mc::crypto::bip39_mnemonic_to_keypair(seed_words, "");
+            if (!kp_opt) {
+                std::cerr << "[mini-node] FATAL: --seed failed key derivation\n";
+                return 5;
+            }
+            // There is no keystore to check an unlock password against, so the
+            // wallet screen's gate falls back to the password given at launch.
+            g_wallet_screen_password = wallet_password;
+            std::fill(seed_words.begin(), seed_words.end(), '\0');
+            seed_words.clear();
+            std::cout << "[mini-node] wallet identity from --seed "
+                         "(no keystore read or written)\n";
+        } else {
+            const std::string wf =
+                wallet_file.empty() ? std::string("mini-node-wallet.json") : wallet_file;
+            kp_opt = mc::load_or_setup_node_identity(
+                ".", wf, wallet_password, tui_enabled, "mini-node");
+            // Remember where the keystore lives so the wallet screen can
+            // re-check the operator's password on unlock / before each send.
+            g_wallet_keystore_path = mc::node_wallet_keystore_path();
+        }
         std::fill(wallet_password.begin(), wallet_password.end(), '\0');
         if (!kp_opt) {
             std::cerr << "[mini-node] FATAL: no usable wallet. Run once with --tui "
@@ -3413,24 +3922,19 @@ int main(int argc, char** argv) {
     }
 
     if (tui_enabled) {
-        // Interactive curses TUI (wallet export/import + live status). Runs on
-        // this thread until Q / signal; never touches the librats io thread.
-        mc::ui::MonitorState st;
-        st.title          = "bopwire mini-node";
-        st.seed_path      = "";   // identity is a password-protected keystore (wizard-managed); no plaintext-seed X/P
-        st.wallet_address = []() { return g_wallet_address_hex; };
-        st.peers          = [client]() { return std::to_string(rats_get_peer_count(client)); };
-        st.routes         = []() {
-            std::lock_guard<std::mutex> lk(g_routes_mu);
-            return std::to_string(g_routes.size());
-        };
-        st.players        = []() {
-            std::lock_guard<std::mutex> lk(g_players_mu);
-            return std::to_string(g_players.size());
-        };
-        st.rats_port      = [rats_port]() { return std::to_string(rats_port); };
-        mc::ui::monitor_start_log_capture();
-        mc::ui::run_monitor_tui(st, g_running);
+        // The mini-node's ENTIRE interactive surface: a password-protected
+        // wallet — unlock, address, balance, send, receive. Nothing else is
+        // exposed here (no peers/routes/players panels, no log tail, no
+        // bootstrap, and no moderator functionality whatsoever); the relay
+        // keeps running on its own threads behind the screen. Runs on this
+        // thread until Q / signal; never touches the librats io thread.
+        mc::ui::WalletTuiState st;
+        st.title           = "bopwire mini-node wallet";
+        st.address         = g_wallet_address_hex;
+        st.verify_password = wallet_verify_password;
+        st.balance         = wallet_fetch_balance;
+        st.send            = wallet_send_tokens;
+        mc::ui::run_wallet_tui(st, g_running);
     } else {
         // Display-only: redraw the ANSI monitor every second (non-quiet), or emit
         // a one-line status every minute in --quiet mode (clean for journald).

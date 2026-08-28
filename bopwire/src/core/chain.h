@@ -82,7 +82,7 @@ inline std::vector<Checkpoint> hardcoded_checkpoints() {
 // All-zero = UNPINNED (dev/test): behavior falls back to "first valid
 // self-grant wins", so local dev and the unit tests are unaffected. The
 // real 20-byte address is baked in during the bootstrap ceremony (after the
-// bopwire-admin wizard generates the founder wallet) and the release nodes
+// bopwire-bootstrap generates the founder wallet) and the release nodes
 // are rebuilt. This is deliberately a compile-time constant, like the
 // checkpoints above — an attacker can't change it without recompiling, and
 // honest nodes running the real binary reject their fork.

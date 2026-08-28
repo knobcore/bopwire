@@ -38,8 +38,17 @@ namespace {
 
 enum { CP_TITLE = 1, CP_OK, CP_WARN, CP_DIM, CP_HDR };
 
-std::string g_status;          // last action result (export/import)
+std::string g_status;          // last action result (export/import/wallet)
 int         g_status_color = CP_DIM;
+
+// ---- Optional wallet page (F3) state ---------------------------------
+// Only reachable when MonitorState::wallet_unlock is set. Kept here rather
+// than in the caller so the page behaves identically in every program that
+// switches it on.
+bool g_wallet_unlocked = false;
+bool g_wallet_receive  = false;   // showing the big receive address panel
+std::chrono::steady_clock::time_point g_wallet_last_key =
+    std::chrono::steady_clock::now();
 
 void setup_colors() {
     if (!has_colors()) return;
@@ -128,6 +137,7 @@ bool prompt_string(const char* title, std::string& out, int max_len = 200) {
     mvhline(y, 0, ' ', cols);
     mvprintw(y, 1, "%s", title);
     attroff(COLOR_PAIR(CP_HDR));
+    mvhline(y + 1, 0, ' ', cols);      // wipe whatever the last prompt echoed
     mvprintw(y + 1, 1, "> ");
     echo();
     curs_set(1);
@@ -141,6 +151,10 @@ bool prompt_string(const char* title, std::string& out, int max_len = 200) {
     out.assign(buf.data());
     while (!out.empty() && (out.back() == '\r' || out.back() == '\n' || out.back() == ' '))
         out.pop_back();
+    // Force a full repaint next refresh: if the terminal was resized after
+    // initscr(), curses' model is smaller than the tty and an erase() alone
+    // can leave the typed line on screen.
+    clearok(stdscr, TRUE);
     return !out.empty();
 }
 
@@ -153,6 +167,7 @@ bool prompt_secret(const char* title, std::string& out, int max_len = 128) {
     mvhline(y, 0, ' ', cols);
     mvprintw(y, 1, "%s", title);
     attroff(COLOR_PAIR(CP_HDR));
+    mvhline(y + 1, 0, ' ', cols);      // wipe whatever the last prompt echoed
     mvprintw(y + 1, 1, "> ");
     curs_set(1);
     noecho();
@@ -177,8 +192,27 @@ bool prompt_secret(const char* title, std::string& out, int max_len = 128) {
     }
     curs_set(0);
     nodelay(stdscr, TRUE);
+    clearok(stdscr, TRUE);
     out = std::move(buf);
     return !out.empty();
+}
+
+// Modal yes/no on the prompt line. True only on an explicit 'y'.
+bool prompt_confirm(const std::string& question) {
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    const int y = rows - 4;
+    attron(COLOR_PAIR(CP_WARN));
+    mvhline(y, 0, ' ', cols);
+    mvprintw(y, 1, "%s  [y/N]", question.c_str());
+    attroff(COLOR_PAIR(CP_WARN));
+    mvhline(y + 1, 0, ' ', cols);      // wipe the echoed input row
+    refresh();
+    nodelay(stdscr, FALSE);
+    const int c = getch();
+    nodelay(stdscr, TRUE);
+    clearok(stdscr, TRUE);
+    return c == 'y' || c == 'Y';
 }
 
 std::string read_seed(const std::string& path) {
@@ -265,27 +299,135 @@ void action_import(const MonitorState& st) {
     g_status_color = CP_OK;
 }
 
+// ---- Wallet page (F3) actions -----------------------------------------
+//
+// Strictly the node operator's OWN wallet: unlock, look, send, receive. No
+// founder / moderator / bootstrap affordance is offered here or anywhere
+// else in this module.
+
+std::string call_or_empty(const std::function<std::string()>& f) {
+    return f ? f() : std::string();
+}
+
+void wallet_touch() { g_wallet_last_key = std::chrono::steady_clock::now(); }
+
+void action_wallet_unlock(const MonitorState& st) {
+    if (!st.wallet_unlock) return;
+    std::string pw;
+    if (!prompt_secret("Wallet password", pw)) {
+        std::fill(pw.begin(), pw.end(), '\0');
+        g_status = "unlock: cancelled"; g_status_color = CP_WARN; return;
+    }
+    const bool ok = st.wallet_unlock(pw);
+    std::fill(pw.begin(), pw.end(), '\0');
+    g_wallet_unlocked = ok;
+    g_wallet_receive  = false;
+    wallet_touch();
+    g_status = ok ? "wallet unlocked" : "unlock: wrong password";
+    g_status_color = ok ? CP_OK : CP_WARN;
+}
+
+void action_wallet_send(const MonitorState& st) {
+    if (!st.wallet_send) return;
+    std::string to;
+    if (!prompt_string("Recipient address (0x...)", to, 64)) {
+        g_status = "send: cancelled"; g_status_color = CP_WARN; return;
+    }
+    std::string amount;
+    if (!prompt_string("Amount (e.g. 12.5)", amount, 40)) {
+        g_status = "send: cancelled"; g_status_color = CP_WARN; return;
+    }
+    if (!prompt_confirm("Send " + amount + " to " + to + "?")) {
+        g_status = "send: cancelled"; g_status_color = CP_WARN; return;
+    }
+    // The caller owns parsing, the balance check, signing and submission —
+    // this module never touches the chain.
+    const auto res = st.wallet_send(to, amount);
+    g_status = res.second;
+    g_status_color = res.first ? CP_OK : CP_WARN;
+}
+
+void draw_wallet(const MonitorState& st) {
+    int r = 2;
+    if (!g_wallet_unlocked) {
+        attron(COLOR_PAIR(CP_WARN));
+        mvprintw(r, 2, "Wallet locked.");
+        attroff(COLOR_PAIR(CP_WARN));
+        r += 2;
+        mvprintw(r++, 2, "Press U and enter the wallet password to open it.");
+        r++;
+        attron(A_DIM);
+        mvprintw(r++, 2, "(the same password this node was started with)");
+        attroff(A_DIM);
+    } else if (g_wallet_receive) {
+        attron(COLOR_PAIR(CP_TITLE));
+        mvprintw(r, 2, "Receive");
+        attroff(COLOR_PAIR(CP_TITLE));
+        r += 2;
+        mvprintw(r++, 2, "Send tokens to this address:");
+        r++;
+        attron(A_BOLD | COLOR_PAIR(CP_OK));
+        mvprintw(r++, 4, "%s", call_or_empty(st.wallet_address).c_str());
+        attroff(A_BOLD | COLOR_PAIR(CP_OK));
+        r++;
+        attron(A_DIM);
+        mvprintw(r++, 2, "Press B to go back.");
+        attroff(A_DIM);
+    } else {
+        auto row = [&](const char* label, const std::string& val, int cp) {
+            attron(COLOR_PAIR(CP_TITLE));
+            mvprintw(r, 2, "%-9s", label);
+            attroff(COLOR_PAIR(CP_TITLE));
+            attron(COLOR_PAIR(cp));
+            mvprintw(r, 13, "%s", val.c_str());
+            attroff(COLOR_PAIR(cp));
+            r += 2;
+        };
+        row("Address", call_or_empty(st.wallet_address), CP_OK);
+        row("Balance", call_or_empty(st.balance), CP_DIM);
+        r++;
+        mvprintw(r++, 2, "[S] Send tokens   [R] Receive   [L] Lock");
+    }
+    if (!g_status.empty()) {
+        r++;
+        attron(COLOR_PAIR(g_status_color));
+        mvprintw(r, 2, "%s", g_status.c_str());
+        attroff(COLOR_PAIR(g_status_color));
+    }
+}
+
 // ---- Drawing ---------------------------------------------------------
 
 void draw_header(const MonitorState& st, int page) {
     int cols = getmaxx(stdscr);
+    const bool has_wallet = static_cast<bool>(st.wallet_unlock);
     attron(COLOR_PAIR(CP_HDR));
     mvhline(0, 0, ' ', cols);
     std::string t = " " + st.title + " ";
     mvprintw(0, 1, "%s", t.c_str());
-    const char* tabs = (page == 1) ? "[F1 Status] F2 Logs" : "F1 Status [F2 Logs]";
-    int tx = cols - static_cast<int>(std::string(tabs).size()) - 1;
-    if (tx > static_cast<int>(t.size()) + 1) mvprintw(0, tx, "%s", tabs);
+    std::string tabs = (page == 1) ? "[F1 Status] F2 Logs"
+                     : (page == 2) ? "F1 Status [F2 Logs]"
+                                   : "F1 Status  F2 Logs";
+    if (has_wallet) tabs += (page == 3) ? " [F3 Wallet]" : " F3 Wallet";
+    int tx = cols - static_cast<int>(tabs.size()) - 1;
+    if (tx > static_cast<int>(t.size()) + 1) mvprintw(0, tx, "%s", tabs.c_str());
     attroff(COLOR_PAIR(CP_HDR));
 }
 
-void draw_footer(const MonitorState& st) {
+void draw_footer(const MonitorState& st, int page) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     attron(COLOR_PAIR(CP_HDR));
     mvhline(rows - 1, 0, ' ', cols);
     std::string f = " F1 Status   F2 Logs   ";
-    if (!st.seed_path.empty()) f += "X Export   P Import   ";
+    if (st.wallet_unlock) f += "F3 Wallet   ";
+    if (page == 3) {
+        if (!g_wallet_unlocked)     f += "U Unlock   ";
+        else if (g_wallet_receive)  f += "B Back   ";
+        else                        f += "S Send   R Receive   L Lock   ";
+    } else if (!st.seed_path.empty()) {
+        f += "X Export   P Import   ";
+    }
     f += "Q Quit ";
     mvprintw(rows - 1, 1, "%s", f.c_str());
     attroff(COLOR_PAIR(CP_HDR));
@@ -353,9 +495,10 @@ void draw_logs() {
 void draw(const MonitorState& st, int page, std::chrono::steady_clock::time_point start) {
     erase();
     draw_header(st, page);
-    if (page == 1) draw_status(st, start);
-    else           draw_logs();
-    draw_footer(st);
+    if      (page == 1) draw_status(st, start);
+    else if (page == 3) draw_wallet(st);
+    else                draw_logs();
+    draw_footer(st, page);
     refresh();
 }
 
@@ -421,24 +564,60 @@ void run_monitor_tui(const MonitorState& st, std::atomic<bool>& running) {
     nodelay(stdscr, TRUE);
     setup_colors();
 
-    const bool can_wallet = !st.seed_path.empty();
+    const bool can_seed_io = !st.seed_path.empty();
+    const bool has_wallet   = static_cast<bool>(st.wallet_unlock);
+    g_wallet_unlocked = false;      // always start locked
+    g_wallet_receive  = false;
+    wallet_touch();
     int page = 1;
     const auto start = std::chrono::steady_clock::now();
     auto last = std::chrono::steady_clock::now() - std::chrono::seconds(2);
     while (running.load()) {
         const auto now = std::chrono::steady_clock::now();
+        // Idle re-lock: an unattended terminal must not leave the wallet open.
+        if (has_wallet && g_wallet_unlocked && st.wallet_idle_lock_seconds > 0 &&
+            std::chrono::duration_cast<std::chrono::seconds>(now - g_wallet_last_key)
+                .count() > st.wallet_idle_lock_seconds) {
+            g_wallet_unlocked = false;
+            g_wallet_receive  = false;
+            g_status = "wallet re-locked (idle)";
+            g_status_color = CP_DIM;
+            last = now - std::chrono::seconds(2);
+        }
         if (now - last >= std::chrono::seconds(1)) { draw(st, page, start); last = now; }
         const int key = getch();
         if (key == ERR) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
+        wallet_touch();
+        const auto redraw = [&] { last = now - std::chrono::seconds(2); };
+        if (key == KEY_RESIZE) { clearok(stdscr, TRUE); redraw(); continue; }
+        // ESC leaves the wallet page rather than killing the node.
+        if (key == 27 && page == 3) { page = 1; redraw(); continue; }
         if (key == 'q' || key == 'Q' || key == 3 || key == 27) { running.store(false); break; }
-        else if (key == KEY_F(1)) { page = 1; last = now - std::chrono::seconds(2); }
-        else if (key == KEY_F(2)) { page = 2; last = now - std::chrono::seconds(2); }
-        else if (can_wallet && (key == 'x' || key == 'X')) { action_export(st); last = now - std::chrono::seconds(2); }
-        else if (can_wallet && (key == 'p' || key == 'P')) { action_import(st); last = now - std::chrono::seconds(2); }
+        else if (key == KEY_F(1)) { page = 1; redraw(); }
+        else if (key == KEY_F(2)) { page = 2; redraw(); }
+        else if (has_wallet && key == KEY_F(3)) { page = 3; g_status.clear(); redraw(); }
+        else if (page == 3 && !g_wallet_unlocked && (key == 'u' || key == 'U')) {
+            action_wallet_unlock(st); redraw();
+        }
+        else if (page == 3 && g_wallet_unlocked && g_wallet_receive &&
+                 (key == 'b' || key == 'B')) { g_wallet_receive = false; redraw(); }
+        else if (page == 3 && g_wallet_unlocked && !g_wallet_receive) {
+            if      (key == 's' || key == 'S') { action_wallet_send(st); redraw(); }
+            else if (key == 'r' || key == 'R') { g_wallet_receive = true; g_status.clear(); redraw(); }
+            else if (key == 'l' || key == 'L') {
+                g_wallet_unlocked = false;
+                g_status = "wallet locked"; g_status_color = CP_DIM; redraw();
+            }
+        }
+        else if (page != 3 && can_seed_io && (key == 'x' || key == 'X')) { action_export(st); redraw(); }
+        else if (page != 3 && can_seed_io && (key == 'p' || key == 'P')) { action_import(st); redraw(); }
     }
+    // Never leave a decrypted wallet flagged open for a later run.
+    g_wallet_unlocked = false;
+    g_wallet_receive  = false;
     endwin();
 }
 

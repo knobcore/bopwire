@@ -9,15 +9,16 @@
 // Chain/Database/etc.; the mini feeds it from its librats globals.
 //
 // There is intentionally NO wallet/founder/moderator/bootstrap surface
-// here — that all lives in the private bopwire-admin TUI. The only wallet
+// here — that all lives in the private bopwire-bootstrap / bopwire-modclient TUIs. The only wallet
 // affordance is optional export/import of the node's OWN identity seed
 // (a BIP39 mnemonic on disk), shown only when `seed_path` is set.
 //
-// F1 status · F2 logs · X export · P import · Q quit.
+// F1 status - F2 logs - F3 wallet (optional) - X export - P import - Q quit.
 //
 #include <atomic>
 #include <functional>
 #include <string>
+#include <utility>
 
 namespace mc::ui {
 
@@ -44,6 +45,30 @@ struct MonitorState {
     std::function<std::string()> routes;
     std::function<std::string()> players;
     std::function<std::string()> rats_port;
+
+    // ---- Optional wallet page (F3) ------------------------------------
+    //
+    // Set `wallet_unlock` to enable a THIRD page: a password-gated wallet
+    // offering the node operator's own send / receive. It reuses the
+    // `wallet_address` + `balance` callbacks above for display. Leave
+    // `wallet_unlock` unset and the F3 chip and the whole page disappear —
+    // the monitor then behaves exactly as it always did.
+    //
+    // Everything still crosses as std::function + strings, so this module
+    // stays chain-free and dependency-light: the mini node, the moderator
+    // console and the bootstrap program can switch the same page on from
+    // their own backends. This is a WALLET only; the no-moderator/founder
+    // rule at the top of this header is unchanged.
+    //
+    //   wallet_unlock(password) -> true when the password is correct.
+    //   wallet_send(to, amount) -> {ok, message to display}. `amount` is the
+    //                              raw string the operator typed; the caller
+    //                              owns parsing, balance checks and signing.
+    std::function<bool(const std::string& password)>            wallet_unlock;
+    std::function<std::pair<bool, std::string>(const std::string& to_address,
+                                               const std::string& amount)> wallet_send;
+    // Re-lock the wallet page after this long with no keypress (0 disables).
+    long wallet_idle_lock_seconds = 300;
 };
 
 // Run the monitor on the caller's thread. Blocks until Q / Ctrl-C or

@@ -5,10 +5,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #ifdef _WIN32
@@ -16,6 +18,9 @@
     #define NOMINMAX
   #endif
   #include <windows.h>
+  #include <io.h>
+#else
+  #include <unistd.h>
 #endif
 #ifdef MC_TUI_PDCURSES
   #include <curses.h>
@@ -25,6 +30,23 @@
 
 namespace mc {
 namespace {
+
+// Last keystore path resolved by load_or_setup_node_identity(), published
+// through node_wallet_keystore_path() so the wallet TUI can re-check the
+// operator's password against the same file without a second flag.
+std::string g_resolved_keystore_path;
+
+// A curses prompt is only possible with a real terminal on stdin. Without
+// this check an unattended service (systemd, Windows service) that still has
+// tui_mode set would drop into initscr() and either die obscurely or sit
+// waiting for a keypress that never comes.
+bool stdin_is_tty() {
+#ifdef _WIN32
+    return _isatty(_fileno(stdin)) != 0;
+#else
+    return ::isatty(STDIN_FILENO) != 0;
+#endif
+}
 
 std::string keystore_path(const std::string& data_dir, const std::string& wallet_file) {
     if (!wallet_file.empty()) return wallet_file;
@@ -37,12 +59,7 @@ std::optional<crypto::KeyPair> kp_from_mnemonic(const std::string& mnemonic) {
     return *kp;
 }
 
-bool write_file(const std::string& path, const std::string& contents) {
-    std::ofstream f(path, std::ios::trunc | std::ios::binary);
-    if (!f) return false;
-    f << contents;
-    return true;
-}
+
 
 // ---- minimal curses input (interactive wizard / password prompt) ----
 
@@ -102,7 +119,7 @@ void msg(const char* title, const std::string& text) {
 // Interactive create/import wizard. On success fills out_mnemonic + out_password.
 bool run_wizard(const std::string& role, std::string& out_mnemonic, std::string& out_password) {
     page("node wallet setup");
-    mvprintw(3, 4, "This %s has no wallet yet — set up its identity.", role.c_str());
+    mvprintw(3, 4, "This %s has no wallet yet - set up its identity.", role.c_str());
     mvprintw(5, 4, "It is a password-protected, portable 12-word wallet.");
     mvprintw(7, 4, "[C] Create new     [I] Import existing     [Q] Cancel");
     refresh();
@@ -149,7 +166,7 @@ bool run_wizard(const std::string& role, std::string& out_mnemonic, std::string&
     }
     if (created) {
         page("back up your 12 words");
-        mvprintw(3, 4, "Write these down — they restore this node's wallet.");
+        mvprintw(3, 4, "Write these down - they restore this node's wallet.");
         attron(A_BOLD); mvprintw(5, 4, "%s", mnemonic.c_str()); attroff(A_BOLD);
         mvprintw(7, 4, "Press any key once you've written them down.");
         refresh(); getkey();
@@ -195,6 +212,14 @@ std::optional<crypto::KeyPair> load_or_setup_node_identity(
     const std::string& password, bool interactive, const char* role_label) {
     const std::string path = keystore_path(data_dir, wallet_file);
     const std::string role = role_label ? role_label : "node";
+    g_resolved_keystore_path = path;
+    // Never prompt without a terminal — an unattended start must fail fast
+    // with the message below instead of blocking on stdin.
+    if (interactive && !stdin_is_tty()) {
+        std::cerr << "[wallet] " << role << ": no terminal on stdin - "
+                     "resolving the wallet without prompting.\n";
+        interactive = false;
+    }
 
     // ---- existing keystore ----
     {
@@ -265,7 +290,7 @@ std::optional<crypto::KeyPair> load_or_setup_node_identity(
         std::string ks = crypto::keystore_encrypt(mnemonic, pw, addr);
         std::fill(mnemonic.begin(), mnemonic.end(), '\0');
         std::fill(pw.begin(), pw.end(), '\0');
-        if (ks.empty() || !write_file(path, ks)) {
+        if (ks.empty() || !write_secret_file(path, ks)) {
             msg("error", "could not save wallet keystore to " + path);
             return false;
         }
@@ -279,6 +304,86 @@ std::optional<crypto::KeyPair> load_or_setup_node_identity(
         std::cout << "[wallet] " << role << " identity created: " << saved_addr
                   << " (keystore " << path << ")\n";
     return result;
+}
+
+// ---- public helpers -------------------------------------------------
+
+const std::string& node_wallet_keystore_path() { return g_resolved_keystore_path; }
+
+bool write_secret_file(const std::string& path, const std::string& contents) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path parent = fs::path(path).parent_path();
+    if (!parent.empty()) fs::create_directories(parent, ec);
+    {
+        std::ofstream f(path, std::ios::trunc | std::ios::binary);
+        if (!f) return false;
+        f << contents;
+        if (!f) return false;
+    }
+    // Tighten to owner-only. Non-fatal on filesystems without POSIX perms
+    // (e.g. Windows/FAT) — the write itself already succeeded.
+    fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write,
+                    fs::perm_options::replace, ec);
+    return true;
+}
+
+std::optional<CreatedWallet> write_node_wallet(const std::string& out_path,
+                                              const std::string& mnemonic_in,
+                                              const std::string& password,
+                                              bool               overwrite,
+                                              std::string&       err) {
+    namespace fs = std::filesystem;
+    err.clear();
+    if (out_path.empty()) { err = "no keystore path"; return std::nullopt; }
+
+    const std::string perr = crypto::password_policy_error(password);
+    if (!perr.empty()) { err = perr; return std::nullopt; }
+
+    std::error_code ec;
+    if (fs::exists(out_path, ec) && !overwrite) {
+        err = "refusing to overwrite existing wallet at " + out_path +
+              " (pass --force to replace it)";
+        return std::nullopt;
+    }
+
+    std::string mnemonic = mnemonic_in;
+    if (mnemonic.empty()) { err = "empty seed phrase"; return std::nullopt; }
+    auto kp = kp_from_mnemonic(mnemonic);
+    if (!kp) {
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+        err = "not a valid BIP39 seed phrase";
+        return std::nullopt;
+    }
+    const std::string addr = crypto::to_checksum_hex(kp->address);
+    const std::string ks   = crypto::keystore_encrypt(mnemonic, password, addr);
+    if (ks.empty()) {
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+        err = "keystore encryption failed";
+        return std::nullopt;
+    }
+    if (!write_secret_file(out_path, ks)) {
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+        err = "cannot write " + out_path;
+        return std::nullopt;
+    }
+    CreatedWallet out;
+    out.mnemonic = mnemonic;
+    out.address  = addr;
+    out.path     = out_path;
+    std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+    return out;
+}
+
+std::optional<CreatedWallet> create_node_wallet(const std::string& out_path,
+                                                const std::string& password,
+                                                bool               overwrite,
+                                                std::string&       err) {
+    std::string mnemonic = crypto::bip39_generate_12();
+    if (mnemonic.empty()) { err = "entropy source failed"; return std::nullopt; }
+    auto out = write_node_wallet(out_path, mnemonic, password, overwrite, err);
+    std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+    return out;
 }
 
 } // namespace mc

@@ -3,12 +3,35 @@
  *
  * Usage:
  *   bopwire-node start [options]
+ *   bopwire-node create-wallet [options]      (also: start --create-wallet)
  *   bopwire-node status
  *   bopwire-node peers
  *   bopwire-node sync-status
  *   bopwire-node stop
  *   bopwire-node rebuild-index
  *   bopwire-node verify-chain
+ *
+ * Wallet flags (shared by `start` and `create-wallet`):
+ *   --wallet-file PATH           encrypted keystore holding this node's
+ *                                identity (default <data_dir>/node-wallet.json)
+ *   --wallet-password PW         wallet password as a literal string
+ *                                (visible in `ps` and shell history)
+ *   --wallet-password-file PATH  read the password from a file instead
+ *   --seed "<12 words>"          adopt this BIP39 phrase as the node wallet
+ *                                (visible in `ps` and shell history); the
+ *                                keystore is (re)written from it, so the
+ *                                node runs that identity from then on
+ *   $BOPWIRE_WALLET_PASSWORD     environment fallback for the password
+ *   config.json "wallet_password"
+ *
+ * Password precedence: --wallet-password > --wallet-password-file > env >
+ * config. Both forms keep working; the literal string wins when both are given.
+ *
+ * `create-wallet` (also `start --create-wallet`) makes a new wallet and exits.
+ * With --seed it imports that phrase instead of generating one. It also takes
+ * --seed-out PATH (write the 12 words to an owner-only file) and --force
+ * (replace an existing keystore). The seed phrase is printed ONCE, to stdout
+ * only; neither the seed nor the password is ever written to a log.
  */
 
 #include "../src/core/chain.h"
@@ -57,6 +80,13 @@
 #include <algorithm>
 #include <vector>
 #include <cstring>
+#ifdef _WIN32
+  #include <io.h>
+  #include <cstdio>
+#else
+  #include <termios.h>
+  #include <unistd.h>
+#endif
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -124,6 +154,52 @@ static void import_wallet_keystore(const std::string& data_dir,
     std::fill(mnemonic.begin(), mnemonic.end(), '\0');
     std::cout << "[wallet] imported " << mc::crypto::to_checksum_hex(kp->address)
               << " -> founder.seed\n";
+}
+
+// Read a password from a file (first line, trailing CR/LF stripped). Returns
+// an empty string if the file can't be read. A file is the preferred source:
+// unlike --wallet-password it never shows up in `ps` / the process list.
+static std::string read_password_file(const std::string& path) {
+    std::ifstream pf(path);
+    if (!pf) return {};
+    std::string pw;
+    std::getline(pf, pw);
+    while (!pw.empty() && (pw.back() == '\r' || pw.back() == '\n')) pw.pop_back();
+    return pw;
+}
+
+// True when stdin is an interactive terminal. Every prompt in this file is
+// gated on it: an unattended `--no-tui` service must fail fast with a message
+// rather than block forever on input that will never arrive.
+static bool stdin_is_tty() {
+#ifdef _WIN32
+    return _isatty(_fileno(stdin)) != 0;
+#else
+    return ::isatty(STDIN_FILENO) != 0;
+#endif
+}
+
+// Prompt for a password on the controlling terminal with echo disabled.
+// Only used by `create-wallet` when the operator supplied no password source
+// at all AND stdin is a terminal; never reached on the headless path.
+static std::string prompt_password_tty(const char* label) {
+    std::cout << label << std::flush;
+    std::string pw;
+#ifndef _WIN32
+    struct termios old_t{}, new_t{};
+    if (::tcgetattr(STDIN_FILENO, &old_t) == 0) {
+        new_t = old_t;
+        new_t.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+        ::tcsetattr(STDIN_FILENO, TCSAFLUSH, &new_t);
+        std::getline(std::cin, pw);
+        ::tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_t);
+        std::cout << "\n";
+        return pw;
+    }
+#endif
+    std::getline(std::cin, pw);
+    std::cout << "\n";
+    return pw;
 }
 
 static mc::net::NodeConfig load_config(const std::string& path) {
@@ -247,6 +323,112 @@ static void signal_handler(int /*sig*/) {
     g_running.store(false, std::memory_order_relaxed);
 }
 
+// ---- Subcommand: create-wallet --------------------------------------
+//
+//   bopwire-node create-wallet --wallet-file /var/lib/bopwire/node-wallet.json
+//                              --wallet-password-file /var/lib/bopwire/node-wallet.pass
+//
+// Creates a brand-new password-protected wallet and exits — no database, no
+// network, no chain. The keystore is exactly the artefact `start` already
+// consumes via --wallet-file (scrypt + AES-256-GCM around a 12-word BIP39
+// mnemonic, written 0600), so the file + password pair loads into ANY bopwire
+// node — full or mini — and, because loading only ever READS the file, into
+// several nodes at the same time.
+//
+// The 12 words are printed once on stdout (or written to an owner-only file
+// with --seed-out). They are never handed to the logger.
+static int cmd_create_wallet(const std::vector<std::string>& args) {
+    std::string data_dir, wallet_file, wallet_password, wallet_password_file,
+                seed_out, seed_in;
+    bool force = false;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--data-dir" && i+1 < args.size())                  { data_dir = args[++i]; }
+        else if (args[i] == "--wallet-file" && i+1 < args.size())          { wallet_file = args[++i]; }
+        else if (args[i] == "--wallet-password" && i+1 < args.size())      { wallet_password = args[++i]; }
+        else if (args[i] == "--wallet-password-file" && i+1 < args.size()) { wallet_password_file = args[++i]; }
+        else if (args[i] == "--seed" && i+1 < args.size())                 { seed_in = args[++i]; }
+        else if (args[i] == "--seed-out" && i+1 < args.size())             { seed_out = args[++i]; }
+        else if (args[i] == "--force")                                     { force = true; }
+        else if (args[i] == "--create-wallet")                             { /* flag form of this subcommand */ }
+    }
+    if (data_dir.empty())    data_dir    = "./data";
+    if (wallet_file.empty()) wallet_file = data_dir + "/node-wallet.json";
+
+    // Password precedence: literal --wallet-password wins, then the file,
+    // then the environment.
+    if (wallet_password.empty() && !wallet_password_file.empty())
+        wallet_password = read_password_file(wallet_password_file);
+    if (wallet_password.empty()) {
+        if (const char* e = std::getenv("BOPWIRE_WALLET_PASSWORD")) wallet_password = e;
+    }
+    if (wallet_password.empty()) {
+        // No password anywhere. Only ask if a human is actually there —
+        // otherwise fail fast so an unattended run can never hang on stdin.
+        if (!stdin_is_tty()) {
+            std::cerr << "[wallet] create-wallet: no password supplied and stdin is not a "
+                         "terminal.\n"
+                         "         Pass --wallet-password '<pw>' or "
+                         "--wallet-password-file PATH.\n";
+            return 1;
+        }
+        // Ask on the terminal with echo off.
+        std::string p1 = prompt_password_tty("New wallet password (>=12 chars, 1 upper, 1 special): ");
+        std::string p2 = prompt_password_tty("Confirm password: ");
+        if (p1.empty() || p1 != p2) {
+            std::fill(p1.begin(), p1.end(), '\0');
+            std::fill(p2.begin(), p2.end(), '\0');
+            std::cerr << "[wallet] passwords empty or do not match — nothing written.\n"
+                         "         Non-interactively, pass --wallet-password-file PATH.\n";
+            return 1;
+        }
+        std::fill(p2.begin(), p2.end(), '\0');
+        wallet_password = p1;
+    }
+
+    std::string err;
+    const bool seed_written_from_flag = !seed_in.empty();
+    // --seed imports an existing phrase; without it we generate a fresh one.
+    auto created = seed_in.empty()
+        ? mc::create_node_wallet(wallet_file, wallet_password, force, err)
+        : mc::write_node_wallet(wallet_file, seed_in, wallet_password, force, err);
+    std::fill(wallet_password.begin(), wallet_password.end(), '\0');
+    std::fill(seed_in.begin(), seed_in.end(), '\0');
+    if (!created) {
+        std::cerr << "[wallet] create-wallet failed: " << err << "\n";
+        return 1;
+    }
+
+    if (!seed_out.empty()) {
+        if (!mc::write_secret_file(seed_out, created->mnemonic + "\n")) {
+            std::cerr << "[wallet] WARNING: could not write seed to " << seed_out << "\n";
+        }
+    }
+
+    // stdout only — cmd_create_wallet never starts the TUI log capture, so
+    // nothing here can end up in a log ring or a log file.
+    std::cout << (seed_written_from_flag ? "\nWallet written from --seed.\n"
+                                        : "\nWallet created.\n")
+              << "  keystore : " << created->path    << "   (mode 0600)\n"
+              << "  address  : " << created->address << "\n"
+              << "  seed     : " << created->mnemonic << "\n";
+    if (!seed_out.empty())
+        std::cout << "  seed file: " << seed_out << "   (mode 0600 — delete once written down)\n";
+    std::cout << (seed_written_from_flag
+            ? "\nThis wallet was written from the phrase you supplied.\n"
+            : "\nWrite the 12 words down now: this is the only time they are shown.\n")
+        << "\nStart the node with either form:\n"
+        << "  bopwire-node start --wallet-file " << created->path
+        << " --wallet-password '<password>'\n"
+        << "  bopwire-node start --wallet-file " << created->path
+        << " --wallet-password-file <passfile>\n"
+        << "(a literal --wallet-password / --seed shows up in `ps` and shell history)\n"
+        << "\nThe same keystore + password — or the seed phrase via --seed — loads\n"
+           "into any full or mini node, including several at once.\n";
+
+    std::fill(created->mnemonic.begin(), created->mnemonic.end(), '\0');
+    return 0;
+}
+
 // ---- Subcommand: start ----------------------------------------------
 
 static int cmd_start(const std::vector<std::string>& args, const char* exe_path = nullptr) {
@@ -262,6 +444,14 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // startup (no TUI needed). Password sources, in precedence: --wallet-password
     // > --wallet-password-file > $BOPWIRE_WALLET_PASSWORD > config wallet_password.
     std::string wallet_file, wallet_password, wallet_password_file;
+    // --seed "<12 words>": adopt this wallet as the node identity. The phrase
+    // is encrypted under the wallet password and written to the keystore, so
+    // the node runs on it and every later start finds it there.
+    std::string wallet_seed;
+    // --create-wallet: make a new wallet and exit without booting the node.
+    // Same code path as the `create-wallet` subcommand, offered as a flag so
+    // an operator can reuse the exact `start` command line they already have.
+    bool create_wallet = false;
 
     // Parse arguments
     for (size_t i = 0; i < args.size(); ++i) {
@@ -272,9 +462,28 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         else if (args[i] == "--wallet-file" && i+1 < args.size())          { wallet_file = args[++i]; }
         else if (args[i] == "--wallet-password" && i+1 < args.size())      { wallet_password = args[++i]; }
         else if (args[i] == "--wallet-password-file" && i+1 < args.size()) { wallet_password_file = args[++i]; }
+        else if (args[i] == "--seed" && i+1 < args.size())      { wallet_seed = args[++i]; }
+        else if (args[i] == "--create-wallet")                  { create_wallet = true; }
         else if (args[i] == "--no-tui" || args[i] == "--daemon"
                                        || args[i] == "--quiet") { tui_mode = false; tui_cli_set = true; }
         else if (args[i] == "--tui")                            { tui_mode = true;  tui_cli_set = true; }
+    }
+
+    // Wallet creation runs before ANY subsystem comes up (no log capture, no
+    // database, no network) and terminates the process.
+    if (create_wallet) return cmd_create_wallet(args);
+
+    // A TUI needs a real terminal. Decide that HERE — before log capture
+    // starts and before the config file gets a chance to turn tui_mode back
+    // on. Otherwise a service-managed start with "tui_mode": true in
+    // config.json would divert every log line into the TUI's in-memory ring
+    // and then run headless anyway: the unit looks "started" while emitting
+    // nothing at all. Setting tui_cli_set pins the decision.
+    if (tui_mode && !stdin_is_tty()) {
+        std::cout << "[node] no terminal on stdin - running headless "
+                     "(pass --no-tui to silence this).\n";
+        tui_mode    = false;
+        tui_cli_set = true;
     }
 
     // Divert all log output into the TUI's in-memory ring BEFORE chain
@@ -374,19 +583,40 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // below). Precedence: --wallet-password > --wallet-password-file > env >
     // config. The wallet itself is loaded/created after the DB opens.
     if (wallet_file.empty()) wallet_file = g_wallet_file_cfg;
-    if (wallet_password.empty() && !wallet_password_file.empty()) {
-        std::ifstream pf(wallet_password_file);
-        if (pf) {
-            std::getline(pf, wallet_password);
-            while (!wallet_password.empty() &&
-                   (wallet_password.back() == '\r' || wallet_password.back() == '\n'))
-                wallet_password.pop_back();
-        }
-    }
+    if (wallet_password.empty() && !wallet_password_file.empty())
+        wallet_password = read_password_file(wallet_password_file);
     if (wallet_password.empty()) {
         if (const char* e = std::getenv("BOPWIRE_WALLET_PASSWORD")) wallet_password = e;
     }
     if (wallet_password.empty()) wallet_password = g_wallet_password_cfg;
+
+    // ---- --seed adoption ------------------------------------------------
+    // Turn the supplied phrase into this node's keystore before the identity
+    // is resolved below. This is how a wallet moves onto a new box from the
+    // command line alone; the SAME phrase can be planted on any number of
+    // nodes. Only the resulting address is ever logged — never the phrase.
+    if (!wallet_seed.empty()) {
+        if (wallet_password.empty()) {
+            std::fill(wallet_seed.begin(), wallet_seed.end(), '\0');
+            std::cerr << "[wallet] --seed needs a password too "
+                         "(--wallet-password / --wallet-password-file).\n";
+            return 1;
+        }
+        const std::string ks_target = wallet_file.empty()
+            ? cfg.data_dir + "/node-wallet.json" : wallet_file;
+        std::string err;
+        auto planted = mc::write_node_wallet(ks_target, wallet_seed, wallet_password,
+                                             /*overwrite=*/true, err);
+        std::fill(wallet_seed.begin(), wallet_seed.end(), '\0');
+        if (!planted) {
+            std::cerr << "[wallet] --seed: " << err << "\n";
+            return 1;
+        }
+        std::fill(planted->mnemonic.begin(), planted->mnemonic.end(), '\0');
+        wallet_file = ks_target;
+        std::cout << "[wallet] --seed adopted: " << planted->address
+                  << " -> " << ks_target << "\n";
+    }
 
     // Founder-key migration bridge (keystore -> founder.seed). The validator
     // self-grant emitter (node_auth_thread) and the relay-reward sweep sign with
@@ -969,8 +1199,23 @@ int main(int argc, char** argv) {
 
     if (argc < 2) {
         std::cerr << "Usage: bopwire-node <command> [options]\n"
-                  << "Commands: start, status, peers, sync-status, stop,\n"
-                  << "          rebuild-index, verify-chain\n";
+                  << "Commands: start, create-wallet, status, peers, sync-status,\n"
+                  << "          stop, rebuild-index, verify-chain\n"
+                  << "\nWallet flags (start and create-wallet):\n"
+                  << "  --wallet-file PATH           keystore holding the node wallet\n"
+                  << "  --wallet-password PW         password as a literal string\n"
+                  << "                               (appears in `ps` / shell history)\n"
+                  << "  --wallet-password-file PATH  read the password from a file\n"
+                  << "  --seed \"<12 words>\"          adopt this seed phrase as the\n"
+                  << "                               node wallet; needs a password\n"
+                  << "                               (appears in `ps` / shell history)\n"
+                  << "  literal flags win over the file forms when both are given\n"
+                  << "\ncreate-wallet [--wallet-file PATH] [--wallet-password PW |\n"
+                  << "              --wallet-password-file PATH] [--seed \"<12 words>\"]\n"
+                  << "              [--seed-out PATH] [--force]\n"
+                  << "  Create (or import with --seed) a password-protected portable\n"
+                  << "  wallet, print the seed phrase once, and exit. `start\n"
+                  << "  --create-wallet` does the same thing.\n";
         return 1;
     }
 
@@ -979,6 +1224,7 @@ int main(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) args.push_back(argv[i]);
 
     if (command == "start")         return cmd_start(args, argv[0]);
+    if (command == "create-wallet") return cmd_create_wallet(args);
     if (command == "status")        return cmd_status(args);
     if (command == "peers")         return cmd_peers(args);
     if (command == "sync-status")   return cmd_status(args);
