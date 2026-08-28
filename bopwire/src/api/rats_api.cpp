@@ -1167,6 +1167,19 @@ void RatsApi::handle_request(const std::string& peer_id,
         } else if (type == "stats.top") {
             reply = wrap_handler_result(req_id,
                 explorer_index_for(chain_, db_).stats_top(in));
+        } else if (type == "moderation.list") {
+            // Moderator actions in chain order. Derived from BLOCK data in the
+            // explorer index, NOT from the signature-gated mod.list_* verbs —
+            // this is public chain history and must stay readable without a
+            // moderator key.
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).moderation_list(in));
+        } else if (type == "moderation.hidden") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).moderation_hidden(in));
+        } else if (type == "moderation.moderator") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).moderation_moderator(in));
         } else if (type == "song.plays") {
             reply = wrap_handler_result(req_id,
                 explorer_index_for(chain_, db_).song_plays(in));

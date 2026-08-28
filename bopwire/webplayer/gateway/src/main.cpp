@@ -783,6 +783,42 @@ int main() {
         explorer_call(res, "stats.top", body, 30, "public, max-age=30");
     });
 
+    // ---- Moderation transparency -------------------------------------
+    //
+    // Hides, unhides, grants and revokes as they appear ON CHAIN. This is
+    // deliberately public and unauthenticated: moderation actions are chain
+    // history that any node already sees, and hides are how DMCA takedowns
+    // propagate network-wide. It reads the explorer index (block-derived),
+    // NOT the signature-gated mod.list_* verbs — the site has no moderator
+    // key and must never need one.
+    svr.Get("/api/moderation", [&, explorer_call, qnum](const httplib::Request& req,
+                                                       httplib::Response& res) {
+        json body = json::object();
+        qnum(req, "offset", body);
+        qnum(req, "limit",  body);
+        explorer_call(res, "moderation.list", body, 30, "public, max-age=30");
+    });
+
+    // Currently-hidden artists / albums / titles, each with the height and
+    // moderator that hid it — so a viewer can see what is hidden, when, and
+    // by whom, rather than just that something vanished.
+    svr.Get("/api/moderation/hidden", [&, explorer_call](const httplib::Request&,
+                                                        httplib::Response& res) {
+        explorer_call(res, "moderation.hidden", json::object(), 30,
+                      "public, max-age=30");
+    });
+
+    // Every action a given moderator address has taken.
+    svr.Get(R"(/api/moderation/moderator/((?:0x)?[0-9a-fA-F]{40}))",
+            [&, explorer_call, qnum](const httplib::Request& req,
+                                     httplib::Response& res) {
+        json body = json::object();
+        body["address"] = req.matches[1].str();
+        qnum(req, "offset", body);
+        qnum(req, "limit",  body);
+        explorer_call(res, "moderation.moderator", body, 30, "public, max-age=30");
+    });
+
     // /api/song/<hash>/fingerprint — the raw on-chain base64 chromaprint as a
     // DOWNLOAD, so anyone can independently verify it against the audio /
     // content hash. Cached for the life of the process (chain data, immutable).
