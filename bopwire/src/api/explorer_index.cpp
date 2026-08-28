@@ -141,6 +141,7 @@ const char* tx_type_name(uint8_t t) {
         case TxType::NODE_AUTH:          return "node_auth";
         case TxType::CHECKPOINT:         return "checkpoint";
         case TxType::SETTLEMENT_MINT:    return "settlement_mint";
+        case TxType::RATING:             return "rating";
         default:                         return "unknown";
     }
 }
@@ -552,6 +553,9 @@ void ExplorerIndex::index_block_locked(uint32_t height, const Hash256& hash,
                                      a.value = hexs(tx.target_hash); }
             else if (tx.kind == 4) { a.kind = "proposal_grant";   a.category = "moderator";
                                      a.value = hexa(tx.target_addr); }
+            else if (tx.kind == 5) { a.kind = "proposal_rating_threshold";
+                                     a.category = "rating_policy";
+                                     a.value = std::to_string(tx.amount); }
             else                   { a.kind = "proposal";         a.category = "unknown"; }
             a.moderator = tx.proposer;
             a.ts_ms     = ts;
@@ -566,7 +570,7 @@ void ExplorerIndex::index_block_locked(uint32_t height, const Hash256& hash,
                 if (pit != proposals_.end())
                     pit->second.votes.push_back(
                         VoteRef{tx.proposer, height, crypto::to_hex(txh)});
-            } else if (tx.kind == 1 || tx.kind == 2 || tx.kind == 4) {
+            } else if (tx.kind == 1 || tx.kind == 2 || tx.kind == 4 || tx.kind == 5) {
                 ProposalInfo pi;
                 pi.kind        = tx.kind;
                 pi.target_hash = tx.target_hash;
@@ -586,6 +590,32 @@ void ExplorerIndex::index_block_locked(uint32_t height, const Hash256& hash,
             UsernameTx tx;
             if (!UsernameTx::deserialize(raw.data(), raw.size(), tx)) break;
             touch_locked(tx.owner, height, i, R_SENDER);
+            break;
+        }
+        case TxType::RATING: {
+            RatingTx tx;
+            if (!RatingTx::deserialize(raw.data(), raw.size(), tx)) break;
+            touch_locked(tx.rater, height, i, R_SENDER);
+            // A rating-driven auto-hide is the THIRD source of a hide (after
+            // the moderator gossip envelope and the HIDE_CONTENT vote), so it
+            // gets a row in the SAME mod_actions_ stream, in the same shape,
+            // distinguished by source == "rating". The chain records the hide
+            // under rh: with the height it fired at; if that is THIS block,
+            // this rating tx is the one that tipped it over.
+            if (auto rh = db_.get_rating_hide(tx.content_hash);
+                rh && rh->height == height) {
+                ModAction a;
+                a.kind      = "hide";
+                a.category  = "hash";
+                a.value     = hexs(tx.content_hash);
+                a.moderator = Address{};   // nobody signed this — the rule did
+                a.ts_ms     = ts;
+                a.height    = height;
+                a.tx_hash   = crypto::to_hex(txh);
+                a.source    = "rating";
+                add_mod_action_locked(std::move(a));
+                mod_hides_ += 1;
+            }
             break;
         }
         case TxType::SLASH: {
@@ -722,9 +752,16 @@ json ExplorerIndex::tx_to_json_locked(const std::vector<uint8_t>& raw) const {
         ProposalTx tx;
         if (!ProposalTx::deserialize(raw.data(), raw.size(), tx)) break;
         static const char* kinds[] = {"?", "hide_content", "release_escrow",
-                                      "vote_yes", "grant_moderator"};
+                                      "vote_yes", "grant_moderator",
+                                      "set_rating_threshold"};
         j["kind"]            = tx.kind;
-        j["kind_name"]       = tx.kind <= 4 ? kinds[tx.kind] : "?";
+        j["kind_name"]       = tx.kind <= 5 ? kinds[tx.kind] : "?";
+        if (tx.kind == static_cast<uint8_t>(ProposalKind::SET_RATING_THRESHOLD)) {
+            uint32_t mr = 0, bps = 0;
+            unpack_rating_policy(tx.amount, mr, bps);
+            j["rating_threshold"] = json{{"min_ratings", mr},
+                                         {"down_ratio_bps", bps}};
+        }
         j["target_hash"]     = hexs(tx.target_hash);
         j["target_addr"]     = hexa(tx.target_addr);
         j["amount"]          = tx.amount;
@@ -733,6 +770,18 @@ json ExplorerIndex::tx_to_json_locked(const std::vector<uint8_t>& raw) const {
         j["nonce"]           = tx.nonce;
         j["subject_pubkey"]  = hexp(tx.subject_pubkey);
         j["signature"]       = hexsig(tx.signature);
+        return j;
+    }
+    case TxType::RATING: {
+        RatingTx tx;
+        if (!RatingTx::deserialize(raw.data(), raw.size(), tx)) break;
+        j["content_hash"] = hexs(tx.content_hash);
+        j["value"]        = tx.value;
+        j["value_name"]   = tx.value == 1 ? "up" : tx.value == 2 ? "down" : "?";
+        j["rater"]        = hexa(tx.rater);
+        j["rater_pubkey"] = hexp(tx.rater_pubkey);
+        j["nonce"]        = tx.nonce;
+        j["signature"]    = hexsig(tx.signature);
         return j;
     }
     case TxType::USERNAME_REGISTER: {
@@ -1669,6 +1718,35 @@ ExplorerIndex::Result ExplorerIndex::song_detail(const json& in) {
         {"first_play_block",     st.first_play_block},
         {"first_play_timestamp", st.first_play_timestamp},
     };
+    const auto rc = db_.get_rating_counts(ch);
+    const auto rp = db_.get_rating_policy();
+    out["ratings"] = json{
+        {"up",    rc.up},
+        {"down",  rc.down},
+        {"total", rc.up + rc.down},
+        {"score", static_cast<int64_t>(rc.up) - static_cast<int64_t>(rc.down)},
+        // The recorded auto-hide event, if any (null otherwise), plus whether a
+        // moderator has since reviewed and cleared it.
+        {"auto_hide", [&]() -> json {
+            auto rh = db_.get_rating_hide(ch);
+            if (!rh) return json(nullptr);
+            return json{{"height", rh->height},
+                        {"up", rh->up}, {"down", rh->down},
+                        {"trigger_tx", crypto::to_hex(rh->trigger_tx)},
+                        {"threshold_in_force",
+                            {{"min_ratings", rh->min_ratings},
+                             {"down_ratio_bps", rh->down_ratio_bps},
+                             {"set_height", rh->policy_set_height}}}};
+        }()},
+        {"moderator_unhidden", db_.is_rating_hide_exempt(ch)},
+        {"threshold_in_force", {{"min_ratings",    rp.min_ratings},
+                                {"down_ratio_bps", rp.down_ratio_bps},
+                                {"source",         rp.set_height ? "chain" : "default"},
+                                {"set_height",     rp.set_height},
+                                {"set_by",         rp.set_height
+                                                       ? crypto::to_hex(rp.set_by.data(), 20)
+                                                       : std::string()}}},
+    };
     const bool hidden = db_.is_song_deleted(ch);
     out["hidden"] = hidden;
     if (hidden)
@@ -1853,6 +1931,30 @@ json ExplorerIndex::provenance_json_locked(const std::string& category,
                     return j;
                 }
             }
+            // Rating-driven auto-hide — the third hide source. The record is
+            // written by consensus at the moment the rule fired and freezes
+            // BOTH the triggering counts and the threshold that was in force,
+            // so a later SET_RATING_THRESHOLD can never make this hide
+            // unexplainable. No signer: `by` is "ratings", not a person.
+            if (auto rh = db_.get_rating_hide(ch)) {
+                char pct[16];
+                std::snprintf(pct, sizeof pct, "%.2f", rh->down_ratio_bps / 100.0);
+                j["by"]     = "ratings";
+                j["height"] = rh->height;
+                j["ratings"] = json{{"up", rh->up}, {"down", rh->down},
+                                    {"total", rh->up + rh->down}};
+                j["trigger_tx"] = crypto::to_hex(rh->trigger_tx);
+                j["threshold_in_force"] = json{
+                    {"min_ratings",    rh->min_ratings},
+                    {"down_ratio_bps", rh->down_ratio_bps},
+                    {"down_ratio_pct", pct},
+                    {"set_height",     rh->policy_set_height},
+                    {"set_by",         rh->policy_set_height
+                                           ? crypto::to_hex(rh->policy_set_by.data(), 20)
+                                           : std::string()},
+                };
+                return j;
+            }
             // K-independent forgery reports (node attestations, not mods).
             const int reports = db_.forgery_report_count(ch);
             if (reports > 0) {
@@ -1889,7 +1991,7 @@ json ExplorerIndex::mod_action_json_locked(const ModAction& a) const {
     // Vote provenance ride-along for proposal rows.
     if (a.source == "block" &&
         (a.kind == "proposal_hide" || a.kind == "proposal_release" ||
-         a.kind == "proposal_grant")) {
+         a.kind == "proposal_grant" || a.kind == "proposal_rating_threshold")) {
         Hash256 ph{};
         if (parse_hex_arr<32>(a.tx_hash, ph)) {
             if (auto pit = proposals_.find(ph); pit != proposals_.end())

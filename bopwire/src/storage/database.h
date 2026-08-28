@@ -337,6 +337,92 @@ public:
                                  const std::string& sig_hex,
                                  const std::string& payload_json)>& cb) const;
 
+    // ---- Listener ratings (rv:, ra:, rc:, rt:, rh:) + play index (pp:) --
+    //
+    // rv:<ch>:<addr>  -> u8 RatingValue     the wallet's current verdict
+    // ra:<addr>:<ch>  -> u8 RatingValue     reverse index, "ratings by address"
+    // rc:<ch>         -> u64 up | u64 down  running counts (never recomputed by scan)
+    // rt:cur          -> the policy in force (see RatingPolicy)
+    // rh:<ch>         -> the auto-hide record (see RatingHide)
+    //
+    // pp:<ch>:<addr>  -> ""  "this wallet has an on-chain credited play of this
+    //                        song". Written by update_song_state, i.e. by the
+    //                        SAME call every mint path already makes, so it
+    //                        covers MINT and every SETTLEMENT_MINT constituent
+    //                        with no second code path to keep in sync. This is
+    //                        the O(1) PlayProof gate apply_rating consults —
+    //                        no chain scan, no proof re-verification.
+    //
+    // rv:/ra:/rc:/rt:/rh: are COMMITTED STATE (in kStatePrefixes, so they are
+    // covered by the state_root and cleared+rebuilt on reorg). pp: deliberately
+    // is NOT in the root — it is derived from plays that predate this feature,
+    // so rooting it would change the state_root of every historical block and
+    // fork the chain instantly. It IS cleared by clear_derived_state so a reorg
+    // re-derives it exactly.
+
+    struct RatingCounts { uint64_t up = 0, down = 0; };
+
+    // The threshold in force. set_height == 0 means "never set on chain" and
+    // the values are the compiled-in RATING_DEFAULT_* fallbacks.
+    struct RatingPolicy {
+        uint32_t min_ratings    = RATING_DEFAULT_MIN_RATINGS;
+        uint32_t down_ratio_bps = RATING_DEFAULT_DOWN_RATIO_BPS;
+        uint32_t set_height     = 0;
+        Address  set_by{};            // proposer of the executed proposal
+        Hash256  proposal_hash{};     // that proposal's tx hash
+    };
+
+    // Recorded ONCE, at the instant a rating hide fires, so a later threshold
+    // change can never make a historical hide unexplainable.
+    struct RatingHide {
+        uint32_t height = 0;          // block the hide fired in
+        uint64_t up = 0, down = 0;    // counts at that instant
+        uint32_t min_ratings = 0;     // policy in force at that instant
+        uint32_t down_ratio_bps = 0;
+        uint32_t policy_set_height = 0;
+        Address  policy_set_by{};
+        Hash256  trigger_tx{};        // the RatingTx that tipped it over
+    };
+
+    // Play participation (pp:) — the PlayProof gate.
+    bool has_play_credit(const Hash256& ch, const Address& addr) const;
+    void mark_play_credit(leveldb::WriteBatch& b, const Hash256& ch,
+                          const Address& addr);
+
+    // Per-wallet verdict. get_rating returns 0 when the wallet has not rated.
+    uint8_t get_rating(const Hash256& ch, const Address& addr) const;
+    void    set_rating(leveldb::WriteBatch& b, const Hash256& ch,
+                       const Address& addr, uint8_t value);
+
+    RatingCounts get_rating_counts(const Hash256& ch) const;
+    void         set_rating_counts(leveldb::WriteBatch& b, const Hash256& ch,
+                                   const RatingCounts& c);
+
+    // Every (content_hash, value) this address has rated. Prefix scan on ra:.
+    std::vector<std::pair<Hash256, uint8_t>> list_ratings_by_address(
+        const Address& addr) const;
+
+    RatingPolicy get_rating_policy() const;
+    void         set_rating_policy(leveldb::WriteBatch& b, const RatingPolicy& p);
+
+    std::optional<RatingHide> get_rating_hide(const Hash256& ch) const;
+    void                      set_rating_hide(leveldb::WriteBatch& b,
+                                              const Hash256& ch,
+                                              const RatingHide& h);
+
+    // "rx:<ch>" — a moderator has reviewed this song and cleared the automatic
+    // hide. DELIBERATELY node-local: it is NOT in kStatePrefixes, NOT cleared
+    // by clear_derived_state, and it MUST NEVER be read by an apply path. Its
+    // only job is to stop apply_rating re-setting the display mask `d:` when
+    // the chain is replayed (rh: is rooted, so a rebuild re-derives the hide
+    // event and would otherwise resurrect a hide a human explicitly reversed).
+    // Consensus is unaffected: rh: is still written identically on every node,
+    // only the local serving decision differs — exactly like every other d:
+    // write, which is already node-local by design.
+    bool is_rating_hide_exempt(const Hash256& ch) const;
+    void set_rating_hide_exempt(leveldb::WriteBatch& b, const Hash256& ch);
+    void clear_rating_hide_exempt(leveldb::WriteBatch& b, const Hash256& ch);
+
     // ---- Transfer nonce (nv:) ----------------------------------------
     uint64_t get_nonce(const Address& addr) const;
     void     set_nonce(leveldb::WriteBatch& b, const Address& addr, uint64_t nonce);

@@ -28,7 +28,22 @@ inline constexpr const char* kStatePrefixes[] = {
     // here — it is written by non-consensus paths (API/DMCA/deep-audit) and read
     // only for local display/serving, never in an apply/state_root path, so
     // rooting it would fork on every local hide.
-    "label:", "art_label:"
+    "label:", "art_label:",
+    // Listener ratings. Written ONLY by the consensus apply path
+    // (Chain::apply_rating / execute_proposal SET_RATING_THRESHOLD) and
+    // load-bearing for consensus: rc: counts + rt: policy together decide
+    // whether a rating auto-hide fires, and rv:/ra: decide whether a re-rate
+    // replaces or adds. Two nodes with different rating state would hide
+    // different tracks, so these MUST be in the root and cleared by rebuild.
+    //
+    // ADDING THESE IS FORK-SAFE: no block before this feature shipped writes a
+    // single key under any of them, so the LtHash fold over historical state is
+    // byte-identical and every existing block still matches its header
+    // state_root. ("pp:", the play-participation index, is deliberately NOT
+    // here — it IS derived from historical plays, so rooting it would change
+    // every old block's root. It is cleared in clear_derived_state instead,
+    // exactly like "fph:".)
+    "rv:", "ra:", "rc:", "rt:", "rh:"
 };
 
 // True iff `key` is part of the committed state: it matches one of

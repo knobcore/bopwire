@@ -483,6 +483,7 @@ std::pair<int, std::string> HttpServer::get_songs_list() {
         if (db_.is_hidden_album (meta->album))  continue;
         if (db_.is_hidden_title (meta->title))  continue;
         auto state = db_.get_song_state(ch);
+        const auto rat = db_.get_rating_counts(ch);
         // Include the SHA256 of the compressed fingerprint so clients can
         // do an O(1) "is this hash already on chain?" check without
         // hashing every track locally. The full constellation stays out
@@ -506,6 +507,10 @@ std::pair<int, std::string> HttpServer::get_songs_list() {
             {"track_number",     meta->track_number},
             {"play_count",       state.play_count},
             {"fingerprint_hash", fp_hash_hex},
+            // Listener ratings ride along with every metadata row so the
+            // player / website can render thumbs without a second round trip.
+            {"ratings_up",       rat.up},
+            {"ratings_down",     rat.down},
         });
     }
     return {200, j.dump()};
@@ -568,6 +573,7 @@ std::pair<int, std::string> HttpServer::_do_songs_search(const std::string& arti
             }
         }
         auto state = db_.get_song_state(ch);
+        const auto rat = db_.get_rating_counts(ch);
         j.push_back({
             {"content_hash", crypto::to_hex(ch)},
             {"title",        meta->title},
@@ -578,6 +584,8 @@ std::pair<int, std::string> HttpServer::_do_songs_search(const std::string& arti
             {"year",         meta->year},
             {"track_number", meta->track_number},
             {"play_count",   state.play_count},
+            {"ratings_up",   rat.up},
+            {"ratings_down", rat.down},
         });
     }
     return {200, j.dump()};
@@ -588,10 +596,13 @@ std::pair<int, std::string> HttpServer::get_song(const std::string& content_hash
     if (!crypto::parse_hash256(content_hash_hex, ch))
         return {400, R"({"error":"invalid hash"})"};
     auto state = db_.get_song_state(ch);
+    const auto rat = db_.get_rating_counts(ch);
     json j = {
         {"content_hash", content_hash_hex},
         {"play_count", state.play_count},
         {"discoverer", crypto::to_checksum_hex(state.discoverer_address)},
+        {"ratings_up",   rat.up},
+        {"ratings_down", rat.down},
     };
     return {200, j.dump()};
 }

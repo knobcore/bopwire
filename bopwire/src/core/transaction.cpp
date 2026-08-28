@@ -668,6 +668,81 @@ bool deserialize_settle_body(const uint8_t* data, size_t len,
     return true;
 }
 
+// ---- RatingTx -------------------------------------------------------
+
+std::vector<uint8_t> RatingTx::sign_message() const {
+    std::vector<uint8_t> msg;
+    // chain_id first (EIP-155 style) so a rating signature can never replay on
+    // another chain, then the TYPE BYTE as an explicit domain separator so this
+    // preimage can never be reinterpreted as some other tx type's preimage.
+    // (The older types omit the type byte for wire-compat reasons; RATING is
+    // brand new, so it gets the stronger form for free.)
+    write_u32le(msg, MC_CHAIN_ID);
+    msg.push_back(static_cast<uint8_t>(TxType::RATING));
+    write_bytes(msg, content_hash.data(), 32);
+    msg.push_back(value);
+    write_bytes(msg, rater.data(),        20);
+    write_bytes(msg, rater_pubkey.data(), 33);
+    write_u64le(msg, nonce);
+    return msg;
+}
+
+std::vector<uint8_t> RatingTx::serialize() const {
+    // EIP-155 convention: chain_id binds the signature but is NOT transmitted.
+    std::vector<uint8_t> buf;
+    buf.push_back(static_cast<uint8_t>(TxType::RATING));
+    write_bytes(buf, content_hash.data(), 32);
+    buf.push_back(value);
+    write_bytes(buf, rater.data(),        20);
+    write_bytes(buf, rater_pubkey.data(), 33);
+    write_u64le(buf, nonce);
+    write_bytes(buf, signature.data(),    64);
+    return buf;
+}
+
+bool RatingTx::deserialize(const uint8_t* data, size_t len, RatingTx& out) {
+    const uint8_t* p   = data;
+    const uint8_t* end = data + len;
+    if (p >= end || *p++ != static_cast<uint8_t>(TxType::RATING)) return false;
+    if (!read_bytes(p, end, out.content_hash.data(), 32)) return false;
+    if (p >= end) return false; out.value = *p++;
+    if (!read_bytes(p, end, out.rater.data(),        20)) return false;
+    if (!read_bytes(p, end, out.rater_pubkey.data(), 33)) return false;
+    if (!read_u64le(p, end, out.nonce))                   return false;
+    if (!read_bytes(p, end, out.signature.data(),    64)) return false;
+    // Fixed-width type: reject trailing garbage so the tx hash stays canonical
+    // (a padded copy would otherwise be a distinct hash for the same rating).
+    if (p != end) return false;
+    return true;
+}
+
+Hash256 RatingTx::tx_hash() const {
+    auto raw = serialize();
+    return crypto::sha256(raw.data(), raw.size());
+}
+
+bool RatingTx::verify_signature() const {
+    // Canonical-value gate: only UP / DOWN exist on the wire. Rejecting 0 and
+    // >2 here (rather than at apply) keeps a nonsense value out of the mempool
+    // and out of every node's flood path.
+    if (value != static_cast<uint8_t>(RatingValue::UP) &&
+        value != static_cast<uint8_t>(RatingValue::DOWN)) return false;
+    // An all-zero content_hash is never a real song; reject the placeholder so
+    // an unfilled slot can't be signed into a block (same discipline as the
+    // ProposalTx unused-slot rules).
+    bool ch_nonzero = false;
+    for (uint8_t b : content_hash) if (b) { ch_nonzero = true; break; }
+    if (!ch_nonzero) return false;
+
+    auto msg  = sign_message();
+    auto hash = crypto::sha256(msg.data(), msg.size());
+    // Same inline-pubkey cross-check every other signed tx does: the key that
+    // signed must be the key that owns the address the rating is attributed to.
+    Address derived = crypto::address_from_pubkey(rater_pubkey);
+    if (std::memcmp(derived.data(), rater.data(), 20) != 0) return false;
+    return crypto::verify_ecdsa(hash, signature, rater_pubkey);
+}
+
 // ---- SlashTx --------------------------------------------------------
 
 std::vector<uint8_t> SlashTx::sign_message() const {

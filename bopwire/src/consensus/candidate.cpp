@@ -392,6 +392,19 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                     }
                     break;
                 }
+                case TxType::RATING: {
+                    RatingTx tx;
+                    if (!RatingTx::deserialize(raw.data(), raw.size(), tx)) {
+                        why = "RATING: deserialize failed";
+                    } else if (!tx.verify_signature()) {
+                        why = "RATING: verify_signature failed";
+                    } else {
+                        slot.sender = tx.rater;
+                        slot.nonce  = tx.nonce;
+                        ok = true;
+                    }
+                    break;
+                }
                 case TxType::MINT: {
                     MintTx tx;
                     if (!MintTx::deserialize(raw.data(), raw.size(), tx)) {
@@ -515,7 +528,8 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                 const bool metered = (t == TxType::TRANSFER ||
                                       t == TxType::USERNAME_REGISTER ||
                                       t == TxType::MODERATOR_PROPOSAL ||
-                                      t == TxType::MODERATOR_OP);
+                                      t == TxType::MODERATOR_OP ||
+                                      t == TxType::RATING);
                 if (metered && ++cur_count > MAX_TXS_PER_SENDER_PER_BLOCK) {
                     dropping_sender = true;      // this tx + every later one for
                     continue;                    // this sender are dropped

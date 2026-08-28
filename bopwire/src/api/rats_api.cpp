@@ -63,6 +63,71 @@ constexpr const char* MC_SETTLE_BODY   = "bopwire.settlebody"; // settlement com
 constexpr const char* MC_SETTLE_BODY_GET = "bopwire.settlebodyget"; // request a body by merkle root (H1)
 
 namespace {
+
+// ---- rating read helpers -------------------------------------------
+//
+// One place that turns the rating policy / hide record into JSON, so
+// ratings.get, ratings.threshold and song.detail all describe a hide the
+// same way and the explorer never has to hardcode a constant.
+nlohmann::json rating_policy_json(const Database& db) {
+    const auto p = db.get_rating_policy();
+    char pct[16];
+    std::snprintf(pct, sizeof pct, "%.2f", p.down_ratio_bps / 100.0);
+    nlohmann::json j = {
+        {"min_ratings",       p.min_ratings},
+        {"down_ratio_bps",    p.down_ratio_bps},
+        {"down_ratio_pct",    pct},
+        // "default" = this chain has never executed a SET_RATING_THRESHOLD
+        // proposal and is running on the compiled-in fallback.
+        {"source",            p.set_height ? "chain" : "default"},
+        {"set_height",        p.set_height},
+        {"set_by",            p.set_height ? crypto::to_hex(p.set_by.data(), 20)
+                                           : std::string()},
+        {"proposal_tx",       p.set_height ? crypto::to_hex(p.proposal_hash)
+                                           : std::string()},
+        {"defaults",          {{"min_ratings",    RATING_DEFAULT_MIN_RATINGS},
+                               {"down_ratio_bps", RATING_DEFAULT_DOWN_RATIO_BPS}}},
+        {"bounds",            {{"min_ratings_min",    RATING_MIN_RATINGS_FLOOR},
+                               {"min_ratings_max",    RATING_MIN_RATINGS_CEIL},
+                               {"down_ratio_bps_min", RATING_DOWN_RATIO_BPS_FLOOR},
+                               {"down_ratio_bps_max", RATING_DOWN_RATIO_BPS_CEIL}}},
+        {"rule",              "hide when total_ratings >= min_ratings AND "
+                              "downvotes/total_ratings >= down_ratio_bps/10000"},
+        {"proposal_kind",     static_cast<int>(ProposalKind::SET_RATING_THRESHOLD)},
+    };
+    return j;
+}
+
+// The recorded hide event for one song (null when ratings never hid it). The
+// counts AND the threshold that was in force are frozen into the record at the
+// moment it fires, so a later retune can't make an old hide unexplainable.
+nlohmann::json rating_hide_json(const Database& db, const Hash256& ch) {
+    auto h = db.get_rating_hide(ch);
+    if (!h) return nlohmann::json(nullptr);
+    char pct[16];
+    std::snprintf(pct, sizeof pct, "%.2f", h->down_ratio_bps / 100.0);
+    return nlohmann::json{
+        {"height",          h->height},
+        {"up",              h->up},
+        {"down",            h->down},
+        {"total",           h->up + h->down},
+        {"trigger_tx",      crypto::to_hex(h->trigger_tx)},
+        {"threshold_in_force", {
+            {"min_ratings",    h->min_ratings},
+            {"down_ratio_bps", h->down_ratio_bps},
+            {"down_ratio_pct", pct},
+            {"set_height",     h->policy_set_height},
+            {"set_by",         h->policy_set_height
+                                   ? crypto::to_hex(h->policy_set_by.data(), 20)
+                                   : std::string()},
+        }},
+        // Ratings never auto-un-hide; a moderator clearing d: is final, and
+        // the exemption below is what makes that survive a chain replay.
+        {"currently_hidden",    db.is_song_deleted(ch)},
+        {"moderator_unhidden",  db.is_rating_hide_exempt(ch)},
+    };
+}
+
 // Load the Shared Moderation Key recipient — (address, pubkey) — from
 // <data_dir>/moderation.key (a dedicated ECIES keypair the founder wizard
 // generated; NOT a wallet). The node uses it as the SINGLE ECIES recipient
@@ -1413,6 +1478,142 @@ void RatsApi::handle_request(const std::string& peer_id,
                 reply = {{"req_id", req_id}, {"status", "server_error"},
                          {"error",  e.what()}};
             }
+        }
+        // ---- listener ratings -------------------------------------------
+        //
+        // The wallet signs the RatingTx preimage locally (RatingTx::sign_message
+        // in src/core/transaction.cpp — u32le chain_id | u8 0x80 | content_hash
+        // | u8 value | rater | rater_pubkey | u64le nonce, SHA-256'd then
+        // ECDSA-signed) and posts the pieces here. We rebuild the tx, verify it,
+        // and flood it down the SAME canonical mempool path as
+        // wallet.transfer / proposal.submit. The node never invents a rating.
+        else if (type == "rating.submit") {
+            try {
+                RatingTx tx{};
+                bool malformed = false;
+                if (!crypto::parse_hash256(in.value("content_hash", std::string()),
+                                           tx.content_hash))
+                    malformed = true;
+                // Accept either the numeric value or the friendly string.
+                const std::string vs = in.value("value", std::string());
+                if      (vs == "up"   || vs == "1") tx.value = 1;
+                else if (vs == "down" || vs == "2") tx.value = 2;
+                else if (in.contains("value") && in["value"].is_number())
+                    tx.value = static_cast<uint8_t>(in["value"].get<int>());
+                else malformed = true;
+                auto ra  = crypto::from_hex(in.value("rater", std::string()));
+                auto pk  = crypto::from_hex(in.value("rater_pubkey", std::string()));
+                auto sig = crypto::from_hex(in.value("signature", std::string()));
+                if (ra.size() == 20) std::copy(ra.begin(), ra.end(), tx.rater.begin());
+                else malformed = true;
+                if (pk.size() == 33) std::copy(pk.begin(), pk.end(), tx.rater_pubkey.begin());
+                else malformed = true;
+                if (sig.size() == 64) std::copy(sig.begin(), sig.end(), tx.signature.begin());
+                else malformed = true;
+                tx.nonce = in.value("nonce", uint64_t{0});
+                if (malformed) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "bad rating field sizes"}};
+                } else if (!tx.verify_signature()) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "signature did not verify"}};
+                } else if (!db_.get_content_height(tx.content_hash).has_value()) {
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "song not on chain"}};
+                } else if (!db_.has_play_credit(tx.content_hash, tx.rater)) {
+                    // The Sybil gate, surfaced early with a readable reason so
+                    // the client can grey the buttons out instead of silently
+                    // dropping the tx in the mempool.
+                    reply = {{"req_id", req_id}, {"status", "invalid"},
+                             {"error", "no play proof: this wallet has no "
+                                       "on-chain credited play of this song"}};
+                } else {
+                    json txe = {{"tx", crypto::to_hex(tx.serialize())},
+                                {"submit_ms", presence_now_ms()}};
+                    ingest_tx(txe.dump(), /*broadcast_if_new=*/true);
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {{"tx_hash", crypto::to_hex(tx.tx_hash())}}}};
+                }
+            } catch (const std::exception& e) {
+                reply = {{"req_id", req_id}, {"status", "server_error"},
+                         {"error", e.what()}};
+            }
+        }
+        // {content_hash, address?} -> counts, this address's verdict, whether
+        // it is even eligible to rate, and the hide record if ratings hid it.
+        else if (type == "ratings.get") {
+            Hash256 ch{};
+            if (!crypto::parse_hash256(in.value("content_hash", std::string()), ch)) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "need 64-hex content_hash"}};
+            } else {
+                const auto c = db_.get_rating_counts(ch);
+                json body = {
+                    {"content_hash", crypto::to_hex(ch)},
+                    {"up",           c.up},
+                    {"down",         c.down},
+                    {"total",        c.up + c.down},
+                    {"score",        static_cast<int64_t>(c.up) -
+                                     static_cast<int64_t>(c.down)},
+                };
+                Address addr{};
+                auto ab = crypto::from_hex(in.value("address", std::string()));
+                if (ab.size() == 20 ||
+                    crypto::parse_address_checksummed(in.value("address", std::string()), addr)) {
+                    if (ab.size() == 20) std::copy(ab.begin(), ab.end(), addr.begin());
+                    const uint8_t mine = db_.get_rating(ch, addr);
+                    body["address"]    = crypto::to_hex(addr.data(), 20);
+                    body["my_rating"]  = mine == 1 ? json("up")
+                                       : mine == 2 ? json("down") : json(nullptr);
+                    body["can_rate"]   = db_.has_play_credit(ch, addr);
+                }
+                body["hidden"] = db_.is_song_deleted(ch);
+                body["rating_hide"] = rating_hide_json(db_, ch);
+                body["threshold"]   = rating_policy_json(db_);
+                reply = {{"req_id", req_id}, {"status", "ok"}, {"body", body}};
+            }
+        }
+        // {address, offset?, limit?} -> every song this wallet has rated.
+        else if (type == "ratings.by_address") {
+            Address addr{};
+            auto ab = crypto::from_hex(in.value("address", std::string()));
+            bool ok = false;
+            if (ab.size() == 20) { std::copy(ab.begin(), ab.end(), addr.begin()); ok = true; }
+            else ok = crypto::parse_address_checksummed(
+                        in.value("address", std::string()), addr);
+            if (!ok) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "need 40-hex address"}};
+            } else {
+                auto all = db_.list_ratings_by_address(addr);
+                size_t offset = in.value("offset", size_t{0});
+                size_t limit  = std::min<size_t>(
+                    std::max<size_t>(in.value("limit", size_t{200}), 1), 1000);
+                json arr = json::array();
+                for (size_t i = offset; i < all.size() && arr.size() < limit; ++i) {
+                    json r = {{"content_hash", crypto::to_hex(all[i].first)},
+                              {"value", all[i].second == 1 ? "up" : "down"}};
+                    if (auto m = db_.get_song_meta(all[i].first)) {
+                        r["title"]  = m->title;
+                        r["artist"] = m->artist;
+                    }
+                    const auto c = db_.get_rating_counts(all[i].first);
+                    r["up"] = c.up; r["down"] = c.down;
+                    arr.push_back(std::move(r));
+                }
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {{"address", crypto::to_hex(addr.data(), 20)},
+                                   {"total",   all.size()},
+                                   {"offset",  offset},
+                                   {"limit",   limit},
+                                   {"ratings", std::move(arr)}}}};
+            }
+        }
+        // The threshold in force, where it came from, and the settable range —
+        // so the explorer can explain any hide without hardcoding constants.
+        else if (type == "ratings.threshold") {
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body", rating_policy_json(db_)}};
         }
         // ---- chat support reads -----------------------------------------
         //
@@ -3788,6 +3989,17 @@ bool tx_preflight_ok(const std::vector<uint8_t>& raw, const Database& db) {
             ProposalTx tx;
             return ProposalTx::deserialize(raw.data(), raw.size(), tx)
                 && tx.verify_signature();
+        }
+        case TxType::RATING: {
+            RatingTx tx;
+            if (!RatingTx::deserialize(raw.data(), raw.size(), tx)) return false;
+            // verify_signature also enforces value in {UP,DOWN} and a non-zero
+            // content_hash. The authoritative rules (nonce, song-on-chain, and
+            // the PlayProof gate) run in Chain::apply_rating — but we check the
+            // play credit HERE too, so a rating from a wallet that never
+            // streamed the track never enters a mempool or floods the mesh.
+            if (!tx.verify_signature()) return false;
+            return db.has_play_credit(tx.content_hash, tx.rater);
         }
         case TxType::USERNAME_REGISTER: {
             UsernameTx tx;

@@ -126,6 +126,11 @@ bool Chain::init() {
                      "reorg/rebuild by re-deriving state before serving\n";
         rebuild_derived_state();
     }
+    // One-time pp: backfill so an already-synced node can serve/validate
+    // ratings for plays that predate this feature. No-op after the first run
+    // and after a rebuild (which re-derives pp: itself, but the marker keeps
+    // the scan from repeating).
+    ensure_play_index();
     return true;
 }
 
@@ -339,6 +344,7 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
     proposal_votes_in_block_.clear();
     applied_nonce_in_block_.clear();
     sessions_used_in_block_.clear();
+    plays_in_block_.clear();        // block-scoped pp: staging (see chain.h)
     pending_checkpoints_.clear();   // M2: staged pins, merged only post-commit
     ledger_.reset();   // C2: fresh block-scoped balance/supply overlay
 
@@ -442,6 +448,15 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
             if (!apply_checkpoint(cp, batch)) {
                 std::cerr << "[chain] apply: CHECKPOINT apply failed\n"; return false;
             }
+        } else if (type == TxType::RATING) {
+            RatingTx rt;
+            if (!RatingTx::deserialize(raw_tx.data(), raw_tx.size(), rt)) {
+                std::cerr << "[chain] apply: RATING deserialize failed\n"; return false;
+            }
+            if (!apply_rating(rt, height, batch)) {
+                std::cerr << "[chain] apply: RATING apply failed (nonce/sig/no play proof)\n";
+                return false;
+            }
         } else if (type == TxType::SETTLEMENT_MINT) {
             SettlementMintTx sm;
             if (!SettlementMintTx::deserialize(raw_tx.data(), raw_tx.size(), sm)) {
@@ -500,8 +515,13 @@ bool Chain::apply_mint(const MintTx& mint, uint64_t play_count_before,
     // is the persistence step that makes the check stick.
     db_.put_batch(batch, "u:" + db_.hex(mint.proof.session_id), {});
 
-    // Update song state (play_count++, discoverer on first play).
+    // Update song state (play_count++, discoverer on first play). This also
+    // writes the pp: play-credit marker the rating gate reads.
     db_.update_song_state(batch, mint.proof, play_count_before);
+    // Stage it for THIS block too — the batched pp: row isn't readable until
+    // the block commits, and a listener's RatingTx can legitimately ride in the
+    // same block as the mint of the play that entitles them to it.
+    plays_in_block_.insert({mint.proof.content_hash, mint.proof.player_address});
 
     // BUG FIX: previously this loop called ledger.credit() per
     // output. Each call read the OLD balance from disk so two
@@ -700,6 +720,162 @@ bool Chain::apply_username_register(const UsernameTx& tx,
     db_.set_username(batch, tx.name, tx.owner);
     db_.set_nonce(batch, tx.owner, expected + 1);
     record_applied_nonce(tx.owner, expected + 1);
+    return true;
+}
+
+// ---- Listener ratings (thumbs up / down) ----------------------------
+//
+// The whole Sybil story is one line below: `has_play_credit`. Wallets are free,
+// so "one wallet one vote" is worthless on its own; "one PROVEN LISTEN one
+// vote" is not. A pp: row exists only because a MintTx (or a SETTLEMENT_MINT
+// constituent) carrying a three-party co-signed PlayProof for exactly this
+// (song, wallet) was applied by every node on the chain. Rating is therefore
+// gated on something an attacker has to actually spend a stream to obtain.
+bool Chain::apply_rating(const RatingTx& tx, uint32_t height,
+                         leveldb::WriteBatch& batch) {
+    // Signature + inline-pubkey bind + canonical value (1/2) + non-zero hash.
+    if (!tx.verify_signature()) return false;
+
+    // Per-address nonce, same nv: space as TRANSFER / PROPOSAL / USERNAME.
+    const uint64_t expected = next_expected_nonce(tx.rater);
+    if (tx.nonce != expected) return false;
+
+    // The song must actually be on chain. bh: is committed, rooted, and
+    // rebuilt by replay, so this verdict is identical on every node.
+    if (!db_.get_content_height(tx.content_hash).has_value()) return false;
+
+    // THE GATE: an on-chain credited play of THIS song by THIS wallet. Reads
+    // the committed pp: row, or the block-scoped staging set for a play minted
+    // earlier in this very block.
+    if (!db_.has_play_credit(tx.content_hash, tx.rater) &&
+        !plays_in_block_.count({tx.content_hash, tx.rater}))
+        return false;
+
+    // Replace, never stack. `prior` is 0 when this wallet has not rated before.
+    const uint8_t prior = db_.get_rating(tx.content_hash, tx.rater);
+    Database::RatingCounts c = db_.get_rating_counts(tx.content_hash);
+    if (prior != tx.value) {
+        if (prior == static_cast<uint8_t>(RatingValue::UP)   && c.up   > 0) --c.up;
+        if (prior == static_cast<uint8_t>(RatingValue::DOWN) && c.down > 0) --c.down;
+        if (tx.value == static_cast<uint8_t>(RatingValue::UP))   ++c.up;
+        else                                                     ++c.down;
+        db_.set_rating_counts(batch, tx.content_hash, c);
+    }
+    // Re-sending the SAME verdict is an idempotent no-op that still advances
+    // the nonce. Rejecting it instead would let one stale mempool copy fail
+    // apply_transactions and take an otherwise-valid block down with it.
+    db_.set_rating(batch, tx.content_hash, tx.rater, tx.value);
+
+    // ---- Auto-hide evaluation ---------------------------------------
+    //
+    // Fires AT MOST ONCE per song, latched on the rh: record. It never
+    // auto-un-hides: if the ratio later recovers the track stays hidden until a
+    // human acts, and once a moderator has unhidden it (mod_action.h
+    // "unhide_hash" -> unmark_song_deleted, or a d: clear from any of the
+    // existing moderator paths) the ratings machinery never touches it again.
+    // Automated action is a one-shot referral to human review, and human review
+    // is final — the alternative (a live ratio that keeps re-hiding) would let
+    // the crowd overrule a moderator forever and would flap `d:`, which is
+    // node-local display state and NOT covered by the state_root.
+    if (!db_.get_rating_hide(tx.content_hash).has_value()) {
+        const Database::RatingPolicy pol = db_.get_rating_policy();
+        if (rating_hide_triggers(c.up, c.down, pol.min_ratings,
+                                 pol.down_ratio_bps)) {
+            Database::RatingHide rh;
+            rh.height            = height;
+            rh.up                = c.up;
+            rh.down              = c.down;
+            // The values IN FORCE at the instant of the hide, copied in, so a
+            // later SET_RATING_THRESHOLD can never make this hide unexplainable.
+            rh.min_ratings       = pol.min_ratings;
+            rh.down_ratio_bps    = pol.down_ratio_bps;
+            rh.policy_set_height = pol.set_height;
+            rh.policy_set_by     = pol.set_by;
+            rh.trigger_tx        = tx.tx_hash();
+            db_.set_rating_hide(batch, tx.content_hash, rh);
+            // d: is the same display mask a moderator hide / HIDE_CONTENT
+            // proposal writes. It is read only by serving + explorer paths,
+            // never by an apply path, so writing it here changes no consensus
+            // verdict — the AUTHORITATIVE, rooted, reorg-safe record is rh:.
+            //
+            // The rx: exemption is checked ONLY for this display write, never
+            // for rh: above: rh: must stay a pure function of the blocks (it is
+            // in the state_root), while d: is already node-local. Without this,
+            // a rebuild/reorg would re-derive rh:, re-set d:, and resurrect a
+            // hide a moderator had explicitly reversed.
+            if (!db_.is_rating_hide_exempt(tx.content_hash))
+                db_.mark_song_deleted(batch, tx.content_hash);
+            std::cout << "[chain] RATING auto-hide: "
+                      << db_.hex(tx.content_hash).substr(0, 12) << "… at "
+                      << c.down << " down / " << (c.up + c.down)
+                      << " ratings (floor " << pol.min_ratings << ", ratio "
+                      << pol.down_ratio_bps << " bps)\n";
+        }
+    }
+
+    db_.set_nonce(batch, tx.rater, expected + 1);
+    record_applied_nonce(tx.rater, expected + 1);
+    return true;
+}
+
+// One-time pp: backfill for a chain that predates ratings. Writes ONLY pp:
+// rows — it never touches committed state, never runs the accumulator, and
+// never moves the tip, so unlike a full rebuild_derived_state() it cannot
+// truncate a live chain. The set it produces is exactly the set the replay
+// path produces: a play counts iff its session was actually consumed (u:
+// marker committed), which is precisely the condition under which apply_mint /
+// apply_settlement_mint called update_song_state in the first place.
+bool Chain::ensure_play_index() {
+    if (db_.get("schema:pp").has_value()) return true;   // already backfilled
+    std::lock_guard<std::mutex> lk(mu_);
+    uint64_t marked = 0, scanned = 0;
+    leveldb::WriteBatch batch;   // NOTE: acc_ is null off the block path
+    for (uint32_t h = 1; h <= tip_.height; ++h) {
+        auto bh = get_block_hash(h);
+        if (!bh) continue;
+        auto blk = get_block(*bh);
+        if (!blk) continue;
+        for (const auto& raw : blk->transactions) {
+            if (raw.empty()) continue;
+            const TxType t = static_cast<TxType>(raw[0]);
+            if (t == TxType::MINT) {
+                MintTx m;
+                if (!MintTx::deserialize(raw.data(), raw.size(), m)) continue;
+                ++scanned;
+                if (!db_.is_session_used(m.proof.session_id)) continue;
+                db_.mark_play_credit(batch, m.proof.content_hash,
+                                     m.proof.player_address);
+                ++marked;
+            } else if (t == TxType::SETTLEMENT_MINT) {
+                SettlementMintTx sm;
+                if (!SettlementMintTx::deserialize(raw.data(), raw.size(), sm)) continue;
+                // sb: companion bodies are never deleted (block replay already
+                // depends on them), so this is complete whenever the chain is.
+                auto braw = db_.get("sb:" + db_.hex(sm.constituents_merkle_root));
+                if (!braw) {
+                    std::cerr << "[chain] play-index backfill: settlement body "
+                              << db_.hex(sm.constituents_merkle_root).substr(0, 12)
+                              << "… missing at height " << h
+                              << " — ratings for its listeners will be refused "
+                                 "until the body is refetched\n";
+                    continue;
+                }
+                std::vector<PlayProof> proofs;
+                if (!deserialize_settle_body(braw->data(), braw->size(), proofs))
+                    continue;
+                for (const auto& pr : proofs) {
+                    ++scanned;
+                    if (!db_.is_session_used(pr.session_id)) continue;
+                    db_.mark_play_credit(batch, pr.content_hash, pr.player_address);
+                    ++marked;
+                }
+            }
+        }
+    }
+    if (!db_.write(batch)) return false;
+    db_.put("schema:pp", std::vector<uint8_t>{1});
+    std::cout << "[chain] play-index backfill: " << marked << " play credit(s) from "
+              << scanned << " proof(s) across " << tip_.height << " block(s)\n";
     return true;
 }
 
@@ -945,7 +1121,8 @@ bool Chain::apply_settlement_mint(const SettlementMintTx& tx,
         used_in_batch.insert(sid);
         sessions_used_in_block_.insert(pr.session_id);  // C1: block-scoped consume
         db_.put_batch(batch, "u:" + sid, {});          // per-play replay marker
-        db_.update_song_state(batch, pr, pc);           // play_count++ (+ discoverer)
+        db_.update_song_state(batch, pr, pc);           // play_count++ (+ discoverer + pp:)
+        plays_in_block_.insert({pr.content_hash, pr.player_address});
     }
     // 5) Apply the aggregated credits. (Post-10k listener burn debit is a
     //    documented follow-up; pre-10k total_burn is 0.)
@@ -1190,6 +1367,27 @@ bool Chain::execute_proposal(const ProposalTx& prop,
             db_.set_proposal_status(batch, prop_hash, Database::PROP_EXECUTED);
             return true;
         }
+        case ProposalKind::SET_RATING_THRESHOLD: {
+            // Retune the chain-wide rating auto-hide policy. Range-checked
+            // again here (not just in apply_proposal) because execute is also
+            // reached from the VOTE_YES path, which re-reads a proposal that
+            // was stored under whatever rules were live when it was filed.
+            uint32_t min_ratings = 0, bps = 0;
+            unpack_rating_policy(prop.amount, min_ratings, bps);
+            if (!rating_policy_in_bounds(min_ratings, bps)) return false;
+            Database::RatingPolicy pol;
+            pol.min_ratings    = min_ratings;
+            pol.down_ratio_bps = bps;
+            pol.set_height     = height;
+            pol.set_by         = prop.proposer;
+            pol.proposal_hash  = prop_hash;
+            db_.set_rating_policy(batch, pol);
+            db_.set_proposal_status(batch, prop_hash, Database::PROP_EXECUTED);
+            std::cout << "[chain] rating threshold set: min_ratings="
+                      << min_ratings << " down_ratio_bps=" << bps
+                      << " at height " << height << "\n";
+            return true;
+        }
         case ProposalKind::VOTE_YES: {
             // VOTE_YES isn't itself executable — we never call execute
             // on a vote tx. If we somehow got here, treat it as a no-op.
@@ -1300,6 +1498,36 @@ bool Chain::apply_proposal(const ProposalTx& tx,
                     : (effective_vote_count(prop_hash) >= needed);
             if (approved) {
                 if (!execute_proposal(prop, prop_hash, height, batch)) return false;
+            }
+            db_.set_nonce(batch, tx.proposer, expected + 1);
+            record_applied_nonce(tx.proposer, expected + 1);
+            return true;
+        }
+        case ProposalKind::SET_RATING_THRESHOLD: {
+            // Unused wire slots must be all-zero so the tx hash is canonical.
+            if (!hash_is_zero(tx.target_hash))    return false;
+            if (!address_is_zero(tx.target_addr)) return false;
+            // `amount` is the packed policy; refuse anything out of bounds
+            // BEFORE it can even become a pending proposal, so an unbounded
+            // value never sits in the table waiting for a vote. This is where
+            // "floor 1, ratio 100%" — one listener deleting any track they
+            // streamed — is made unrepresentable.
+            {
+                uint32_t min_ratings = 0, bps = 0;
+                unpack_rating_policy(tx.amount, min_ratings, bps);
+                if (!rating_policy_in_bounds(min_ratings, bps)) return false;
+            }
+
+            Hash256 prop_hash = tx.tx_hash();
+            if (db_.has_proposal(prop_hash))      return false;
+
+            db_.put_proposal(batch, prop_hash, tx.serialize());
+            db_.add_proposal_vote(batch, prop_hash, tx.proposer);
+            proposal_votes_in_block_[prop_hash].insert(tx.proposer);
+
+            // Same majority quorum as HIDE_CONTENT / RELEASE_ESCROW.
+            if (effective_vote_count(prop_hash) >= needed) {
+                if (!execute_proposal(tx, prop_hash, height, batch)) return false;
             }
             db_.set_nonce(batch, tx.proposer, expected + 1);
             record_applied_nonce(tx.proposer, expected + 1);
@@ -1823,6 +2051,7 @@ bool Chain::rebuild_derived_state() {
             applied_nonce_in_block_.clear();
             proposal_votes_in_block_.clear();
             sessions_used_in_block_.clear();
+            plays_in_block_.clear();
             apply_ok = apply_transactions(*block, h, batch);
         }   // AccGuard clears acc_ here, even if a writer threw
         if (!apply_ok) {

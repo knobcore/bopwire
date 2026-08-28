@@ -17,6 +17,23 @@ enum class TxType : uint8_t {
     NODE_AUTH            = 0x70,   // founder authorizes/revokes a validator in v: (Phase 2)
     CHECKPOINT           = 0x71,   // founder-signed {height, block_hash} finality pin (Phase 2)
     SETTLEMENT_MINT      = 0x72,   // batched, recompute-authoritative play settlement (Phase 3)
+    // Listener rating (thumbs up / down) on a song. 0x80 deliberately opens a
+    // NEW high band: every pre-existing type is <= 0x72, and 0x00-0x7F is now
+    // closed as "chain/economic/governance machinery". 0x80+ is reserved for
+    // LISTENER-AUTHORED reactions to content (ratings today; comments / follows
+    // later), so the tag byte alone tells you which half of the protocol a tx
+    // belongs to. It also cannot collide with any value an existing node has
+    // ever emitted or accepted.
+    RATING               = 0x80,
+};
+
+// Thumbs value carried in a RatingTx. There is deliberately NO "clear/neutral"
+// value: a wallet's rating is one of exactly two states, and changing your mind
+// means sending the other one (which REPLACES, never stacks). Zero and >2 are
+// rejected at signature-verification time so the wire stays canonical.
+enum class RatingValue : uint8_t {
+    UP   = 1,
+    DOWN = 2,
 };
 
 // Sub-kinds of evidence carried inside a SlashTx. Two payload shapes for
@@ -218,6 +235,17 @@ enum class ProposalKind : uint8_t {
     RELEASE_ESCROW  = 2,   // release escrow from artist's escrow_address
     VOTE_YES        = 3,   // cast a YES vote on an existing proposal
     GRANT_MODERATOR = 4,   // request a moderator grant; needs UNANIMOUS mod votes
+    // Retune the chain-wide rating auto-hide threshold. Majority quorum, exactly
+    // like HIDE_CONTENT: it changes hiding for the WHOLE catalogue, so it must
+    // not be a single moderator's call. Field discipline (enforced in
+    // Chain::apply_proposal, unused slots must be all-zero so the tx hash stays
+    // canonical): target_hash and target_addr are ZERO, and `amount` carries the
+    // packed policy
+    //
+    //     amount = (uint64_t(down_ratio_bps) << 32) | uint64_t(min_ratings)
+    //
+    // with both halves range-checked against the RATING_* bounds in chain.h.
+    SET_RATING_THRESHOLD = 5,
 };
 
 struct ProposalTx {
@@ -410,6 +438,145 @@ struct SettlementMintTx {
 std::vector<uint8_t> serialize_settle_body(const std::vector<PlayProof>& proofs);
 bool deserialize_settle_body(const uint8_t* data, size_t len,
                              std::vector<PlayProof>& out);
+
+// ---- Listener rating (thumbs up / down) -----------------------------
+//
+// A wallet's single verdict on ONE song. The Sybil defence is not "one rating
+// per IP" (wallets are free) but "one rating per PROVEN LISTEN": the chain only
+// accepts a rating from an address that already has an on-chain, three-party
+// co-signed PlayProof for that exact content_hash (see PlayProof above — the
+// serving node, the listener and the relaying mini-node all sign the same
+// preimage, so "this address really streamed this track" is already chain
+// attested). Chain::apply_rating looks that up in O(1) via the pp: index
+// Database::update_song_state maintains on every credited play.
+//
+// One rating per wallet per song, CHANGEABLE and never stackable: re-rating
+// replaces the previous verdict (up -> down moves one vote across, it does not
+// add one). Re-sending the SAME verdict is accepted as an idempotent no-op that
+// only advances the nonce, so a stale mempool copy can never wedge a block.
+//
+// Wire (little-endian), 159 bytes total:
+//   u8        TxType::RATING (0x80)
+//   Hash256   content_hash(32)   — song being rated, must be non-zero + on chain
+//   u8        value              — RatingValue (1 = up, 2 = down)
+//   Address   rater(20)          — the listener's wallet
+//   PubKey33  rater_pubkey(33)   — carried inline; address_from_pubkey(...) == rater
+//   u64       nonce              — per-address replay protection (shared nv: space)
+//   Sig64     signature(64)
+//
+// Signing preimage (99 bytes) — chain_id first, EIP-155 style, so a rating
+// signature never replays on another chain, then the TYPE BYTE as an explicit
+// domain separator (new type, no back-compat cost) so a RatingTx preimage can
+// never be reinterpreted as any other tx type's preimage:
+//   u32le MC_CHAIN_ID | u8 0x80 | content_hash(32) | u8 value
+//        | rater(20) | rater_pubkey(33) | u64le nonce
+struct RatingTx {
+    Hash256  content_hash{};
+    uint8_t  value = 0;               // RatingValue
+    Address  rater{};
+    PubKey33 rater_pubkey{};
+    uint64_t nonce = 0;
+    Sig64    signature{};
+
+    std::vector<uint8_t> serialize() const;
+    static bool deserialize(const uint8_t* data, size_t len, RatingTx& out);
+
+    std::vector<uint8_t> sign_message() const;
+    Hash256              tx_hash() const;
+    // Checks value is a legal RatingValue, content_hash is non-zero, the inline
+    // pubkey hashes to `rater`, and the ECDSA signature verifies.
+    bool                 verify_signature() const;
+};
+
+// ---- Rating auto-hide policy — THE one named place ------------------
+//
+// A track is auto-hidden when BOTH tests pass. Neither alone is enough:
+//
+//   1. SAMPLE FLOOR  total_ratings (= up + down) >= min_ratings
+//   2. RATIO TEST    down / total_ratings       >= down_ratio_bps / 10000
+//
+// The sample floor is what stops "3 plays, 2 downvotes, gone". The ratio test
+// is what stops a popular track being buried by a fixed number of downvotes:
+// the more people rate a track, the more downvotes hiding it costs, and an
+// unpopular-but-legitimate track that simply nobody rates never trips either
+// test. Both operands are DISTINCT WALLETS THAT PROVABLY STREAMED THE TRACK
+// (RatingTx requires an on-chain PlayProof), so "total" is not a free variable.
+//
+// The values IN FORCE live in chain state (Database::get_rating_policy, key
+// "rt:cur") and are changed by a majority-quorum ProposalKind::SET_RATING_
+// THRESHOLD. The constants below are the fallback a chain that has NEVER set
+// them uses — genesis defaults, not the only values.
+//
+// DEFAULTS, and why:
+//   min_ratings 25   — 25 distinct wallets each had to complete a three-party
+//                      co-signed stream of the track before the counter is even
+//                      consulted. On a catalogue the size of today's (332 songs,
+//                      249 plays, 4 unique listeners) this is unreachable, which
+//                      is the correct posture for shipping an automatic,
+//                      destructive action: it arms itself only once the network
+//                      is an order of magnitude larger.
+//   ratio 8000 (80%) — at 25 ratings that is >= 20 down vs <= 5 up. A merely
+//                      divisive track (60/40, 70/30) never auto-hides; only
+//                      near-unanimous rejection does. 80% also means every extra
+//                      upvote raises the downvote cost by 4, so an organised
+//                      brigade has to out-number the track's actual audience 4:1
+//                      AND each brigader has to have streamed it.
+//
+// BOUNDS on what a moderator quorum may set, and why:
+//   min_ratings in [10, 1000000]
+//     10 is the floor because, combined with the ratio floor below, it is the
+//     smallest setting that still needs 6 independent proven listeners to agree.
+//     The owner's own worked example — floor 1 with ratio 1.0, i.e. one listener
+//     deleting any track they streamed — is unrepresentable. 1000000 is the
+//     ceiling and doubles as the documented "turn it off" setting.
+//   down_ratio_bps in [5001, 10000]
+//     5001 = 50.01%, the lowest value that still requires a STRICT majority of
+//     raters to be negative (a 50/50 split can never hide anything). 10000 =
+//     unanimity, the other "effectively off" setting.
+inline constexpr uint32_t RATING_DEFAULT_MIN_RATINGS    = 25;
+inline constexpr uint32_t RATING_DEFAULT_DOWN_RATIO_BPS = 8000;   // 80.00%
+
+inline constexpr uint32_t RATING_MIN_RATINGS_FLOOR      = 10;
+inline constexpr uint32_t RATING_MIN_RATINGS_CEIL       = 1000000;
+inline constexpr uint32_t RATING_DOWN_RATIO_BPS_FLOOR   = 5001;   // 50.01%
+inline constexpr uint32_t RATING_DOWN_RATIO_BPS_CEIL    = 10000;  // 100.00%
+
+// ProposalTx::amount packing for SET_RATING_THRESHOLD. High 32 bits = ratio in
+// basis points, low 32 bits = the sample floor. Both halves are range-checked
+// on apply, so no other bit pattern is accepted and the encoding is canonical.
+inline constexpr uint64_t pack_rating_policy(uint32_t min_ratings,
+                                             uint32_t down_ratio_bps) {
+    return (static_cast<uint64_t>(down_ratio_bps) << 32) |
+            static_cast<uint64_t>(min_ratings);
+}
+inline constexpr void unpack_rating_policy(uint64_t amount,
+                                           uint32_t& min_ratings,
+                                           uint32_t& down_ratio_bps) {
+    min_ratings    = static_cast<uint32_t>(amount & 0xFFFFFFFFull);
+    down_ratio_bps = static_cast<uint32_t>(amount >> 32);
+}
+inline constexpr bool rating_policy_in_bounds(uint32_t min_ratings,
+                                              uint32_t down_ratio_bps) {
+    return min_ratings    >= RATING_MIN_RATINGS_FLOOR
+        && min_ratings    <= RATING_MIN_RATINGS_CEIL
+        && down_ratio_bps >= RATING_DOWN_RATIO_BPS_FLOOR
+        && down_ratio_bps <= RATING_DOWN_RATIO_BPS_CEIL;
+}
+
+// The single hide predicate. Integer-only (no floating point anywhere near a
+// consensus decision) and overflow-guarded: `down * 10000` and `total * bps`
+// are both refused rather than wrapped if the counts are absurd, which can only
+// happen on a corrupted DB and errs toward NOT hiding.
+inline constexpr bool rating_hide_triggers(uint64_t up, uint64_t down,
+                                           uint32_t min_ratings,
+                                           uint32_t down_ratio_bps) {
+    const uint64_t total = up + down;
+    if (total < up) return false;                       // wrapped -> never hide
+    if (total == 0 || total < static_cast<uint64_t>(min_ratings)) return false;
+    constexpr uint64_t kGuard = UINT64_MAX / 10000ull;
+    if (down > kGuard || total > kGuard) return false;  // absurd -> never hide
+    return down * 10000ull >= total * static_cast<uint64_t>(down_ratio_bps);
+}
 
 // ---- Slash transaction ----------------------------------------------
 //

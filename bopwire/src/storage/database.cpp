@@ -154,6 +154,14 @@ void Database::update_song_state(leveldb::WriteBatch& b, const PlayProof& proof,
         state.first_play_timestamp = proof.play_start_timestamp;
     }
     set_song_state(b, proof.content_hash, state);
+    // Play-participation marker (pp:) — the O(1) PlayProof gate RatingTx needs.
+    // Written HERE, in the one call every mint path (MINT and each accepted
+    // SETTLEMENT_MINT constituent) already makes, so the "did this wallet
+    // actually stream this song" fact can never drift from "did this wallet get
+    // credited a play". NOT part of the state_root (see state_prefixes.h): it
+    // is derived from plays that predate ratings, so rooting it would change
+    // every historical block's state_root.
+    mark_play_credit(b, proof.content_hash, proof.player_address);
 }
 
 // ---- Balance ledger -------------------------------------------------
@@ -1034,6 +1042,165 @@ std::string Database::hex(const Address& a) const {
     return crypto::to_hex(a.data(), 20);
 }
 
+// ---- Listener ratings + play index ----------------------------------
+//
+// Key shapes (all hex so they range-scan cleanly and never contain a raw ':'):
+//   pp:<64hex ch>:<40hex addr>      play credit  (NOT state-rooted)
+//   rv:<64hex ch>:<40hex addr>      wallet verdict
+//   ra:<40hex addr>:<64hex ch>      reverse index
+//   rc:<64hex ch>                   u64 up | u64 down
+//   rt:cur                          policy in force
+//   rh:<64hex ch>                   auto-hide record
+
+namespace {
+
+void put_u32le(std::vector<uint8_t>& v, uint32_t x) {
+    for (int i = 0; i < 4; ++i) v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xFF));
+}
+void put_u64le(std::vector<uint8_t>& v, uint64_t x) {
+    for (int i = 0; i < 8; ++i) v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xFF));
+}
+uint32_t take_u32le(const uint8_t* p) {
+    uint32_t x = 0;
+    for (int i = 0; i < 4; ++i) x |= static_cast<uint32_t>(p[i]) << (8 * i);
+    return x;
+}
+uint64_t take_u64le(const uint8_t* p) {
+    uint64_t x = 0;
+    for (int i = 0; i < 8; ++i) x |= static_cast<uint64_t>(p[i]) << (8 * i);
+    return x;
+}
+
+} // namespace
+
+bool Database::has_play_credit(const Hash256& ch, const Address& addr) const {
+    return get("pp:" + hex(ch) + ":" + hex(addr)).has_value();
+}
+
+void Database::mark_play_credit(leveldb::WriteBatch& b, const Hash256& ch,
+                                const Address& addr) {
+    put_batch(b, "pp:" + hex(ch) + ":" + hex(addr), {});
+}
+
+uint8_t Database::get_rating(const Hash256& ch, const Address& addr) const {
+    auto v = get("rv:" + hex(ch) + ":" + hex(addr));
+    if (!v || v->empty()) return 0;
+    return (*v)[0];
+}
+
+void Database::set_rating(leveldb::WriteBatch& b, const Hash256& ch,
+                          const Address& addr, uint8_t value) {
+    // Both directions are written together and always overwrite in place —
+    // that is what makes a re-rate REPLACE rather than stack.
+    put_batch(b, "rv:" + hex(ch) + ":" + hex(addr), {value});
+    put_batch(b, "ra:" + hex(addr) + ":" + hex(ch), {value});
+}
+
+Database::RatingCounts Database::get_rating_counts(const Hash256& ch) const {
+    RatingCounts c;
+    auto v = get("rc:" + hex(ch));
+    if (!v || v->size() < 16) return c;
+    c.up   = take_u64le(v->data());
+    c.down = take_u64le(v->data() + 8);
+    return c;
+}
+
+void Database::set_rating_counts(leveldb::WriteBatch& b, const Hash256& ch,
+                                 const RatingCounts& c) {
+    std::vector<uint8_t> v;
+    v.reserve(16);
+    put_u64le(v, c.up);
+    put_u64le(v, c.down);
+    put_batch(b, "rc:" + hex(ch), v);
+}
+
+std::vector<std::pair<Hash256, uint8_t>>
+Database::list_ratings_by_address(const Address& addr) const {
+    std::vector<std::pair<Hash256, uint8_t>> out;
+    const std::string prefix = "ra:" + hex(addr) + ":";
+    for_each_with_prefix(prefix, [&](const std::string& key,
+                                     const std::string& val) {
+        if (key.size() != prefix.size() + 64 || val.empty()) return true;
+        Hash256 ch{};
+        if (crypto::parse_hash256(key.substr(prefix.size()), ch))
+            out.emplace_back(ch, static_cast<uint8_t>(val[0]));
+        return true;
+    });
+    return out;
+}
+
+Database::RatingPolicy Database::get_rating_policy() const {
+    RatingPolicy p;   // pre-seeded with the RATING_DEFAULT_* fallbacks
+    auto v = get("rt:cur");
+    if (!v || v->size() < 4 + 4 + 4 + 20 + 32) return p;
+    const uint8_t* d = v->data();
+    p.min_ratings    = take_u32le(d + 0);
+    p.down_ratio_bps = take_u32le(d + 4);
+    p.set_height     = take_u32le(d + 8);
+    std::memcpy(p.set_by.data(),        d + 12, 20);
+    std::memcpy(p.proposal_hash.data(), d + 32, 32);
+    return p;
+}
+
+void Database::set_rating_policy(leveldb::WriteBatch& b, const RatingPolicy& p) {
+    std::vector<uint8_t> v;
+    v.reserve(64);
+    put_u32le(v, p.min_ratings);
+    put_u32le(v, p.down_ratio_bps);
+    put_u32le(v, p.set_height);
+    v.insert(v.end(), p.set_by.begin(),        p.set_by.end());
+    v.insert(v.end(), p.proposal_hash.begin(), p.proposal_hash.end());
+    put_batch(b, "rt:cur", v);
+}
+
+std::optional<Database::RatingHide>
+Database::get_rating_hide(const Hash256& ch) const {
+    auto v = get("rh:" + hex(ch));
+    if (!v || v->size() < 4 + 8 + 8 + 4 + 4 + 4 + 20 + 32) return std::nullopt;
+    const uint8_t* d = v->data();
+    RatingHide h;
+    h.height            = take_u32le(d + 0);
+    h.up                = take_u64le(d + 4);
+    h.down              = take_u64le(d + 12);
+    h.min_ratings       = take_u32le(d + 20);
+    h.down_ratio_bps    = take_u32le(d + 24);
+    h.policy_set_height = take_u32le(d + 28);
+    std::memcpy(h.policy_set_by.data(), d + 32, 20);
+    std::memcpy(h.trigger_tx.data(),    d + 52, 32);
+    return h;
+}
+
+bool Database::is_rating_hide_exempt(const Hash256& ch) const {
+    return get("rx:" + hex(ch)).has_value();
+}
+
+void Database::set_rating_hide_exempt(leveldb::WriteBatch& b, const Hash256& ch) {
+    // NOT put_batch: this key must never reach the state_root accumulator even
+    // if it is somehow written inside a block-apply scope. (It isn't today —
+    // only the moderation envelope path writes it — but the guarantee is worth
+    // making structural rather than relying on call-site discipline.)
+    b.Put("rx:" + hex(ch), leveldb::Slice());
+}
+
+void Database::clear_rating_hide_exempt(leveldb::WriteBatch& b, const Hash256& ch) {
+    b.Delete("rx:" + hex(ch));
+}
+
+void Database::set_rating_hide(leveldb::WriteBatch& b, const Hash256& ch,
+                               const RatingHide& h) {
+    std::vector<uint8_t> v;
+    v.reserve(84);
+    put_u32le(v, h.height);
+    put_u64le(v, h.up);
+    put_u64le(v, h.down);
+    put_u32le(v, h.min_ratings);
+    put_u32le(v, h.down_ratio_bps);
+    put_u32le(v, h.policy_set_height);
+    v.insert(v.end(), h.policy_set_by.begin(), h.policy_set_by.end());
+    v.insert(v.end(), h.trigger_tx.begin(),    h.trigger_tx.end());
+    put_batch(b, "rh:" + hex(ch), v);
+}
+
 void Database::clear_derived_state() {
     // Delete all keys with prefixes: a:, s:, f:, i:, u:, bh:
     // bh: (content-height marker) is derived state too — song_on_chain's exact
@@ -1066,6 +1233,14 @@ void Database::clear_derived_state() {
     // sb:/cp:/sr:vec/sr:height).
     std::vector<std::string> prefixes(std::begin(kStatePrefixes), std::end(kStatePrefixes));
     prefixes.push_back("fph:");
+    // "pp:" (play participation) is block-derived but deliberately OUTSIDE the
+    // committed state_root — it is reconstructed from plays that predate the
+    // ratings feature, so rooting it would change every historical block's root.
+    // It still MUST be cleared here: after a reorg that drops a play, a stale
+    // pp: row would let a wallet rate a song it no longer provably streamed,
+    // and rebuild_derived_state's replay repopulates it exactly (via
+    // update_song_state) for the branch that actually won.
+    prefixes.push_back("pp:");
     for (const auto& prefix : prefixes) {
         auto* it = db_->NewIterator(leveldb::ReadOptions());
         for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next())

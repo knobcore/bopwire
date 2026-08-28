@@ -156,6 +156,10 @@ inline bool verify_signature_only(const Envelope& e) {
 //   hide_album  / unhide_album   → hb:
 //   hide_title  / unhide_title   → ht:
 //   hide_hash   / unhide_hash    → d:   (value is 64-hex content hash)
+//                                   + rx: (unhide also marks the song exempt
+//                                          from rating-driven auto-hide, so a
+//                                          moderator's reversal survives a
+//                                          chain replay; hide clears it)
 //
 // Returns false on a malformed action / value (e.g. bad hash); the caller
 // should NOT persist such envelopes to the mod log.
@@ -169,8 +173,19 @@ inline bool apply(const Envelope& e, Database& db, leveldb::WriteBatch& b) {
     if (e.action == "hide_hash" || e.action == "unhide_hash") {
         Hash256 ch{};
         if (!mc::crypto::parse_hash256(e.value, ch)) return false;
-        if (e.action == "hide_hash") db.mark_song_deleted(b, ch);
-        else                          db.unmark_song_deleted(b, ch);
+        if (e.action == "hide_hash") {
+            db.mark_song_deleted(b, ch);
+            // A deliberate re-hide clears any earlier review exemption.
+            db.clear_rating_hide_exempt(b, ch);
+        } else {
+            db.unmark_song_deleted(b, ch);
+            // Human review is final: mark the song exempt so a rating-driven
+            // auto-hide never re-applies the display mask, INCLUDING after a
+            // rebuild / reorg replays the RatingTxs that originally tripped it.
+            // This touches no consensus state — see
+            // Database::set_rating_hide_exempt.
+            db.set_rating_hide_exempt(b, ch);
+        }
         return true;
     }
     return false;

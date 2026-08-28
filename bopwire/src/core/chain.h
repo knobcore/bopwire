@@ -269,6 +269,26 @@ public:
                         uint32_t height,
                         leveldb::WriteBatch& batch);
 
+    // Listener rating (thumbs up / down). Verifies the signature + inline
+    // pubkey bind, the per-address nonce, that the song is on chain, and —
+    // the Sybil defence — that `rater` has an on-chain CREDITED PLAY of
+    // exactly this content_hash (the pp: index Database::update_song_state
+    // maintains for every MINT and every accepted SETTLEMENT_MINT
+    // constituent). Then it replaces (never stacks) the wallet's verdict,
+    // updates the counts, and evaluates the auto-hide predicate against the
+    // threshold in force. `height` is recorded in the hide record.
+    bool apply_rating(const RatingTx& tx, uint32_t height,
+                      leveldb::WriteBatch& batch);
+
+    // One-time migration for a chain that predates ratings: the pp: play
+    // index is derived from every credited play in history, and an
+    // already-synced node has none of it. Walks the block store once,
+    // writing ONLY pp: rows (no consensus state is touched, so this can
+    // never truncate the chain the way a full rebuild can) and stamps a
+    // schema marker so it runs at most once. Idempotent; safe to re-run.
+    // Called from init(), after the sr:dirty recovery.
+    bool ensure_play_index();
+
     // First-come-first-served username registration. Anyone signs for
     // their own address; chain checks (a) name well-formedness, (b)
     // not already taken, (c) nonce, (d) signature.
@@ -362,6 +382,15 @@ private:
     // case is bootstrap, which emits GRANT (nonce 0) + UsernameTx
     // (nonce 1) for the same founder address back-to-back.
     std::map<Address, uint64_t> applied_nonce_in_block_;
+
+    // Block-scoped play-credit set. Mirrors sessions_used_in_block_: pp: rows
+    // are staged in the block's WriteBatch and invisible to reads until it
+    // commits, so a MINT and the listener's RatingTx landing in the SAME block
+    // would otherwise fail the PlayProof gate and take the whole block down
+    // with it. Every mint path inserts here; apply_rating consults it beside
+    // the committed pp: row. Deterministic (same block => same set on every
+    // node). Cleared per block.
+    std::set<std::pair<Hash256, Address>> plays_in_block_;
 
     // Block-scoped session-consumption set (C1). is_session_used reads only
     // COMMITTED "u:" markers, which are staged in the block's WriteBatch and not
