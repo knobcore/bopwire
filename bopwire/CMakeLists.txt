@@ -308,6 +308,7 @@ set(MC_SOURCES
   src/api/jsonrpc_server.cpp
   src/api/routes.cpp
   src/api/rats_api.cpp
+  src/api/explorer_index.cpp
   src/util/hw_fingerprint.cpp
   src/capi/capi.cpp
 )

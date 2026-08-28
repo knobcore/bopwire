@@ -1,5 +1,6 @@
 #include "rats_api.h"
 #include "server.h"
+#include "explorer_index.h"       // read-only explorer verbs (blocks/tx/address/stats)
 #include "device_attestation.h"   // DeviceAttestationVerifier (#5)
 #include "../audio/fingerprint.h"
 #include "../art/album_key.h"
@@ -522,6 +523,21 @@ json wrap_handler_result(const std::string& req_id,
         reply["error"]  = text;
     }
     return reply;
+}
+
+// ---- Explorer index (read-only) -------------------------------------
+//
+// Backing store for the explorer verbs (blocks.list/get, tx.get,
+// address.summary/history, search, stats.*, song.detail/plays). One process
+// hosts exactly one full node, so a lazily-constructed function-local static
+// bound to the first caller's (chain, db) is safe — and it means NO change to
+// rats_api.h / node_main.cpp (other agents own those). The index is built on
+// the FIRST explorer verb (one full chain walk) and extended incrementally
+// per query after that; mini-nodes never call these verbs, so they never pay
+// for the index.
+ExplorerIndex& explorer_index_for(Chain& chain, Database& db) {
+    static ExplorerIndex idx(chain, db);
+    return idx;
 }
 
 json status_body(Chain& chain, net::NetworkManager& network,
@@ -1115,6 +1131,69 @@ void RatsApi::handle_request(const std::string& peer_id,
                                  {"body", {{"stored", true},
                                            {"replaced", have}}}};
                     }
+                }
+            }
+        }
+        // ---- explorer (read-only chain/analytics verbs) -----------------
+        //
+        // All of these answer from the in-memory ExplorerIndex (see
+        // explorer_index.{h,cpp}) — no chain writes, no consensus surface.
+        // The first call after startup walks the chain once to build the
+        // index; every later call only indexes blocks above the last tip.
+        else if (type == "blocks.list") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).blocks_list(in));
+        } else if (type == "blocks.get") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).blocks_get(in));
+        } else if (type == "tx.get") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).tx_get(in));
+        } else if (type == "address.summary") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).address_summary(in));
+        } else if (type == "address.history") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).address_history(in));
+        } else if (type == "search") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).search(in));
+        } else if (type == "stats.overview") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).stats_overview(in));
+        } else if (type == "stats.artist") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).stats_artist(in));
+        } else if (type == "stats.top") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).stats_top(in));
+        } else if (type == "song.plays") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).song_plays(in));
+        } else if (type == "song.detail") {
+            reply = wrap_handler_result(req_id,
+                explorer_index_for(chain_, db_).song_detail(in));
+            // Augment with CURRENT holders — a live-network fact (DB2 library
+            // + presence), which the chain-scoped index can't know.
+            if (reply.value("status", std::string()) == "ok" &&
+                reply.contains("body") && reply["body"].is_object()) {
+                Hash256 ch{};
+                std::array<uint8_t, 32> tmp{};
+                const std::string ch_hex = in.value("content_hash", "");
+                if (from_hex_fixed(ch_hex, tmp.data(), 32)) {
+                    std::copy(tmp.begin(), tmp.end(), ch.begin());
+                    const auto holders = library_.holders(ch);
+                    const auto live    = live_wallets_();
+                    json hs = json::array();
+                    size_t online = 0;
+                    for (const auto& w : holders) {
+                        const std::string wh = crypto::to_hex(w.data(), w.size());
+                        const bool is_on = live.count(wh) > 0;
+                        if (is_on) ++online;
+                        hs.push_back({{"address", "0x" + wh}, {"online", is_on}});
+                    }
+                    reply["body"]["holders"]        = std::move(hs);
+                    reply["body"]["holders_online"] = online;
                 }
             }
         } else if (type == "songs.get") {

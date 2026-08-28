@@ -620,9 +620,250 @@ int main() {
         catch (const std::exception& e) { err(res, 503, e.what()); }
     });
 
-    svr.Get("/api/search", [&](const httplib::Request& req, httplib::Response& res) {
+    // ───────────────────── explorer proxy layer ─────────────────────
+    //
+    // Read-only chain-explorer routes. Each one relays a single explorer verb
+    // to a full node and caches the JSON reply in-process (same idea as the
+    // /api/art cache): chain data below the tip is immutable so block/tx
+    // lookups get long TTLs, while stats/summaries stay short-TTL. Errors are
+    // negative-cached for a few seconds so a down node can't be hammered.
+    struct ExpEnt {
+        int code = 0;
+        std::string body;
+        std::chrono::steady_clock::time_point at{};
+        int ttl_s = 0;
+    };
+    auto exp_mu    = std::make_shared<std::mutex>();
+    auto exp_cache = std::make_shared<std::unordered_map<std::string, ExpEnt>>();
+
+    auto explorer_rpc = [&link](const std::string& verb, const json& body) -> json {
+        const std::string node = link.pick_full_node();
+        if (node.empty()) throw std::runtime_error("no_node");
+        return link.rpc_via_relay(node, verb, body, 20000);
+    };
+
+    auto explorer_call = [explorer_rpc, exp_mu, exp_cache](
+                             httplib::Response& res, const std::string& verb,
+                             const json& body, int ttl_s,
+                             const char* browser_cc) {
+        const std::string key = verb + std::string(1, '\x1f') + body.dump();
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(*exp_mu);
+            auto it = exp_cache->find(key);
+            if (it != exp_cache->end() &&
+                now - it->second.at < std::chrono::seconds(it->second.ttl_s)) {
+                res.status = it->second.code;
+                if (browser_cc && it->second.code == 200)
+                    res.set_header("Cache-Control", browser_cc);
+                res.set_content(it->second.body, "application/json");
+                return;
+            }
+        }
+        int code = 502;
+        std::string out;
+        try {
+            json r = explorer_rpc(verb, body);
+            const std::string st = r.value("status", std::string());
+            if (st == "ok") {
+                code = 200;
+                out  = r.value("body", json::object()).dump();
+            } else if (st.rfind("http_", 0) == 0) {
+                try { code = std::stoi(st.substr(5)); } catch (...) { code = 502; }
+                out = json{{"error", r.value("error", st)}}.dump();
+            } else {
+                out = json{{"error", st.empty() ? "bad_reply" : st}}.dump();
+            }
+        } catch (const std::exception& e) {
+            code = 503;
+            out  = json{{"error", e.what()}}.dump();
+        }
+        {
+            std::lock_guard<std::mutex> lk(*exp_mu);
+            if (exp_cache->size() > 8192) exp_cache->clear();
+            (*exp_cache)[key] = ExpEnt{code, out, now,
+                                       code == 200 ? ttl_s : std::min(ttl_s, 5)};
+        }
+        res.status = code;
+        if (browser_cc && code == 200) res.set_header("Cache-Control", browser_cc);
+        res.set_content(out, "application/json");
+    };
+
+    auto qnum = [](const httplib::Request& req, const char* name,
+                   json& body, const char* as = nullptr) {
+        if (!req.has_param(name)) return;
+        try {
+            body[as ? as : name] =
+                static_cast<uint64_t>(std::stoull(req.get_param_value(name)));
+        } catch (...) {}
+    };
+
+    // /api/blocks — newest-first summaries. ?offset/?limit page; ?from/?to
+    // select a height range; ?since=YYYY-MM-DD filters by block timestamp.
+    svr.Get("/api/blocks", [&, explorer_call, qnum](const httplib::Request& req,
+                                                    httplib::Response& res) {
         json body = json::object();
-        if (req.has_param("q"))      body["q"]      = req.get_param_value("q");
+        qnum(req, "offset", body); qnum(req, "limit", body);
+        qnum(req, "from", body);   qnum(req, "to", body);
+        if (req.has_param("since")) body["since"] = req.get_param_value("since");
+        explorer_call(res, "blocks.list", body, 5, "public, max-age=5");
+    });
+
+    // /api/blocks/<height|hash> — the FULL block, every tx fully expanded.
+    svr.Get(R"(/api/blocks/((?:0x)?[0-9a-fA-F]{64}|\d+))",
+            [&, explorer_call](const httplib::Request& req, httplib::Response& res) {
+        const std::string id = req.matches[1];
+        const bool by_hash = id.size() >= 64;
+        json body = by_hash ? json{{"hash", id}} : json{{"id", id}};
+        // A block addressed by HASH is immutable — cache hard. By height the
+        // mapping can move in a (finality-bounded) reorg — cache briefly.
+        explorer_call(res, "blocks.get", body,
+                      by_hash ? 86400 : 30,
+                      by_hash ? "public, max-age=31536000, immutable"
+                              : "public, max-age=30");
+    });
+
+    // /api/tx/<hash> — one tx, fully expanded, + its block coordinates.
+    svr.Get(R"(/api/tx/((?:0x)?[0-9a-fA-F]{64}))",
+            [&, explorer_call](const httplib::Request& req, httplib::Response& res) {
+        explorer_call(res, "tx.get", json{{"hash", std::string(req.matches[1])}},
+                      86400, "public, max-age=31536000, immutable");
+    });
+
+    // /api/address/<addr>/history — paged txs touching the address, each
+    // tagged with the role(s) the address played. ?role= narrows to one role
+    // (listener|artist|seeder|relay|sender|recipient|node).
+    svr.Get(R"(/api/address/((?:0x)?[0-9a-fA-F]{40})/history)",
+            [&, explorer_call, qnum](const httplib::Request& req, httplib::Response& res) {
+        json body{{"address", std::string(req.matches[1])}};
+        qnum(req, "offset", body); qnum(req, "limit", body);
+        if (req.has_param("role")) body["role"] = req.get_param_value("role");
+        explorer_call(res, "address.history", body, 10, "public, max-age=10");
+    });
+
+    // /api/address/<addr> — balances + lifetime activity summary.
+    svr.Get(R"(/api/address/((?:0x)?[0-9a-fA-F]{40}))",
+            [&, explorer_call](const httplib::Request& req, httplib::Response& res) {
+        explorer_call(res, "address.summary",
+                      json{{"address", std::string(req.matches[1])}},
+                      10, "public, max-age=10");
+    });
+
+    // /api/stats — network-wide explorer metrics. ?days=N sizes the activity
+    // series (default 30); ?since=YYYY-MM-DD pins its start instead.
+    svr.Get("/api/stats", [&, explorer_call, qnum](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        json body = json::object();
+        qnum(req, "days", body);
+        if (req.has_param("since")) body["since"] = req.get_param_value("since");
+        explorer_call(res, "stats.overview", body, 15, "public, max-age=15");
+    });
+
+    // /api/stats/artist/<address-or-name> — label-grade per-artist metrics
+    // (plays, listeners, earnings, per-song, over-time, seeders/relays, and
+    // the block heights the artist appears in).
+    svr.Get(R"(/api/stats/artist/(.+))",
+            [&, explorer_call](const httplib::Request& req, httplib::Response& res) {
+        const std::string id = req.matches[1];
+        const bool is_addr =
+            (id.size() == 40 || (id.size() == 42 && id[0] == '0' &&
+                                 (id[1] == 'x' || id[1] == 'X')));
+        json body = is_addr ? json{{"artist_address", id}} : json{{"artist", id}};
+        explorer_call(res, "stats.artist", body, 30, "public, max-age=30");
+    });
+
+    // /api/top?kind=songs|artists|listeners&n=&since= — play-ranked top-N.
+    svr.Get("/api/top", [&, explorer_call, qnum](const httplib::Request& req,
+                                                 httplib::Response& res) {
+        json body = json::object();
+        body["kind"] = req.has_param("kind") ? req.get_param_value("kind")
+                                             : std::string("songs");
+        qnum(req, "n", body);
+        if (req.has_param("since")) body["since"] = req.get_param_value("since");
+        explorer_call(res, "stats.top", body, 30, "public, max-age=30");
+    });
+
+    // /api/song/<hash>/fingerprint — the raw on-chain base64 chromaprint as a
+    // DOWNLOAD, so anyone can independently verify it against the audio /
+    // content hash. Cached for the life of the process (chain data, immutable).
+    svr.Get(R"(/api/song/([0-9a-fA-F]{64})/fingerprint)",
+            [&, explorer_rpc, exp_mu, exp_cache](const httplib::Request& req,
+                                                 httplib::Response& res) {
+        const std::string h   = req.matches[1];
+        const std::string key = "fp" + std::string(1, '\x1f') + h;
+        std::string fp;
+        {
+            std::lock_guard<std::mutex> lk(*exp_mu);
+            auto it = exp_cache->find(key);
+            if (it != exp_cache->end() && it->second.code == 200)
+                fp = it->second.body;
+        }
+        if (fp.empty()) {
+            try {
+                json r = explorer_rpc("song.detail", json{{"content_hash", h}});
+                if (r.value("status", std::string()) != "ok") {
+                    err(res, 404, "unknown song"); return;
+                }
+                const json song = r.value("body", json::object())
+                                      .value("song", json::object());
+                fp = song.is_object()
+                         ? song.value("compressed_fingerprint", std::string())
+                         : std::string();
+                if (fp.empty()) { err(res, 404, "no fingerprint on chain"); return; }
+                std::lock_guard<std::mutex> lk(*exp_mu);
+                if (exp_cache->size() > 8192) exp_cache->clear();
+                (*exp_cache)[key] = ExpEnt{200, fp,
+                                           std::chrono::steady_clock::now(),
+                                           7 * 86400};
+            } catch (const std::exception& e) { err(res, 503, e.what()); return; }
+        }
+        res.set_header("Content-Disposition",
+                       "attachment; filename=\"" + h + ".chromaprint.b64.txt\"");
+        res.set_header("Cache-Control", "public, max-age=31536000, immutable");
+        res.set_content(fp, "text/plain");
+    });
+
+    // /api/song/<hash>/plays — paged individual play events for one song.
+    svr.Get(R"(/api/song/([0-9a-fA-F]{64})/plays)",
+            [&, explorer_call, qnum](const httplib::Request& req, httplib::Response& res) {
+        json body{{"content_hash", std::string(req.matches[1])}};
+        qnum(req, "offset", body); qnum(req, "limit", body);
+        explorer_call(res, "song.plays", body, 15, "public, max-age=15");
+    });
+
+    // /api/song/<hash> — full on-chain SongSection (incl. fingerprint),
+    // registration coordinates, play metrics, and current holders.
+    svr.Get(R"(/api/song/([0-9a-fA-F]{64}))",
+            [&, explorer_call](const httplib::Request& req, httplib::Response& res) {
+        explorer_call(res, "song.detail",
+                      json{{"content_hash", std::string(req.matches[1])}},
+                      30, "public, max-age=30");
+    });
+
+    // /api/search — with ?q= this is the EXPLORER search: the node resolves
+    // the free text to typed hits (block/tx/address/song/artist/genre) and we
+    // return the bare hit array. Without ?q= the legacy songs.search shape is
+    // preserved for ?artist=/?genre= callers.
+    svr.Get("/api/search", [&](const httplib::Request& req, httplib::Response& res) {
+        if (req.has_param("q")) {
+            json body{{"q", req.get_param_value("q")}};
+            if (req.has_param("limit")) {
+                try { body["limit"] = std::stoul(req.get_param_value("limit")); }
+                catch (...) {}
+            }
+            try {
+                json r = explorer_rpc("search", body);
+                if (r.value("status", std::string()) != "ok") {
+                    err(res, 502, r.value("error", std::string("search failed")));
+                    return;
+                }
+                res.set_content(r.value("body", json::object())
+                                    .value("results", json::array()).dump(),
+                                "application/json");
+            } catch (const std::exception& e) { err(res, 503, e.what()); }
+            return;
+        }
+        json body = json::object();
         if (req.has_param("artist")) body["artist"] = req.get_param_value("artist");
         if (req.has_param("genre"))  body["genre"]  = req.get_param_value("genre");
         try {

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Bopwire — Explorer</title>
+  <meta name="description" content="Bopwire blockchain explorer — blocks, transactions, wallets, songs and network metrics." />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="apple-touch-icon" href="logo.png" />
+  <link rel="preconnect" href="https://api.bopwire.com" crossorigin />
+  <link rel="stylesheet" href="explorer.css" />
+</head>
+<body data-palette="#10a274,#3086d6">
+  <!-- ───────────────────────── Header ───────────────────────── -->
+  <header class="topbar">
+    <a class="brand" href="index.html" title="Back to the player">
+      <img class="brand-mark" src="logo.png" alt="Bopwire" width="30" height="30" />
+      <span class="brand-name">bopwire</span>
+      <span class="brand-sub">explorer</span>
+    </a>
+
+    <nav class="viewnav" id="viewnav" role="tablist" aria-label="Explorer section">
+      <a class="vn-btn" data-tab="blocks"    href="#/blocks">Blocks</a>
+      <a class="vn-btn" data-tab="txs"       href="#/txs">Transactions</a>
+      <a class="vn-btn" data-tab="addresses" href="#/addresses">Addresses</a>
+      <a class="vn-btn" data-tab="songs"     href="#/songs">Songs</a>
+      <a class="vn-btn" data-tab="stats"     href="#/stats">Stats</a>
+    </nav>
+
+    <form class="search" id="search-form" autocomplete="off">
+      <svg class="search-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4a6 6 0 1 0 3.7 10.7l4.8 4.8 1.4-1.4-4.8-4.8A6 6 0 0 0 10 4zm0 2a4 4 0 1 1 0 8 4 4 0 0 1 0-8z"/></svg>
+      <input id="search" type="search"
+             placeholder="Height, block/tx hash, 0x address, song or artist…"
+             spellcheck="false" aria-label="Search the chain" />
+    </form>
+
+    <a class="player-link" href="index.html" title="Back to the player">Player</a>
+  </header>
+
+  <!-- ─────────────────────────── Body ───────────────────────── -->
+  <main class="ex-main" id="ex-main" aria-live="polite">
+    <div class="ex-loading">Loading…</div>
+  </main>
+
+  <footer class="ex-foot">
+    <span>Every number on this page is read from the public Bopwire chain via
+      <code id="foot-gateway"></code>. Nothing here requires trusting this site —
+      see any song page for how to verify a registration yourself.</span>
+  </footer>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="config.js"></script>
+  <script src="explorer-mock.js"></script>
+  <script src="explorer.js"></script>
+</body>
+</html>
