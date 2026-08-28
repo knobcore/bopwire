@@ -19,8 +19,11 @@ fi
 
 echo "[publish] copying frontend -> $DEST/player/"
 mkdir -p "$DEST/player/decoders"
-cp "$SRC/index.html" "$SRC/dmca.html" "$SRC/styles.css" "$SRC/app.js" "$SRC/config.js" "$SRC/wasm-player.js" \
-   "$SRC/logo.png" "$SRC/favicon.png" "$DEST/player/"
+# Copy by PATTERN, not a hardcoded list. The list silently dropped
+# explorer.html/.js/.css when they were added — the publish reported
+# success while the new pages 404'd on the live site. Anything the site
+# is built from should ship without editing this script.
+cp "$SRC"/*.html "$SRC"/*.css "$SRC"/*.js "$SRC"/*.png "$SRC"/*.ico "$DEST/player/" 2>/dev/null
 cp "$SRC"/decoders/*.js "$DEST/player/decoders/"
 
 cd "$DEST"
