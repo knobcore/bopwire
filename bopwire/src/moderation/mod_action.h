@@ -31,20 +31,44 @@
 namespace mc::moderation {
 
 struct Envelope {
+    // v1 = original. v2 adds `reason`, SIGNED (see canon()).
+    //
+    // Why v2 exists: a DMCA-driven hide was byte-identical on chain to a
+    // moderator hiding something by hand, so the explorer could not tell
+    // a takedown from a judgement call. Takedown notices themselves are
+    // ECIES-encrypted to the shared moderation key and must stay that way
+    // — only the REASON CODE goes on chain, never the notice or the
+    // complainant. v1 envelopes keep verifying byte-identically.
     int         v       = 1;
     std::string action;       // "hide_artist" | "unhide_artist" | ...
     std::string value;
     std::string mod_pub_hex;  // 66 hex (compressed pubkey)
     uint64_t    ts_ms   = 0;
     std::string sig_hex;      // 128 hex
+    std::string reason;       // v2 only: "dmca" | "manual" | "policy" | ""
 };
 
+// Reason codes carried by a v2 envelope. Deliberately a short closed set,
+// not free text: this is public chain data, and free text would leak
+// complainant details or case specifics that belong only in the encrypted
+// takedown record.
+inline bool reason_is_valid(const std::string& r) {
+    return r.empty() || r == "dmca" || r == "manual" || r == "policy";
+}
+
+// Signing preimage. v1 is UNCHANGED byte-for-byte; v2 appends the reason
+// as one more 0x1f-separated field, so a v1 signature can never be
+// replayed as a v2 (and vice versa) — the preimages differ in length and
+// content.
 inline std::string canon(const std::string& action,
                          const std::string& value,
                          uint64_t           ts_ms,
-                         const std::string& mod_pub_hex) {
+                         const std::string& mod_pub_hex,
+                         int                v      = 1,
+                         const std::string& reason = std::string()) {
     std::string s;
-    s.reserve(action.size() + value.size() + mod_pub_hex.size() + 40);
+    s.reserve(action.size() + value.size() + mod_pub_hex.size()
+              + reason.size() + 48);
     s += action;
     s.push_back('\x1f');
     s += value;
@@ -52,6 +76,10 @@ inline std::string canon(const std::string& action,
     s += std::to_string(ts_ms);
     s.push_back('\x1f');
     s += mod_pub_hex;
+    if (v >= 2) {
+        s.push_back('\x1f');
+        s += reason;
+    }
     return s;
 }
 
@@ -79,7 +107,7 @@ inline Envelope sign(const std::string& action,
 }
 
 inline nlohmann::json to_json(const Envelope& e) {
-    return {
+    nlohmann::json j = {
         {"v",       e.v},
         {"action",  e.action},
         {"value",   e.value},
@@ -87,6 +115,11 @@ inline nlohmann::json to_json(const Envelope& e) {
         {"ts_ms",   e.ts_ms},
         {"sig",     e.sig_hex},
     };
+    // Emit `reason` ONLY for v2. A v1 envelope must serialize exactly as
+    // it always did, or its gossip digest changes and peers treat a
+    // re-sent envelope as a new one.
+    if (e.v >= 2) j["reason"] = e.reason;
+    return j;
 }
 
 inline bool from_json(const nlohmann::json& j, Envelope& out) {
@@ -97,7 +130,12 @@ inline bool from_json(const nlohmann::json& j, Envelope& out) {
     out.mod_pub_hex = j.value("mod_pub", std::string());
     out.ts_ms       = j.value("ts_ms",   0ULL);
     out.sig_hex     = j.value("sig",     std::string());
-    return out.v == 1
+    out.reason      = j.value("reason",  std::string());
+    // v1 must NOT carry a reason: accepting one would let an unsigned
+    // field ride along on a v1 signature that never covered it.
+    if (out.v == 1 && !out.reason.empty()) return false;
+    if (out.v == 2 && !reason_is_valid(out.reason)) return false;
+    return (out.v == 1 || out.v == 2)
         && !out.action.empty()
         && out.mod_pub_hex.size() == 66
         && out.sig_hex.size()     == 128
@@ -107,14 +145,16 @@ inline bool from_json(const nlohmann::json& j, Envelope& out) {
 // Verify the signature AND that the signing pubkey's address is currently
 // in the node's moderator set. Returns false on any failure.
 inline bool verify(const Envelope& e, const Database& db) {
-    if (e.v != 1) return false;
+    if (e.v != 1 && e.v != 2) return false;
+    if (e.v == 2 && !reason_is_valid(e.reason)) return false;
     auto pub_bytes = mc::crypto::from_hex(e.mod_pub_hex);
     if (pub_bytes.size() != 33) return false;
     PubKey33 pub{};
     std::copy(pub_bytes.begin(), pub_bytes.end(), pub.begin());
     const Address addr = mc::crypto::address_from_pubkey(pub);
     if (!db.is_moderator(addr)) return false;
-    const std::string c = canon(e.action, e.value, e.ts_ms, e.mod_pub_hex);
+    const std::string c = canon(e.action, e.value, e.ts_ms, e.mod_pub_hex,
+                                e.v, e.reason);
     const Hash256 h = mc::crypto::sha256(
         reinterpret_cast<const uint8_t*>(c.data()), c.size());
     auto sig_bytes = mc::crypto::from_hex(e.sig_hex);
