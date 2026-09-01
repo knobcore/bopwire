@@ -741,6 +741,17 @@ int main() {
         explorer_call(res, "address.history", body, 10, "public, max-age=10");
     });
 
+    // /api/address/<addr>/ratings — every song this wallet has thumbed up or
+    // down, newest first. Public: a RatingTx is signed chain data, so who
+    // rated what is already visible to every node — the explorer only reads
+    // it back. ?offset/?limit page.
+    svr.Get(R"(/api/address/((?:0x)?[0-9a-fA-F]{40})/ratings)",
+            [&, explorer_call, qnum](const httplib::Request& req, httplib::Response& res) {
+        json body{{"address", std::string(req.matches[1])}};
+        qnum(req, "offset", body); qnum(req, "limit", body);
+        explorer_call(res, "ratings.by_address", body, 15, "public, max-age=15");
+    });
+
     // /api/address/<addr> — balances + lifetime activity summary.
     svr.Get(R"(/api/address/((?:0x)?[0-9a-fA-F]{40}))",
             [&, explorer_call](const httplib::Request& req, httplib::Response& res) {
@@ -857,6 +868,33 @@ int main() {
                        "attachment; filename=\"" + h + ".chromaprint.b64.txt\"");
         res.set_header("Cache-Control", "public, max-age=31536000, immutable");
         res.set_content(fp, "text/plain");
+    });
+
+    // ---- Ratings (on-chain thumbs up/down) ---------------------------
+    //
+    // Rating counts are consensus state, and the auto-hide threshold they
+    // are measured against is settable on chain by moderator proposal. Both
+    // are exposed read-only so the explorer can show a track's score AND
+    // explain any rating-driven hide without hardcoding a constant.
+
+    // /api/song/<hash>/ratings?address= — counts + score for one track, the
+    // recorded auto-hide event (if ratings hid it) and the threshold in
+    // force. ?address= additionally reports that wallet's own verdict and
+    // whether it is even eligible to rate.
+    svr.Get(R"(/api/song/([0-9a-fA-F]{64})/ratings)",
+            [&, explorer_call](const httplib::Request& req, httplib::Response& res) {
+        json body{{"content_hash", std::string(req.matches[1])}};
+        if (req.has_param("address")) body["address"] = req.get_param_value("address");
+        explorer_call(res, "ratings.get", body, 15, "public, max-age=15");
+    });
+
+    // /api/ratings/threshold — the auto-hide rule in force: values, whether
+    // they came from a chain proposal or the compiled-in default, who set
+    // them and where, the settable bounds, and the rule in plain English.
+    svr.Get("/api/ratings/threshold", [&, explorer_call](const httplib::Request&,
+                                                         httplib::Response& res) {
+        explorer_call(res, "ratings.threshold", json::object(), 60,
+                      "public, max-age=60");
     });
 
     // /api/song/<hash>/plays — paged individual play events for one song.

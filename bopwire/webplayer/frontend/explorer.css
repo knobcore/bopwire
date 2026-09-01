@@ -310,3 +310,85 @@ details.raw pre {
   .page-title { font-size: 18px; }
   .brand-sub { display: none; }
 }
+
+/* ═════════════ Moderation & ratings ═════════════
+ * Takedown transparency: WHO hid a thing, HOW, and — honestly — that the
+ * reason is not on chain when it isn't. Plus on-chain thumbs up/down.       */
+
+/* extra tx-type chips */
+.chip.t-rating     { color: #f0abfc;         border-color: rgba(240,171,252,.35); }
+.chip.t-proposal   { color: var(--accent-2); border-color: rgba(56,189,248,.35); }
+
+/* moderation action kinds */
+.chip.k-hide       { color: var(--danger);  border-color: rgba(248,113,113,.35); }
+.chip.k-unhide     { color: var(--good);    border-color: rgba(52,211,153,.35); }
+.chip.k-grant      { color: var(--warn);    border-color: rgba(251,191,36,.35); }
+.chip.k-revoke     { color: var(--danger);  border-color: rgba(248,113,113,.35); }
+.chip.k-proposal   { color: var(--accent-2);border-color: rgba(56,189,248,.35); }
+.chip.k-vote       { color: var(--accent);  border-color: rgba(110,231,183,.35); }
+.chip.k-forgery    { color: var(--warn);    border-color: rgba(251,191,36,.35); }
+
+/* who signed it */
+.chip.s-founder    { color: #fcd34d; border-color: rgba(252,211,77,.45);
+                     background: rgba(252,211,77,.08); }
+.chip.s-moderator  { color: var(--accent-2); border-color: rgba(56,189,248,.4); }
+.chip.s-former     { color: var(--text-dim); }
+.chip.s-rule       { color: #f0abfc; border-color: rgba(240,171,252,.4); }
+.chip.s-vote       { color: var(--accent); border-color: rgba(110,231,183,.4); }
+.chip.src          { font-weight: 700; letter-spacing: .04em; }
+
+/* the takedown banner — the loudest thing on a hidden song/artist page */
+.takedown {
+  border: 1px solid rgba(248,113,113,.45); border-left-width: 4px;
+  border-radius: 12px; background: rgba(248,113,113,.06);
+  padding: 14px 16px; margin-bottom: 16px;
+}
+.takedown.by-rating { border-color: rgba(240,171,252,.45);
+                      background: rgba(240,171,252,.06); }
+.takedown.ok        { border-color: rgba(52,211,153,.4);
+                      background: rgba(52,211,153,.05); }
+.takedown-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 8px; }
+.takedown-title { font-size: 15px; font-weight: 800; letter-spacing: .01em; }
+.takedown.ok .takedown-title { color: var(--good); }
+.takedown .kv { margin-top: 8px; }
+.takedown .kv > div { border-color: rgba(255,255,255,.06); }
+/* "reason not recorded on chain" — never left blank, never guessed */
+.reason-unrec {
+  display: block; margin-top: 10px; padding: 9px 11px;
+  border: 1px dashed var(--line); border-radius: 8px;
+  color: var(--text-dim); font-size: 12.5px;
+}
+.reason-unrec b { color: var(--text); }
+
+/* moderation action cards (same idiom as .txcard) */
+.modcard { border: 1px solid var(--line); border-radius: 12px; background: var(--bg-elev);
+  margin-bottom: 12px; overflow: hidden; }
+.modcard.is-hide   { border-left: 3px solid rgba(248,113,113,.6); }
+.modcard.is-unhide { border-left: 3px solid rgba(52,211,153,.6); }
+.modcard.is-rule   { border-left: 3px solid rgba(240,171,252,.6); }
+.modcard-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  border-bottom: 1px solid var(--line); flex-wrap: wrap; background: var(--bg-elev2); }
+.modcard-head .spacer { flex: 1 1 auto; }
+.modcard-body { padding: 8px 14px 10px; }
+.modcard-what { padding: 2px 0 6px; overflow-wrap: anywhere; }
+
+/* ratings */
+.rate-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.rate-fig { display: flex; align-items: baseline; gap: 6px; }
+.rate-fig .rf-n { font-size: 19px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.rate-fig .rf-l { font-size: 11.5px; font-weight: 700; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--text-dim); }
+.rate-fig.up   .rf-n { color: var(--good); }
+.rate-fig.down .rf-n { color: var(--danger); }
+.rate-ico { width: 14px; height: 14px; fill: currentColor; vertical-align: -2px; }
+.ratebar { width: 100%; margin: 10px 0 2px; }
+.ratebar svg { display: block; width: 100%; height: auto; }
+.rate-mine { font-size: 12px; color: var(--text-dim); }
+
+@media (max-width: 640px) {
+  .modcard-head { gap: 6px; padding: 9px 11px; }
+  .modcard-body { padding: 6px 11px 9px; }
+  .takedown { padding: 12px 12px; }
+  .rate-row { gap: 10px; }
+}
