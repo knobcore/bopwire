@@ -326,7 +326,8 @@ public:
     // companion body (sb:), then walks constituents in canonical order and
     // credits exactly what committed state justifies (per-leaf skip on
     // used/underfunded/over-cap). Declares no amounts, so nothing can inflate.
-    bool apply_settlement_mint(const SettlementMintTx& tx, leveldb::WriteBatch& batch);
+    bool apply_settlement_mint(const SettlementMintTx& tx, uint32_t height,
+                               leveldb::WriteBatch& batch);
 
     // Has this address been slashed? Used by the consensus path that
     // tallies confirmations — slashed addresses' votes return zero

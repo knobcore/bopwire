@@ -372,7 +372,10 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
             // arbitrary tokens to itself and every node would apply it.
             {
                 std::string mint_err;
-                if (!validate_mint(mint, db_, mint_err)) {
+                // `height` selects the co-signature rule (COSIGN_ACTIVATION_
+                // HEIGHT in mint.h): below activation this is the historical
+                // rule verbatim, so replaying old blocks is unchanged.
+                if (!validate_mint(mint, db_, height, mint_err)) {
                     std::cerr << "[chain] apply: MINT validation failed: " << mint_err << "\n";
                     return false;
                 }
@@ -462,7 +465,7 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
             if (!SettlementMintTx::deserialize(raw_tx.data(), raw_tx.size(), sm)) {
                 std::cerr << "[chain] apply: SETTLEMENT_MINT deserialize failed\n"; return false;
             }
-            if (!apply_settlement_mint(sm, batch)) {
+            if (!apply_settlement_mint(sm, height, batch)) {
                 std::cerr << "[chain] apply: SETTLEMENT_MINT apply failed\n"; return false;
             }
         } else {
@@ -1014,6 +1017,7 @@ bool Chain::apply_checkpoint(const CheckpointTx& tx, leveldb::WriteBatch& batch)
 // committed state justifies. Every honest node computes the identical credited
 // map from replicated inputs, so no vote is needed and nothing can be inflated.
 bool Chain::apply_settlement_mint(const SettlementMintTx& tx,
+                                  uint32_t height,
                                   leveldb::WriteBatch& batch) {
     // 1) Serving node must be a registered validator; recover its pubkey.
     auto ventry = db_.get("v:" + db_.hex(tx.serving_node_id));
@@ -1092,7 +1096,7 @@ bool Chain::apply_settlement_mint(const SettlementMintTx& tx,
     uint64_t running_supply = base_supply;
     for (const auto& pr : proofs) {
         std::string cperr;
-        if (!check_play(pr, db_, cperr)) continue;                 // invalid proof -> skip
+        if (!check_play(pr, db_, height, cperr)) continue;          // invalid proof -> skip
         const std::string sid = db_.hex(pr.session_id);
         // C1: skip a session already consumed within this body OR by any earlier
         // tx in the SAME block (a MINT or another settlement) — is_session_used

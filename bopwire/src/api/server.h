@@ -34,6 +34,19 @@ struct PlaySession {
     // session.start. Zero when the player didn't report them (legacy / direct).
     Address  seeder_address{};
     Address  mini_node_address{};
+    // Stage 2: the delivery_id the player received from stream.open, threaded
+    // through session.start. It is the node's OWN 128-bit handle on the
+    // stream, so it lets post_session_complete resolve the seeder + mini-node
+    // lanes from the node's delivery-triangulation records (dr:/pd:) rather
+    // than from the client-supplied addresses above — a client that names its
+    // own wallet as the seeder would otherwise be stealing that lane.
+    std::string delivery_id;
+    // Stage 2: the LISTENER's 33-byte compressed pubkey, supplied by the client
+    // and accepted only when address_from_pubkey(it) == player_address (so it
+    // is self-verifying, not a trust decision). Required before the node can
+    // build a co-signable proof at all, because the v3 preimage covers all
+    // three co-signer pubkeys — nobody can sign until every identity is fixed.
+    PubKey33 player_pubkey{};
     uint64_t start_timestamp;
     uint64_t last_heartbeat;
     uint32_t heartbeat_count;
@@ -44,6 +57,25 @@ struct PlaySession {
     // is rejected. Cleared on any error/reject exit so a legit retry can proceed;
     // subsumed by `completed` on success.
     bool     completing = false;
+
+    // ---- Stage 2: awaiting three-party co-signature ---------------------
+    // session.complete cleared every gate, the node assembled the v3 proof and
+    // node-signed it, and is now holding it until the LISTENER (and, when the
+    // proof claims a paid relay lane, the MINI-NODE) return a signature over
+    // the SAME PlayProof::sign_message() preimage. Only session.cosign can
+    // move a session out of this state; if the client never comes back the
+    // reaper drops the whole session after TIMEOUT_MS and nothing is minted.
+    //
+    // Why the proof can only be signed HERE and not at session.start: three of
+    // the signed fields (play_end_timestamp, total_duration_ms,
+    // heartbeat_count) are node-authoritative and unknown until completion, so
+    // the preimage does not exist until this point.
+    bool        awaiting_cosign      = false;
+    PlayProof   pending_proof{};
+    Hash256     pending_sign_hash{};       // sha256(pending_proof.sign_message())
+    SongSection pending_song{};            // the song section the gates used
+    uint64_t    pending_effective_ms = 0;  // covered listen time, for ddur:
+    uint64_t    pending_deadline_ms  = 0;  // wall-clock cosign deadline
 
     // ---- Anti-farm device binding (#5, node-local, consensus-invisible) ----
     // device_id is SERVER-derived at session.start from the client's hardware
@@ -126,6 +158,12 @@ public:
     std::pair<int, std::string> verb_session_complete(const std::string& sid,
                                                       const std::string& body)
         { return post_session_complete(sid, body); }
+    // Stage 2 second leg: the listener (and, carried by the listener, the
+    // mini-node) hand back their signatures over the preimage session.complete
+    // returned, and the node emits the MINT.
+    std::pair<int, std::string> verb_session_cosign(const std::string& sid,
+                                                    const std::string& body)
+        { return post_session_cosign(sid, body); }
     std::pair<int, std::string> verb_songs_search_query(const std::string& q);
     std::pair<int, std::string> verb_songs_search_artist(const std::string& a);
     std::pair<int, std::string> verb_songs_search_genre(const std::string& g);
@@ -181,6 +219,12 @@ private:
     std::thread                                   reaper_thread_;
     std::atomic<bool>                             reaper_stop_{false};
 
+    // How long a session.complete-issued preimage stays signable. Comfortably
+    // covers a listener signing locally plus one relay hop to the mini-node,
+    // and stays well inside PlaySession::TIMEOUT_MS so the reaper is still the
+    // backstop that frees an abandoned pending proof.
+    static constexpr uint64_t kCosignDeadlineMs = 45000;
+
     // A device may hold a few concurrent live sessions (track-skip tear-down +
     // new stream, or 2 accounts on one PC). Cap is on (device,wallet), not the
     // device alone, so one wallet can't fan out — but a device is not bricked to
@@ -220,6 +264,41 @@ private:
                                                         const std::string& body);
     std::pair<int, std::string> post_session_complete(const std::string& session_id,
                                                        const std::string& body);
+    std::pair<int, std::string> post_session_cosign(const std::string& session_id,
+                                                     const std::string& body);
+
+    // Shared tail of the two completion paths: stage the ddur: counter, publish
+    // the MINT (or accrue it for batched settlement) and build the JSON reply.
+    // `proof` is final and fully signed by whoever is going to sign it.
+    std::pair<int, std::string> emit_mint(const PlaySession& sess,
+                                          const PlayProof& proof,
+                                          const SongSection& song_section,
+                                          uint64_t effective_ms);
+
+    // Resolve the SEEDER and MINI-NODE reward lanes for a session from the
+    // node's OWN delivery-triangulation rows (`dr:` / `pd:`, written by
+    // RatsApi at stream.open + relay.report + relay.receipt), never from the
+    // request body. Returns false and leaves both lanes zero when the session
+    // carries no delivery binding or the binding does not corroborate — an
+    // unpayable lane is always preferable to paying the wrong wallet.
+    // `mini_pk_out` is the relaying mini-node's 33-byte compressed pubkey,
+    // taken from the same wallet-signed relay.report as its address. It has to
+    // be known BEFORE anybody signs, because PlayProof::sign_message() for v3
+    // covers all three co-signer pubkeys — see post_session_complete.
+    bool resolve_delivery_lanes(const PlaySession& sess,
+                                Address& seeder_out, Address& mini_out,
+                                PubKey33& mini_pk_out,
+                                std::string& why) const;
+    // Consume (delete) the delivery-resolution row so a single relayed stream
+    // can only fund ONE play's seeder/relay lanes.
+    void consume_delivery_row(const std::string& delivery_id_hex);
+
+    // Node-local (NON-consensus) enforcement switch: BOPWIRE_REQUIRE_COSIGN=1
+    // makes THIS node refuse to originate a mint whose proof lacks the listener
+    // co-signature, months before COSIGN_ACTIVATION_HEIGHT makes it a consensus
+    // rule. Lets an operator stop rewarding un-upgraded players without any
+    // risk of splitting the chain.
+    std::atomic<bool> require_cosign_{false};
     std::pair<int, std::string> post_wallet_create();
     std::pair<int, std::string> get_wallet_address();
     std::pair<int, std::string> get_wallet_nonce(const std::string& address_hex);

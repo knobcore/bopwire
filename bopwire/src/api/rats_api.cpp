@@ -1909,6 +1909,12 @@ void RatsApi::handle_request(const std::string& peer_id,
             reply = wrap_handler_result(req_id,
                 http_.verb_session_complete(in.value("session_id", ""),
                                             in.dump()));
+        } else if (type == "session.cosign") {
+            // Stage 2 second leg — the listener returns its signature (and the
+            // relaying mini-node's) over the preimage session.complete issued.
+            reply = wrap_handler_result(req_id,
+                http_.verb_session_cosign(in.value("session_id", ""),
+                                          in.dump()));
         }
         // ---- DB2: wallet-keyed library store ----------------------------
         //
@@ -2384,7 +2390,16 @@ void RatsApi::handle_request(const std::string& peer_id,
                     // row (this node is the broker), returned so the player
                     // threads it through the relay and reports receipt. Minted
                     // only now that we know there's a peer to deliver from.
-                    const std::string did_hex = mint_delivery(ch);
+                    // Stage 2: bind the delivery to the requesting LISTENER and to the
+                    // CANDIDATE seeder set, so the seeder lane can later only
+                    // ever name a wallet that was genuinely eligible to serve
+                    // this song at this moment (see resolve_delivery_lanes).
+                    const std::string listener_pid =
+                        !env.value("originator_peer_id", std::string()).empty()
+                            ? env.value("originator_peer_id", std::string())
+                            : peer_id;
+                    const std::string did_hex =
+                        mint_delivery(ch, listener_pid, peers);
                     if (debug_log_.load()) {
                         std::cout << "[rats-api] stream.open ch="
                                   << hash.substr(0, 16)
@@ -3962,7 +3977,8 @@ namespace {
 // in candidate.cpp before a tx can enter a block, so a malformed / unsigned tx
 // never floods the mesh. This is only the floor; the authoritative rules
 // (nonce, balance, authority) run in Chain::apply_transactions at block-connect.
-bool tx_preflight_ok(const std::vector<uint8_t>& raw, const Database& db) {
+bool tx_preflight_ok(const std::vector<uint8_t>& raw, const Database& db,
+                     uint32_t next_height) {
     if (raw.empty()) return false;
     switch (static_cast<TxType>(raw[0])) {
         case TxType::TRANSFER: {
@@ -4013,7 +4029,9 @@ bool tx_preflight_ok(const std::vector<uint8_t>& raw, const Database& db) {
             // declared outputs+burn == recompute from on-chain song/supply. A
             // forged/inflated mint never enters the mempool or floods.
             std::string err;
-            return validate_mint(tx, db, err);
+            // Preflight against the height this tx would LAND at (tip+1) so the
+            // mempool applies the same co-signature rule the block-apply will.
+            return validate_mint(tx, db, next_height, err);
         }
         case TxType::RELAY_REWARD: {
             RelayRewardTx tx;
@@ -4066,7 +4084,7 @@ bool RatsApi::ingest_tx(const std::string& payload_json, bool broadcast_if_new) 
             request_settle_body(sm.constituents_merkle_root);
     }
     // Same pre-flight the producer applies, so a bad tx never floods.
-    if (!tx_preflight_ok(raw, db_)) return false;
+    if (!tx_preflight_ok(raw, db_, chain_.tip().height + 1)) return false;
 
     // Dedup + min-merge on tx_hash (the content-addressed p: row is free
     // loop-safe dedup, exactly like mod_log_has_sig). Keep the smaller
@@ -4383,7 +4401,9 @@ void RatsApi::handle_forgery_report(const std::string& peer_id,
 // received, flags }. flags bit0=brokered, bit1=reported, bit2=receipted.
 // Credit fires only when all three are set, per min(relayed,received) byte.
 
-std::string RatsApi::mint_delivery(const Hash256& content_hash) {
+std::string RatsApi::mint_delivery(const Hash256& content_hash,
+                                   const std::string& listener_peer_id,
+                                   const std::vector<std::string>& candidate_peers) {
     uint8_t did[16];
     if (RAND_bytes(did, 16) != 1) {
         // Fallback: hash (now_ms || content_hash) — still unguessable enough.
@@ -4399,11 +4419,35 @@ std::string RatsApi::mint_delivery(const Hash256& content_hash) {
     const uint64_t now = (uint64_t)std::chrono::duration_cast<
         std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+    // Stage 2 seeder-lane provenance, all captured HERE at broker time and
+    // never taken from a later client claim:
+    //   lw   — the listener's wallet, from ITS signed presence.hello binding.
+    //          Blocks one listener replaying another's delivery_id.
+    //   cand — the wallets eligible to seed this song right now: they published
+    //          this exact content_hash in their DB2 library AND hold a live
+    //          wallet-signed presence binding. A seeder claim outside this set
+    //          is refused, so naming your own (or a friend's) wallet as the
+    //          seeder does not work unless that wallet really is serving the
+    //          song.
+    std::string listener_wallet;
+    nlohmann::json cand = nlohmann::json::array();
+    {
+        std::lock_guard<std::mutex> lk(wallet_presence_mu_);
+        auto lit = peer_to_wallet_player_.find(listener_peer_id);
+        if (lit != peer_to_wallet_player_.end()) listener_wallet = lit->second;
+        for (const auto& pid : candidate_peers) {
+            auto cit = peer_to_wallet_player_.find(pid);
+            if (cit != peer_to_wallet_player_.end()) cand.push_back(cit->second);
+        }
+    }
     nlohmann::json row = {
         {"ch",       crypto::to_hex(content_hash)},
         {"broker",   crypto::to_hex(keypair_.address.data(), 20)},
         {"created",  now},
         {"mw",       std::string()},
+        {"sd",       std::string()},
+        {"lw",       listener_wallet},
+        {"cand",     cand},
         {"relayed",  (uint64_t)0},
         {"received", (uint64_t)0},
         {"flags",    1},
@@ -4419,6 +4463,18 @@ bool RatsApi::handle_relay_report(const nlohmann::json& body) {
     const std::string mw_hex  = body.value("mini_wallet",  std::string());
     const std::string pk_hex  = body.value("mini_pubkey",  std::string());
     const std::string sig_hex = body.value("sig",          std::string());
+    // Stage 2: the v2 signature, over a preimage that additionally covers the
+    // seeder attestation. Sent alongside `sig` (never instead of it), so a
+    // broker and a mini can be upgraded in either order.
+    const std::string sig2_hex = body.value("sig2",         std::string());
+    // Stage 2 (report v2, optional): the peer_id the mini-node actually
+    // received this delivery's audio frames FROM — i.e. the SEEDER. The mini
+    // is the only party in the loop that observes this directly, and it has no
+    // stake in the seeder lane (its own lane is separate), which is why we ask
+    // IT rather than the listener. Absent => an un-upgraded mini => no seeder
+    // lane for this delivery, which is a lost token, not a wrong payment.
+    const std::string seeder_pid   = body.value("seeder_peer_id", std::string());
+    const uint64_t    seeder_bytes = body.value("seeder_bytes", (uint64_t)0);
     if (did_hex.size() != 32) return false;
     // Serialise the pd: row RMW (+ try_corroborate at the tail) against the
     // receipt leg's worker — see pd_mu_ in the header. (#1 worker-pool fix)
@@ -4437,20 +4493,93 @@ bool RatsApi::handle_relay_report(const nlohmann::json& body) {
     auto sigb = crypto::from_hex(sig_hex); if (sigb.size() != 64) return false;
     Sig64 sig{}; std::copy(sigb.begin(), sigb.end(), sig.begin());
     auto did = crypto::from_hex(did_hex); if (did.size() != 16) return false;
-    // preimage = "relay.report" || did(16) || bytes(u64 LE) || mini_addr(20)
-    std::vector<uint8_t> msg;
-    const char* tag = "relay.report";
-    msg.insert(msg.end(), tag, tag + std::strlen(tag));
-    msg.insert(msg.end(), did.begin(), did.end());
-    for (int i=0;i<8;++i) msg.push_back((uint8_t)(bytes_relayed >> (8*i)));
-    msg.insert(msg.end(), mini_addr.begin(), mini_addr.end());
-    if (!crypto::verify_data(msg.data(), msg.size(), sig, pub)) return false;
+    // Two accepted preimages, so an un-upgraded mini-node keeps corroborating
+    // unchanged while an upgraded one additionally attests the seeder:
+    //   v1: "relay.report"  || did(16) || bytes(u64 LE) || mini_addr(20)
+    //   v2: "relay.report2" || did(16) || bytes(u64 LE) || mini_addr(20)
+    //                       || seeder_bytes(u64 LE) || seeder_peer_id (ASCII)
+    // v2 is REQUIRED whenever a seeder_peer_id is claimed — the seeder name has
+    // to be inside the mini's signature or a middlebox could rewrite it.
+    auto build_msg = [&](bool v2) {
+        std::vector<uint8_t> m;
+        const char* tag = v2 ? "relay.report2" : "relay.report";
+        m.insert(m.end(), tag, tag + std::strlen(tag));
+        m.insert(m.end(), did.begin(), did.end());
+        for (int i=0;i<8;++i) m.push_back((uint8_t)(bytes_relayed >> (8*i)));
+        m.insert(m.end(), mini_addr.begin(), mini_addr.end());
+        if (v2) {
+            for (int i=0;i<8;++i) m.push_back((uint8_t)(seeder_bytes >> (8*i)));
+            m.insert(m.end(), seeder_pid.begin(), seeder_pid.end());
+        }
+        return m;
+    };
+    bool sig_ok = false;
+    bool seeder_attested = false;
+    if (!seeder_pid.empty()) {
+        // The seeder name is only honoured when it is covered by a signature.
+        // Accept it from `sig2` if present, or from `sig` for a mini that only
+        // sends the v2 preimage in the legacy field.
+        auto m2 = build_msg(true);
+        Sig64 s2{};
+        auto s2b = crypto::from_hex(sig2_hex);
+        if (s2b.size() == 64) {
+            std::copy(s2b.begin(), s2b.end(), s2.begin());
+            if (crypto::verify_data(m2.data(), m2.size(), s2, pub)) {
+                sig_ok = true; seeder_attested = true;
+            }
+        }
+        if (!seeder_attested &&
+            crypto::verify_data(m2.data(), m2.size(), sig, pub)) {
+            sig_ok = true; seeder_attested = true;
+        }
+    }
+    // A v1 signature never covers seeder_pid, so it authorises the byte count
+    // and the mini's own identity but never a seeder claim.
+    {
+        auto m1 = build_msg(false);
+        if (crypto::verify_data(m1.data(), m1.size(), sig, pub)) sig_ok = true;
+    }
+    if (!sig_ok) return false;
     auto row = nlohmann::json::parse(
         std::string(row_opt->begin(), row_opt->end()), nullptr, false);
     if (!row.is_object()) return false;
     row["mw"]      = crypto::to_hex(mini_addr.data(), 20);
+    // Stage 2: keep the mini's PUBKEY too, not just its address. The v3
+    // PlayProof preimage covers every co-signer's pubkey, so session.complete
+    // needs it to build a proof the mini can co-sign at all. It is safe to
+    // store: we verified address_from_pubkey(pub) == mini_addr and the whole
+    // report against it just above.
+    row["mpk"]     = crypto::to_hex(pub.data(), 33);
     row["relayed"] = bytes_relayed;
     row["flags"]   = row.value("flags", 0) | 2;
+    // Resolve the attested seeder peer_id to a WALLET, and only accept it if
+    // that wallet was in the candidate set the broker itself recorded at
+    // stream.open (published this song + live signed presence binding) and is
+    // not the listener. Every one of those facts is either the node's own or
+    // signed by somebody with no incentive to lie about it.
+    if (seeder_attested && seeder_bytes > 0) {
+        std::string seeder_wallet;
+        {
+            std::lock_guard<std::mutex> lk(wallet_presence_mu_);
+            auto it = peer_to_wallet_player_.find(seeder_pid);
+            if (it != peer_to_wallet_player_.end()) seeder_wallet = it->second;
+        }
+        bool in_cand = false;
+        if (!seeder_wallet.empty() && row.contains("cand") && row["cand"].is_array())
+            for (const auto& c : row["cand"])
+                if (c.is_string() && c.get<std::string>() == seeder_wallet) { in_cand = true; break; }
+        const std::string lw = row.value("lw", std::string());
+        if (!in_cand) {
+            std::cout << "[relay] seeder claim REFUSED did=" << did_hex.substr(0, 12)
+                      << " peer=" << seeder_pid.substr(0, 12)
+                      << " (not a presence-bound holder of this song)\n";
+        } else if (!lw.empty() && lw == seeder_wallet) {
+            std::cout << "[relay] seeder claim REFUSED did=" << did_hex.substr(0, 12)
+                      << " (self-seed: seeder == listener)\n";
+        } else {
+            row["sd"] = seeder_wallet;
+        }
+    }
     const std::string s = row.dump();
     db_.put("pd:" + did_hex, std::vector<uint8_t>(s.begin(), s.end()));
     try_corroborate(did_hex);
@@ -4513,8 +4642,32 @@ void RatsApi::try_corroborate(const std::string& did_hex) {
     // corroborate the 3 legs and retire the pd: row (single-use ⇒ replay-proof).
     // The RelayRewardTx struct + Chain::apply_relay_reward are kept ONLY so
     // historical blocks carrying old per-byte rewards still replay.
+    //
+    // Stage 2: retire the pd: row into a compact `dr:` DELIVERY RESOLUTION row.
+    // session.complete reads that to fill the seeder + mini-node reward lanes
+    // (HttpServer::resolve_delivery_lanes), and consumes it once the mint is
+    // published, so one relayed stream funds exactly one play's lanes. Carrying
+    // the identities forward here (rather than leaving the pd: row alive) keeps
+    // the pd: single-use property that makes the 3-leg corroboration
+    // replay-proof.
+    nlohmann::json res = {
+        {"ch",      row.value("ch", std::string())},
+        {"lw",      row.value("lw", std::string())},
+        {"sd",      row.value("sd", std::string())},
+        {"mw",      row.value("mw", std::string())},
+        {"mpk",     row.value("mpk", std::string())},
+        {"created", row.value("created", (uint64_t)0)},
+    };
+    const std::string rs = res.dump();
+    db_.put("dr:" + did_hex, std::vector<uint8_t>(rs.begin(), rs.end()));
     std::cout << "[relay] corroborated delivery " << did_hex.substr(0, 12)
-              << "… (per-byte reward retired; mini earns per-stream)\n";
+              << "… seeder=" << (res.value("sd", std::string()).empty()
+                                   ? std::string("-")
+                                   : res.value("sd", std::string()).substr(0, 10))
+              << " mini=" << (res.value("mw", std::string()).empty()
+                                   ? std::string("-")
+                                   : res.value("mw", std::string()).substr(0, 10))
+              << "\n";
     db_.del("pd:" + did_hex);   // single-use ⇒ replay-proof
 }
 
@@ -4526,6 +4679,18 @@ void RatsApi::reap_stale_deliveries_() {
     // 3 legs all landed is already retired by try_corroborate, so anything
     // still here past the TTL is an abandoned half-delivery.
     std::vector<std::string> dead;
+    // Stage 2: `dr:` resolution rows age out on the same clock. A play that
+    // never completes leaves one behind; session.complete consumes it on the
+    // happy path.
+    db_.for_each_with_prefix("dr:", [&](const std::string& key,
+                                        const std::string& val) {
+        auto row = nlohmann::json::parse(val, nullptr, /*allow_exceptions=*/false);
+        uint64_t created = 0;
+        if (row.is_object()) created = row.value("created", (uint64_t)0);
+        if (now > created && now - created >= kDeliveryTtlMs)
+            dead.push_back(key);
+        return true;
+    });
     db_.for_each_with_prefix("pd:", [&](const std::string& key,
                                         const std::string& val) {
         auto row = nlohmann::json::parse(val, nullptr, /*allow_exceptions=*/false);

@@ -146,6 +146,16 @@ bool HttpServer::start() {
         device_cap_enforce_.store(e[0] == '1' || e[0] == 't' || e[0] == 'T');
     if (const char* e = std::getenv("BOPWIRE_BATCH_SETTLE"))
         batch_settle_enabled_.store(e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    // Stage 2, node-local and NON-consensus: refuse to ORIGINATE a mint whose
+    // proof carries no listener co-signature. Lets an operator stop paying for
+    // un-co-signed plays long before COSIGN_ACTIVATION_HEIGHT turns it into a
+    // consensus rule, with zero fork risk (this node just declines to build the
+    // tx; every other node's validation is unchanged).
+    if (const char* e = std::getenv("BOPWIRE_REQUIRE_COSIGN"))
+        require_cosign_.store(e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    if (require_cosign_.load())
+        std::cout << "[cosign] REQUIRE_COSIGN on — this node only mints "
+                     "three-party co-signed play proofs\n";
     if (batch_settle_enabled_.load())
         std::cout << "[settle] batched settlement ON (epoch=" << (EPOCH_MS/1000)
                   << "s) — session.complete accrues, reaper emits SETTLEMENT_MINT\n";
@@ -731,6 +741,33 @@ std::pair<int, std::string> HttpServer::post_session_start(const std::string& bo
             if (crypto::parse_address(j.value("mini_node_address", std::string()), ma))
                 session.mini_node_address = ma;
         }
+        // Stage 2: the delivery_id from this play's stream.open. Unlike the two
+        // addresses above it is NOT a claim — it is a 128-bit random handle the
+        // NODE minted and handed only to the peer that opened the stream, so
+        // presenting it proves nothing more than "I am the requester", and the
+        // node then reads the seeder / mini identities out of its OWN
+        // triangulation row rather than out of this request. 32 lowercase hex.
+        // Stage 2: the listener's compressed pubkey. Self-verifying — we only
+        // keep it when it hashes to the player_address that was already parsed
+        // and checksum-validated above, so it is not a trust decision. Optional
+        // here; session.complete accepts it too. Without it the node cannot
+        // build a co-signable proof, because the v3 preimage covers it.
+        {
+            auto pk = crypto::from_hex(j.value("player_pubkey", std::string()));
+            if (pk.size() == 33) {
+                PubKey33 candidate{};
+                std::copy(pk.begin(), pk.end(), candidate.begin());
+                if (crypto::address_from_pubkey(candidate) == pl)
+                    session.player_pubkey = candidate;
+            }
+        }
+        {
+            const std::string did = j.value("delivery_id", std::string());
+            bool ok = (did.size() == 32);
+            for (char c : did)
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { ok = false; break; }
+            if (ok) session.delivery_id = did;
+        }
         session.start_timestamp  = now_ms_api();
         session.last_heartbeat   = session.start_timestamp;
         session.heartbeat_count  = 0;
@@ -864,6 +901,12 @@ std::pair<int, std::string> HttpServer::post_session_complete(
         auto it = sessions_.find(session_id);
         if (it == sessions_.end()) return {404, R"({"error":"session not found"})"};
         if (it->second.completed) return {400, R"({"error":"already completed"})"};
+        // Stage 2: a session that already handed out a preimage must finish
+        // through session.cosign. Re-completing would build a SECOND proof for
+        // the same session_id (different play_end_timestamp, so a different
+        // preimage) and leave the first one signable in parallel.
+        if (it->second.awaiting_cosign)
+            return {409, R"({"error":"awaiting co-signature","detail":"call session.cosign with the preimage already issued"})"};
         // Atomically CLAIM the session so two concurrent completes for the same
         // session_id can't both mint + both increment the daily counter (the
         // `completed` flag alone is only set after the mint, and apply_mint does
@@ -1111,39 +1154,387 @@ std::pair<int, std::string> HttpServer::post_session_complete(
     proof.heartbeat_count      = (sess.heartbeat_count > 0xFFFFu)
         ? static_cast<uint16_t>(0xFFFF) : static_cast<uint16_t>(sess.heartbeat_count);
 
-    // Per-stream reward lanes (PlayProof v2). The player reports the SEEDER +
-    // MINI-NODE here at COMPLETE (not start) because the serving peer isn't known
-    // until streaming has begun. 40-hex peer-ids == wallet addresses (lenient
-    // parse, no checksum); fall back to whatever session.start recorded. Setting
-    // version=2 makes sign_message()/serialize() include them so the node
-    // signature COVERS them (tamper-proof). compute_mint_outputs adds 1 token to
-    // each non-zero address and skips the seeder lane when it equals the listener
-    // (no self-seed double-dip).
-    Address seeder_addr = sess.seeder_address;
-    Address mini_addr   = sess.mini_node_address;
-    try {
-        auto jb = json::parse(body);
-        Address a{};
-        if (crypto::parse_address(jb.value("seeder_address", std::string()), a))
-            seeder_addr = a;
-        a = Address{};
-        if (crypto::parse_address(jb.value("mini_node_address", std::string()), a))
-            mini_addr = a;
-    } catch (...) { /* no body / not JSON -> use session.start values */ }
+    // ---- Per-stream reward lanes (PlayProof v2/v3), NODE-AUTHORITATIVE ------
+    //
+    // These two addresses are MONEY: each non-zero lane mints a whole token to
+    // whoever it names. They used to be read straight out of this request body
+    // (and, before that, out of session.start), so a client that named its own
+    // wallet as `seeder_address` simply stole the seeder lane and a client that
+    // named a friend's mini-node stole the relay lane. Nothing verified that
+    // the named peer had served a single byte.
+    //
+    // Stage 2 resolves both from the node's OWN delivery-triangulation record
+    // instead (see resolve_delivery_lanes): the broker minted the delivery_id
+    // at stream.open and recorded the candidate holder set; the MINI-NODE
+    // signed a relay.report naming the peer it actually received the audio
+    // frames from; the peer→wallet mapping comes from the wallet-signed
+    // presence.hello binding. The request body is no longer consulted at all.
+    //
+    // If that resolution fails for any reason — no delivery_id threaded
+    // through, the mini never reported, the named peer has no signed presence
+    // binding, the wallet isn't a holder of this song — BOTH lanes stay zero.
+    // An unpaid lane is always the right failure mode; paying the wrong wallet
+    // is not recoverable.
+    Address  seeder_addr{};
+    Address  mini_addr{};
+    PubKey33 mini_pk{};
+    {
+        std::string why;
+        if (!resolve_delivery_lanes(sess, seeder_addr, mini_addr, mini_pk, why)) {
+            seeder_addr = Address{};
+            mini_addr   = Address{};
+            mini_pk     = PubKey33{};
+            std::cout << "[session.complete] lanes unresolved sid="
+                      << crypto::to_hex(sess.session_id).substr(0, 12)
+                      << " reason=" << why << " (seeder+relay unpaid)\n";
+        }
+    }
     proof.seeder_address    = seeder_addr;
     proof.mini_node_address = mini_addr;
-    // v3: carry the serving-node pubkey so any validator verifies the node
-    // signature WITHOUT the founder v: registry (serving_node_id ==
-    // sha256(pubkey)). The listener + mini co-signatures (player_*/mini_*) fill
-    // in once those parties sign (Stage 2); until then they stay zero and
-    // validate_mint skips them, so a node-signed v3 proof still mints.
-    proof.serving_node_pubkey = node_keypair_.public_key;
     proof.version           = 3;
 
-    // Node signs the proof
+    // ---- Fix EVERY identity before ANY signature ---------------------------
+    //
+    // PlayProof::sign_message() for v3 covers all three co-signer pubkeys
+    // (serving_node, player, mini_node) as well as the play facts. That is
+    // deliberate — it is what stops one party's signature being grafted onto a
+    // proof naming somebody else — but it means the preimage does not exist
+    // until all three identities are known, so they must be resolved here,
+    // before the node signs:
+    //
+    //   serving_node_pubkey — ours; also lets any validator check the node
+    //       signature without the founder v: registry, since
+    //       serving_node_id == sha256(serving_node_pubkey).
+    //   player_pubkey       — supplied by the client and accepted only if it
+    //       hashes to the player_address we already hold (self-verifying).
+    //   mini_node_pubkey    — from the mini's own wallet-signed relay.report,
+    //       via the delivery row. Never client input.
+    //
+    // A relay lane is claimed ONLY when we have the matching pubkey: an
+    // address we cannot bind to a key could never be co-signed, and post
+    // activation a lane without its signature is a hard reject. Dropping the
+    // lane costs one token; claiming an unsignable one would cost the mint.
+    //
+    // A pubkey is only ever written when its signature is going to follow.
+    // check_play verifies a co-signature the moment its pubkey is non-zero, so
+    // publishing a pubkey with a zero signature produces a proof that FAILS
+    // consensus — i.e. a play that silently never mints. On the legacy
+    // (un-co-signed) path both slots therefore stay zero, exactly as today.
+    bool wants_cosign = false;
+    try {
+        auto jb = json::parse(body);
+        wants_cosign = jb.value("cosign", false);
+    } catch (...) { /* no body / not JSON -> legacy client */ }
+
+    proof.serving_node_pubkey = node_keypair_.public_key;
+    if (wants_cosign) {
+        PubKey33 listener_pk = sess.player_pubkey;
+        try {
+            auto jb = json::parse(body);
+            auto pk = crypto::from_hex(jb.value("player_pubkey", std::string()));
+            if (pk.size() == 33) {
+                PubKey33 candidate{};
+                std::copy(pk.begin(), pk.end(), candidate.begin());
+                if (crypto::address_from_pubkey(candidate) == proof.player_address)
+                    listener_pk = candidate;
+            }
+        } catch (...) { /* no body / not JSON */ }
+        if (listener_pk != PubKey33{} &&
+            crypto::address_from_pubkey(listener_pk) == proof.player_address)
+            proof.player_pubkey = listener_pk;
+
+        if (mini_pk != PubKey33{} &&
+            crypto::address_from_pubkey(mini_pk) == proof.mini_node_address) {
+            proof.mini_node_pubkey = mini_pk;
+        } else if (proof.mini_node_address != Address{}) {
+            std::cout << "[session.complete] relay lane dropped sid="
+                      << crypto::to_hex(sess.session_id).substr(0, 12)
+                      << " (no verified mini-node pubkey for "
+                      << crypto::to_checksum_hex(proof.mini_node_address) << ")\n";
+            proof.mini_node_address = Address{};
+        }
+    }
+
+    // Node signs the proof. This is the FIRST of the three signatures over the
+    // identical PlayProof::sign_message() preimage.
     auto sign_msg = proof.sign_message();
     Hash256 sh    = crypto::sha256(sign_msg.data(), sign_msg.size());
     proof.node_signature = crypto::sign_ecdsa(sh, node_keypair_.private_key);
+
+    // ---- Stage 2: hand the preimage back for co-signature ------------------
+    //
+    // Why the flow is shaped this way. play_end_timestamp, total_duration_ms
+    // and heartbeat_count are node-authoritative and only exist NOW, so the
+    // preimage cannot be signed at session.start; somebody has to see the
+    // assembled proof before it is final. The alternative — letting the client
+    // declare those three fields up front so it could pre-sign — would hand a
+    // client control over the exact numbers the anti-farm gates are computed
+    // from, which is strictly worse than one extra round trip.
+    //
+    // So: the node returns the preimage, the listener signs it, and the
+    // listener also carries it one hop to the mini-node it is already relaying
+    // through and brings back that signature too. Cost on the play path is
+    // ZERO — the song has already finished playing by the time this runs; the
+    // only thing waiting on it is the mint. The listener is a safe courier for
+    // the mini's signature because it cannot forge, retarget or replay it: the
+    // mini_node_address is chosen by the NODE (above) and is inside the signed
+    // bytes, as is the session_id.
+    //
+    // Backwards compatibility: a client that does not send "cosign": true is
+    // an un-upgraded player, and gets exactly the old behaviour — mint now,
+    // co-signature slots left zero. That is what keeps the live chain minting
+    // while players roll out. BOPWIRE_REQUIRE_COSIGN=1 lets an operator turn
+    // that tolerance off on THIS node without touching consensus.
+    if (!wants_cosign && require_cosign_.load()) {
+        std::cout << "[session.complete] REJECT sid="
+                  << crypto::to_hex(sess.session_id).substr(0, 12)
+                  << " reason=cosign_required (BOPWIRE_REQUIRE_COSIGN=1)\n";
+        return {426, R"({"error":"cosign_required","detail":"this node only mints three-party co-signed play proofs; update your player"})"};
+    }
+
+    if (wants_cosign && proof.player_pubkey == PubKey33{}) {
+        return {400, R"({"error":"player_pubkey required","detail":"send the listener's 33-byte compressed pubkey (hex) at session.start or in this body; the v3 preimage covers it, so it must be fixed before anything is signed"})"};
+    }
+
+    if (wants_cosign) {
+        // Stash the assembled + node-signed proof and wait for session.cosign.
+        // `completing` deliberately stays true so a second session.complete
+        // can't build a SECOND proof for the same session; `completed` stays
+        // false so the reaper still expires an abandoned session normally.
+        const uint64_t deadline = now + kCosignDeadlineMs;
+        {
+            std::lock_guard<std::mutex> lk(sessions_mutex_);
+            auto it = sessions_.find(sid_copy);
+            if (it == sessions_.end()) return {404, R"({"error":"session not found"})"};
+            it->second.awaiting_cosign      = true;
+            it->second.pending_proof        = proof;
+            it->second.pending_sign_hash    = sh;
+            it->second.pending_song         = song_section;
+            it->second.pending_effective_ms = effective_ms;
+            it->second.pending_deadline_ms  = deadline;
+        }
+        // The device concurrency slot is released by slot_guard on return (the
+        // play is over); the completion claim is NOT, so the pending proof is
+        // the only thing that can still mint this session.
+        json resp = {
+            {"status",       "awaiting_cosign"},
+            {"session_id",   crypto::to_hex(sess.session_id)},
+            // sha256 of the preimage — this is the 32 bytes each party's ECDSA
+            // signs. Clients that build the preimage themselves can and should
+            // cross-check it against this value before signing.
+            {"sign_hash",    crypto::to_hex(sh)},
+            // The full preimage, hex. Handed over verbatim so a client can
+            // parse the node-authoritative fields out of it rather than
+            // trusting the JSON mirror below, and so the mini-node can rebuild
+            // and re-derive it independently.
+            {"preimage",     crypto::to_hex(sign_msg.data(), sign_msg.size())},
+            {"proof_version", 3},
+            {"deadline_ms",  deadline},
+            // Structured mirror of every signed field, so the mini-node can
+            // reconstruct the preimage with PlayProof::sign_message() instead
+            // of blind-signing opaque bytes handed to it by a peer.
+            {"proof", {
+                {"session_id",           crypto::to_hex(proof.session_id)},
+                {"content_hash",         crypto::to_hex(proof.content_hash)},
+                {"block_hash",           crypto::to_hex(proof.block_hash)},
+                {"artist_address",       crypto::to_hex(proof.artist_address.data(), 20)},
+                {"player_address",       crypto::to_hex(proof.player_address.data(), 20)},
+                {"serving_node_id",      crypto::to_hex(proof.serving_node_id)},
+                {"play_start_timestamp", proof.play_start_timestamp},
+                {"play_end_timestamp",   proof.play_end_timestamp},
+                {"total_duration_ms",    proof.total_duration_ms},
+                {"heartbeat_count",      proof.heartbeat_count},
+                {"seeder_address",       crypto::to_hex(proof.seeder_address.data(), 20)},
+                {"mini_node_address",    crypto::to_hex(proof.mini_node_address.data(), 20)},
+                {"serving_node_pubkey",  crypto::to_hex(proof.serving_node_pubkey.data(), 33)},
+                {"player_pubkey",        crypto::to_hex(proof.player_pubkey.data(), 33)},
+                {"mini_node_pubkey",     crypto::to_hex(proof.mini_node_pubkey.data(), 33)},
+            }},
+            {"delivery_id", sess.delivery_id},
+        };
+        std::cout << "[session.complete] AWAIT-COSIGN sid="
+                  << crypto::to_hex(sess.session_id).substr(0, 12)
+                  << " player=" << crypto::to_checksum_hex(proof.player_address)
+                  << " seeder=" << crypto::to_checksum_hex(proof.seeder_address)
+                  << " mini="   << crypto::to_checksum_hex(proof.mini_node_address)
+                  << "\n";
+        return {202, resp.dump()};
+    }
+
+    // Legacy single-party path — unchanged behaviour for un-upgraded players.
+    std::cout << "[session.complete] UNSIGNED-PROOF sid="
+              << crypto::to_hex(sess.session_id).substr(0, 12)
+              << " player=" << crypto::to_checksum_hex(proof.player_address)
+              << " (listener did not co-sign; a serving node alone attests this "
+                 "play — see COSIGN_ACTIVATION_HEIGHT)\n";
+    auto result = emit_mint(sess, proof, song_section, effective_ms);
+    if (result.first == 200) {
+        std::lock_guard<std::mutex> lk(sessions_mutex_);
+        auto it = sessions_.find(sid_copy);
+        if (it != sessions_.end()) it->second.completed = true;
+    }
+    return result;
+}
+
+// ---- Stage 2: session.cosign ----------------------------------------
+//
+// Second and final leg of the co-signed completion. The listener returns its
+// own signature over the preimage session.complete handed back, and (when the
+// node resolved a paid relay lane) the mini-node's signature too, which the
+// listener collected over its existing one-hop relay connection.
+//
+// Request body:
+//   {
+//     "session_id":          "<64 hex>",          // also in the path/verb arg
+//     "player_pubkey":       "<66 hex>",          // 33-byte compressed secp256k1
+//     "player_signature":    "<128 hex>",         // 64-byte compact ECDSA
+//     "mini_node_pubkey":    "<66 hex>",          // omit when no relay lane
+//     "mini_node_signature": "<128 hex>"          // omit when no relay lane
+//   }
+//
+// Every signature is ECDSA-secp256k1 over sha256(PlayProof::sign_message()) —
+// i.e. over the SAME 32 bytes returned as `sign_hash`, with no extra hashing
+// and no message prefix. Identical construction to node_signature.
+std::pair<int, std::string> HttpServer::post_session_cosign(
+    const std::string& session_id, const std::string& body) {
+    PlaySession sess;
+    {
+        std::lock_guard<std::mutex> lk(sessions_mutex_);
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) return {404, R"({"error":"session not found"})"};
+        if (it->second.completed)  return {400, R"({"error":"already completed"})"};
+        if (!it->second.awaiting_cosign)
+            return {400, R"({"error":"session is not awaiting co-signature"})"};
+        sess = it->second;
+    }
+    if (now_ms_api() > sess.pending_deadline_ms)
+        return {408, R"({"error":"cosign deadline expired"})"};
+
+    PlayProof proof = sess.pending_proof;
+    const Hash256& sh = sess.pending_sign_hash;
+
+    // Parse the two signature pairs out of the body.
+    PubKey33 player_pk{}, mini_pk{};
+    Sig64    player_sig{}, mini_sig{};
+    bool     have_mini = false;
+    try {
+        auto jb = json::parse(body);
+        auto pk = crypto::from_hex(jb.value("player_pubkey", std::string()));
+        auto sg = crypto::from_hex(jb.value("player_signature", std::string()));
+        if (pk.size() != 33) return {400, R"({"error":"player_pubkey must be 33 bytes hex"})"};
+        if (sg.size() != 64) return {400, R"({"error":"player_signature must be 64 bytes hex"})"};
+        std::copy(pk.begin(), pk.end(), player_pk.begin());
+        std::copy(sg.begin(), sg.end(), player_sig.begin());
+
+        const std::string mpk_hex = jb.value("mini_node_pubkey", std::string());
+        const std::string msg_hex = jb.value("mini_node_signature", std::string());
+        if (!mpk_hex.empty() || !msg_hex.empty()) {
+            auto mpk = crypto::from_hex(mpk_hex);
+            auto msg = crypto::from_hex(msg_hex);
+            if (mpk.size() != 33) return {400, R"({"error":"mini_node_pubkey must be 33 bytes hex"})"};
+            if (msg.size() != 64) return {400, R"({"error":"mini_node_signature must be 64 bytes hex"})"};
+            std::copy(mpk.begin(), mpk.end(), mini_pk.begin());
+            std::copy(msg.begin(), msg.end(), mini_sig.begin());
+            have_mini = true;
+        }
+    } catch (...) {
+        return {400, R"({"error":"invalid body"})"};
+    }
+
+    // ---- Listener leg. The pubkey must hash to the player_address the NODE
+    // put in the proof (the client cannot substitute a different earner), and
+    // the signature must verify over the preimage the NODE built.
+    if (crypto::address_from_pubkey(player_pk) != proof.player_address)
+        return {403, R"({"error":"player_pubkey does not match player_address"})"};
+    if (player_pk != proof.player_pubkey)
+        return {403, R"({"error":"player_pubkey differs from the one committed in the preimage"})"};
+    if (!crypto::verify_ecdsa(sh, player_sig, player_pk))
+        return {403, R"({"error":"invalid listener signature"})"};
+
+    // ---- Relay leg. Only accepted when the node itself resolved a paid relay
+    // lane, and only from the exact mini-node it resolved: mini_node_address is
+    // node-chosen, is inside the signed bytes, and is re-derived from the
+    // pubkey here. A client cannot point this lane at a wallet of its choosing.
+    const Address zero_addr{};
+    if (proof.mini_node_address != zero_addr) {
+        if (!have_mini)
+            return {428, R"({"error":"mini_node_signature required","detail":"this proof claims a paid relay lane; ask the relaying mini-node to co-sign via proof.cosign"})"};
+        if (crypto::address_from_pubkey(mini_pk) != proof.mini_node_address)
+            return {403, R"({"error":"mini_node_pubkey does not match the resolved mini_node_address"})"};
+        if (mini_pk != proof.mini_node_pubkey)
+            return {403, R"({"error":"mini_node_pubkey differs from the one committed in the preimage"})"};
+        if (!crypto::verify_ecdsa(sh, mini_sig, mini_pk))
+            return {403, R"({"error":"invalid mini-node signature"})"};
+    } else if (have_mini) {
+        // No relay lane was resolved, so a mini signature is meaningless here
+        // and accepting it would put a pubkey in the proof whose address does
+        // not match the (zero) mini_node_address — which check_play rejects.
+        return {400, R"({"error":"no relay lane resolved for this session; do not send a mini-node signature"})"};
+    }
+
+    // Only the two SIGNATURE slots are filled here. The pubkeys are already in
+    // the proof — the v3 preimage covers them, so they were fixed before the
+    // node signed and cannot be changed now without invalidating every
+    // signature including the node's own. What the checks above therefore
+    // establish is that the submitted keys MATCH the ones already committed to.
+    proof.player_signature = player_sig;
+    if (have_mini) proof.mini_node_signature = mini_sig;
+    {
+        // Belt and braces: the preimage must be bit-identical to the one whose
+        // digest we handed out. If a future edit to sign_message() ever starts
+        // covering the signature fields, this catches it here instead of
+        // shipping a proof that consensus silently drops.
+        auto check_msg = proof.sign_message();
+        Hash256 check_h = crypto::sha256(check_msg.data(), check_msg.size());
+        if (std::memcmp(check_h.data(), sh.data(), 32) != 0) {
+            std::cout << "[session.cosign] INTERNAL preimage drift sid="
+                      << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
+            return {500, R"({"error":"internal preimage mismatch"})"};
+        }
+    }
+
+    // Local consensus preflight against the height this would land at, so a
+    // proof that could never mint is refused here with a reason instead of
+    // being flooded and silently dropped.
+    {
+        std::string err;
+        if (!check_play(proof, db_, chain_.tip().height + 1, err)) {
+            std::cout << "[session.cosign] REJECT sid="
+                      << crypto::to_hex(sess.session_id).substr(0, 12)
+                      << " reason=" << err << "\n";
+            return {400, std::string(R"({"error":"proof rejected","detail":")") + err + "\"}"};
+        }
+    }
+
+    auto result = emit_mint(sess, proof, sess.pending_song,
+                            sess.pending_effective_ms);
+    if (result.first == 200) {
+        std::lock_guard<std::mutex> lk(sessions_mutex_);
+        auto it = sessions_.find(session_id);
+        if (it != sessions_.end()) {
+            it->second.completed       = true;
+            it->second.completing      = false;
+            it->second.awaiting_cosign = false;
+            release_device_slot_locked(it->second);
+        }
+    }
+    std::cout << "[session.cosign] OK sid="
+              << crypto::to_hex(sess.session_id).substr(0, 12)
+              << " listener=SIGNED"
+              << " mini=" << (have_mini ? "SIGNED" : "n/a") << "\n";
+    return result;
+}
+
+// ---- Shared mint emission -------------------------------------------
+//
+// Everything from "the proof is final" to "the reply is built", shared by the
+// legacy single-party completion and the co-signed one so the two paths can
+// never drift in what they mint.
+std::pair<int, std::string> HttpServer::emit_mint(const PlaySession& sess,
+                                                  const PlayProof& proof,
+                                                  const SongSection& song_section,
+                                                  uint64_t effective_ms) {
+    const uint64_t now = now_ms_api();
 
     // Compute mint outputs
     uint64_t play_count = db_.get_play_count(sess.content_hash);
@@ -1213,28 +1604,39 @@ std::pair<int, std::string> HttpServer::post_session_complete(
                       << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
         }
     }
-    // Mint actually landed. NOW flip the in-memory completed flag so
-    // a retry returns "already completed" instead of double-minting.
-    {
-        std::lock_guard<std::mutex> lk(sessions_mutex_);
-        auto it = sessions_.find(sid_copy);
-        if (it != sessions_.end()) it->second.completed = true;
-    }
+    // Retire the delivery-resolution row so a single relayed stream can only
+    // ever fund ONE play's seeder + relay lanes, even if the same delivery_id
+    // is threaded through a second session.
+    if (!sess.delivery_id.empty())
+        consume_delivery_row(sess.delivery_id);
+
     std::cout << "[session.complete] OK sid="
               << crypto::to_hex(sess.session_id).substr(0, 12)
               << " player=" << crypto::to_checksum_hex(sess.player_address)
               << " artist=" << crypto::to_checksum_hex(song_section.artist_address)
+              << " seeder=" << crypto::to_checksum_hex(proof.seeder_address)
+              << " mini="   << crypto::to_checksum_hex(proof.mini_node_address)
               << " play_count=" << (play_count + 1)
               << " outputs=" << outputs.size()
               << " eff_ms=" << effective_ms
-              << " heartbeats=" << samples.size() << "\n";
+              << " heartbeats=" << sess.samples.size() << "\n";
 
     // Tally response amounts
+    // Attribute each output to the lane it belongs to. Below the 10k-play
+    // threshold the artist share lands in escrow_address_for(artist), not the
+    // artist itself; it used to fall through into discoverer_amount and made
+    // the reply claim the listener had earned the artist's tokens.
     uint64_t artist_amount = 0, node_amount = 0, discoverer_amount = 0;
+    uint64_t seeder_amount = 0, mini_amount = 0, escrow_amount = 0;
     for (const auto& out : outputs) {
-        if (out.recipient == song_section.artist_address) artist_amount    += out.amount;
-        else if (out.recipient == node_addr)              node_amount      += out.amount;
-        else                                              discoverer_amount += out.amount;
+        if (out.recipient == song_section.artist_address)   artist_amount     += out.amount;
+        else if (out.recipient == node_addr)                node_amount       += out.amount;
+        else if (proof.seeder_address != Address{} &&
+                 out.recipient == proof.seeder_address)     seeder_amount     += out.amount;
+        else if (proof.mini_node_address != Address{} &&
+                 out.recipient == proof.mini_node_address)  mini_amount       += out.amount;
+        else if (out.recipient == proof.player_address)     discoverer_amount += out.amount;
+        else                                                escrow_amount     += out.amount;
     }
 
     SongState new_state = db_.get_song_state(sess.content_hash);
@@ -1244,14 +1646,120 @@ std::pair<int, std::string> HttpServer::post_session_complete(
         {"status", "ok"},
         {"play_count", new_state.play_count},
         {"is_discoverer", is_discoverer},
+        {"cosigned", {
+            {"listener", proof.player_pubkey    != PubKey33{}},
+            {"relay",    proof.mini_node_pubkey != PubKey33{}},
+        }},
         {"tokens_minted", {
             {"artist_amount",     Ledger::format_balance(artist_amount)},
             {"node_amount",       Ledger::format_balance(node_amount)},
             {"discoverer_amount", Ledger::format_balance(discoverer_amount)},
+            {"seeder_amount",     Ledger::format_balance(seeder_amount)},
+            {"mini_node_amount",  Ledger::format_balance(mini_amount)},
+            {"escrow_amount",     Ledger::format_balance(escrow_amount)},
         }},
     };
     return {200, resp.dump()};
 }
+
+// ---- Stage 2: node-authoritative seeder / relay lane resolution ------
+//
+// Where the identities genuinely come from, and why none of it is client input:
+//
+//   1. stream.open (RatsApi) mints a 128-bit delivery_id and writes a `pd:`
+//      row recording the CANDIDATE seeder wallets — the wallets that both
+//      published this content_hash in their DB2 library AND hold a live
+//      wallet-SIGNED presence.hello binding — plus the requesting peer's
+//      wallet.
+//   2. The MINI-NODE, which is the party that physically forwards the audio
+//      frames, signs a relay.report naming the delivery_id, the bytes it
+//      relayed, its own wallet, and the peer_id it received the frames FROM.
+//      That report is verified against the reporting mini's own pubkey.
+//   3. The broker maps that peer_id back to a wallet through the same signed
+//      presence binding, and refuses it unless the wallet is in the candidate
+//      set from step 1 and is not the listener itself.
+//   4. The corroborated result lands in a `dr:` row, which is what this
+//      function reads.
+//
+// So the seeder lane names a wallet that (a) proved control of its key,
+// (b) advertised this exact song, and (c) was independently observed serving
+// the bytes by a third party that gains nothing from lying about it. The
+// listener never gets a say, which is the whole point.
+bool HttpServer::resolve_delivery_lanes(const PlaySession& sess,
+                                        Address& seeder_out, Address& mini_out,
+                                        PubKey33& mini_pk_out,
+                                        std::string& why) const {
+    seeder_out  = Address{};
+    mini_out    = Address{};
+    mini_pk_out = PubKey33{};
+    if (sess.delivery_id.empty()) { why = "no delivery_id bound to session"; return false; }
+
+    auto row_opt = db_.get("dr:" + sess.delivery_id);
+    if (!row_opt) row_opt = db_.get("pd:" + sess.delivery_id);
+    if (!row_opt) { why = "no delivery row (not brokered here, or expired)"; return false; }
+
+    json row = json::parse(std::string(row_opt->begin(), row_opt->end()),
+                           nullptr, /*allow_exceptions=*/false);
+    if (!row.is_object()) { why = "delivery row malformed"; return false; }
+
+    // The delivery must be for the song this session actually played.
+    if (row.value("ch", std::string()) != crypto::to_hex(sess.content_hash)) {
+        why = "delivery content_hash != session content_hash";
+        return false;
+    }
+    // ... and must have been opened BY this listener. `lw` is the wallet the
+    // broker resolved from the stream.open requester's signed presence
+    // binding, so this blocks one listener replaying another's delivery_id.
+    const std::string lw = row.value("lw", std::string());
+    if (!lw.empty()) {
+        Address listener{};
+        if (!crypto::parse_address(lw, listener) || listener != sess.player_address) {
+            why = "delivery was opened by a different wallet";
+            return false;
+        }
+    }
+
+    bool any = false;
+    Address a{};
+    // Seeder: only present once a mini-node's SIGNED relay.report named a peer
+    // the broker could resolve to a presence-bound holder of this song.
+    if (crypto::parse_address(row.value("sd", std::string()), a) && a != Address{}) {
+        if (a == sess.player_address) {
+            // Self-seed: compute_mint_outputs would skip this lane anyway, but
+            // zero it here too so the on-chain proof doesn't carry a claim the
+            // chain silently ignores.
+            std::cout << "[lanes] self-seed suppressed for "
+                      << crypto::to_checksum_hex(a) << "\n";
+        } else {
+            seeder_out = a;
+            any = true;
+        }
+    }
+    // Relay: the mini wallet AND pubkey, both taken from the same wallet-signed
+    // relay.report (the broker verified address_from_pubkey(pubkey) == wallet
+    // before storing either). The pubkey is needed here and not just at payout
+    // time because the v3 preimage covers it.
+    a = Address{};
+    if (crypto::parse_address(row.value("mw", std::string()), a) && a != Address{}) {
+        mini_out = a;
+        auto pk = crypto::from_hex(row.value("mpk", std::string()));
+        if (pk.size() == 33) {
+            PubKey33 candidate{};
+            std::copy(pk.begin(), pk.end(), candidate.begin());
+            if (crypto::address_from_pubkey(candidate) == a) mini_pk_out = candidate;
+        }
+        any = true;
+    }
+    if (!any) { why = "delivery row carries neither a corroborated seeder nor a relay"; return false; }
+    return true;
+}
+
+void HttpServer::consume_delivery_row(const std::string& delivery_id_hex) {
+    db_.del("dr:" + delivery_id_hex);
+    db_.del("pd:" + delivery_id_hex);
+}
+
+
 
 // ---- Wallet routes --------------------------------------------------
 

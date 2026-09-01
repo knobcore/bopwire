@@ -226,10 +226,48 @@ struct DeliveryAccum {
     std::array<uint8_t, 16> delivery_id{};
     uint64_t                bytes   = 0;
     uint64_t                last_ms = 0;
+    // Stage 2 (seeder attestation): bytes forwarded per SENDING peer for this
+    // delivery. The serving player (the seeder) pushes the audio frames through
+    // us, so it is by a wide margin the top sender; the listener's own control
+    // frames are tiny. We report the top sender as the seeder, SIGNED, and the
+    // broker resolves it to a wallet through the wallet-signed presence
+    // binding. We are the only party that directly observes this, and we have
+    // no stake in the seeder lane — our own lane is separate — which is exactly
+    // why the seeder identity is asked of us and not of the listener.
+    std::unordered_map<std::string, uint64_t> by_sender;
+    std::pair<std::string, uint64_t> top_sender() const {
+        std::pair<std::string, uint64_t> best{std::string(), 0};
+        for (const auto& [pid, n] : by_sender)
+            if (n > best.second || (n == best.second && pid < best.first))
+                best = {pid, n};
+        return best;
+    }
 };
 constexpr uint64_t kDeliveryIdleMs = 5000;   // flush a delivery this idle
 std::mutex                                       g_delivery_mu;
 std::unordered_map<std::string, DeliveryAccum>   g_delivery_accum;
+
+// Stage 2: what we relayed for a delivery, retained AFTER the relay.report is
+// flushed so a later `proof.cosign` can be checked against our own observation.
+// Without this the mini-node would be a blind signing oracle: anybody could
+// hand it bytes and get a signature. Also records which session_id we already
+// co-signed for a delivery, so one relayed stream yields exactly one co-signed
+// play (retries with the same session_id stay idempotent).
+struct DeliveryDone {
+    uint64_t    bytes       = 0;
+    std::string seeder_pid;
+    uint64_t    flushed_ms  = 0;
+    std::string cosigned_session;   // 64-hex session_id, or empty
+};
+std::unordered_map<std::string, DeliveryDone>    g_delivery_done;
+// How long after the last relayed byte we will still co-sign a play proof for
+// a delivery. Generous next to a song length + the 30 s play gate, tight enough
+// that a captured delivery_id is not a standing signing capability.
+constexpr uint64_t kCosignMemoryMs = 15ULL * 60ULL * 1000ULL;
+// Minimum bytes we must actually have relayed before we are willing to attest
+// a play. Guards against a peer opening a delivery, pushing one frame through
+// us, and harvesting a relay-lane signature it did not earn.
+constexpr uint64_t kCosignMinBytes = 64ULL * 1024ULL;
 
 // Peers that responded to mini.hello are tracked here so we can replicate
 // every fresh route to them. The "from_mininode" loop guard in ingest_route
@@ -2289,6 +2327,137 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
         r << "{\"req_id\":\"" << req_id << "\",\"status\":\"ok\","
           << "\"body\":{\"role\":\"mini-node\",\"routes\":" << routes_n
           << ",\"peers\":" << g_peer_count.load() << "}}";
+    } else if (type == "proof.cosign") {
+        // ---- Stage 2: mini-node co-signs a PlayProof as the RELAY -----------
+        //
+        // The listener carries this over the relay hop it is already using:
+        //   1. session.complete returns the assembled, node-signed proof plus
+        //      the preimage digest.
+        //   2. The listener forwards the STRUCTURED proof fields here.
+        //   3. We REBUILD the preimage ourselves with PlayProof::sign_message()
+        //      and sign that. We never sign opaque bytes handed to us — the
+        //      PlayProof preimage shares its leading chain-id with other signed
+        //      tx types, so a blind-signing oracle here would be a way to have
+        //      the mini-node's wallet sign a transfer. Deriving the bytes from
+        //      typed fields makes it structurally impossible for what we sign
+        //      to be anything other than a play proof.
+        //   4. We refuse unless the proof names OUR wallet as the relay, and
+        //      unless we actually relayed a real stream for the delivery_id it
+        //      cites within the last kCosignMemoryMs.
+        //
+        // Request body:
+        //   { delivery_id: "<32hex>", sign_hash: "<64hex>",
+        //     proof: { session_id, content_hash, block_hash, artist_address,
+        //              player_address, serving_node_id, play_start_timestamp,
+        //              play_end_timestamp, total_duration_ms, heartbeat_count,
+        //              seeder_address, mini_node_address, serving_node_pubkey } }
+        // Reply body:
+        //   { mini_node_pubkey: "<66hex>", mini_node_signature: "<128hex>" }
+        const auto& inner = env.value("body", nlohmann::json::object());
+        const auto& pj    = inner.value("proof", nlohmann::json::object());
+        auto fail = [&](const char* why) {
+            std::ostringstream e;
+            e << "{\"req_id\":\"" << req_id << "\",\"status\":\"rejected\","
+              << "\"error\":\"" << why << "\"}";
+            return e.str();
+        };
+        std::string out;
+        do {
+            if (g_mini_priv.empty()) { out = fail("mini-node has no wallet"); break; }
+            // ---- rebuild the proof from typed fields --------------------
+            auto hx = [&](const char* k, size_t n, uint8_t* dst) {
+                auto v = mc::crypto::from_hex(pj.value(k, std::string()));
+                if (v.size() != n) return false;
+                std::memcpy(dst, v.data(), n);
+                return true;
+            };
+            mc::PlayProof pr;
+            pr.version = 3;
+            if (!hx("session_id",          32, pr.session_id.data())      ||
+                !hx("content_hash",        32, pr.content_hash.data())    ||
+                !hx("block_hash",          32, pr.block_hash.data())      ||
+                !hx("artist_address",      20, pr.artist_address.data())  ||
+                !hx("player_address",      20, pr.player_address.data())  ||
+                !hx("serving_node_id",     32, pr.serving_node_id.data()) ||
+                !hx("seeder_address",      20, pr.seeder_address.data())  ||
+                !hx("mini_node_address",   20, pr.mini_node_address.data()) ||
+                !hx("serving_node_pubkey", 33, pr.serving_node_pubkey.data()) ||
+                !hx("player_pubkey",       33, pr.player_pubkey.data())      ||
+                !hx("mini_node_pubkey",    33, pr.mini_node_pubkey.data())) {
+                out = fail("malformed proof fields"); break;
+            }
+            // player_pubkey and mini_node_pubkey ARE part of the v3 preimage —
+            // that is what stops a signature being grafted onto a proof naming
+            // somebody else — so every identity is already fixed by the time we
+            // are asked to sign. We check below that the one naming us is us.
+            pr.play_start_timestamp = pj.value("play_start_timestamp", (uint64_t)0);
+            pr.play_end_timestamp   = pj.value("play_end_timestamp",   (uint64_t)0);
+            pr.total_duration_ms    = pj.value("total_duration_ms",    (uint32_t)0);
+            pr.heartbeat_count      = (uint16_t)pj.value("heartbeat_count", (uint32_t)0);
+
+            // ---- it must name US as the relay ---------------------------
+            if (std::memcmp(pr.mini_node_address.data(),
+                            g_mini_addr20.data(), 20) != 0) {
+                out = fail("proof does not name this mini-node as the relay"); break;
+            }
+            if (g_mini_pub.size() != 33 ||
+                std::memcmp(pr.mini_node_pubkey.data(),
+                            g_mini_pub.data(), 33) != 0) {
+                out = fail("proof does not carry this mini-node's pubkey"); break;
+            }
+            // ---- and we must have actually relayed the cited delivery ----
+            const std::string did_hex = inner.value("delivery_id", std::string());
+            const std::string sid_hex = pj.value("session_id", std::string());
+            if (did_hex.size() != 32) { out = fail("bad delivery_id"); break; }
+            {
+                std::lock_guard<std::mutex> lk(g_delivery_mu);
+                auto it = g_delivery_done.find(did_hex);
+                uint64_t relayed = 0;
+                if (it != g_delivery_done.end()) relayed = it->second.bytes;
+                else {
+                    auto la = g_delivery_accum.find(did_hex);
+                    if (la != g_delivery_accum.end()) relayed = la->second.bytes;
+                }
+                if (relayed < kCosignMinBytes) {
+                    out = fail("no relayed stream on record for this delivery_id");
+                    break;
+                }
+                auto& d = g_delivery_done[did_hex];
+                if (d.flushed_ms == 0) d.flushed_ms = mono_ms();
+                if (d.bytes == 0) d.bytes = relayed;
+                // One relayed stream co-signs exactly ONE play. A retry for the
+                // same session is idempotent; a different session is refused.
+                if (!d.cosigned_session.empty() && d.cosigned_session != sid_hex) {
+                    out = fail("this delivery already co-signed a different session");
+                    break;
+                }
+                d.cosigned_session = sid_hex;
+            }
+            // ---- derive the preimage OURSELVES and sign it ---------------
+            auto preimage = pr.sign_message();
+            mc::Hash256 h = mc::crypto::sha256(preimage.data(), preimage.size());
+            // Cross-check against the digest the node published, purely as a
+            // mismatch DIAGNOSTIC — we sign `h`, never the client's value.
+            const std::string claimed = inner.value("sign_hash", std::string());
+            const std::string ours    = mc::crypto::to_hex(h);
+            if (!claimed.empty() && claimed != ours) {
+                out = fail("preimage mismatch: rebuilt digest != node sign_hash");
+                break;
+            }
+            mc::Sig64 sig = mc::crypto::sign_ecdsa(h, g_mini_priv);
+            std::ostringstream ok;
+            ok << "{\"req_id\":\"" << req_id << "\",\"status\":\"ok\",\"body\":{"
+               << "\"mini_node_pubkey\":\""
+               << mc::crypto::to_hex(g_mini_pub.data(), g_mini_pub.size()) << "\","
+               << "\"mini_node_signature\":\""
+               << mc::crypto::to_hex(sig.data(), sig.size()) << "\","
+               << "\"sign_hash\":\"" << ours << "\"}}";
+            out = ok.str();
+            if (!g_quiet)
+                push_event("proof-cosign", did_hex.substr(0, 12),
+                           "session " + sid_hex.substr(0, 12));
+        } while (false);
+        r << out;
     } else if (type == "ice.connect_request") {
         // Body: {target_pid, my_addr: "ip:port"}
         // Player asks us to invite full_node (target_pid) to hole-punch back
@@ -3045,6 +3214,11 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
             std::memcpy(a.delivery_id.data(), delivery_id, 16);
             a.bytes        += payload_size;
             a.last_ms       = mono_ms(); // (#8) idle-flush clock — monotonic
+            // Stage 2: attribute the bytes to the peer that SENT them, so the
+            // flushed report can name the seeder. Bounded by the handful of
+            // peers that can legitimately touch one delivery.
+            if (a.by_sender.size() < 32 || a.by_sender.count(sender_pid))
+                a.by_sender[sender_pid] += payload_size;
         }
     }
     cleanup();
@@ -3059,23 +3233,48 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
 // wallet), so the broker verifies recover(sig) == the wallet it knows.
 void flush_relay_report(const DeliveryAccum& a) {
     if (!g_client || g_mini_priv.empty()) return;
-    std::vector<uint8_t> msg;
-    static const char tag[] = "relay.report";
-    msg.insert(msg.end(), tag, tag + (sizeof(tag) - 1));        // 12 bytes, no NUL
-    msg.insert(msg.end(), a.delivery_id.begin(), a.delivery_id.end());  // 16
-    for (int i = 0; i < 8; ++i) msg.push_back(uint8_t(a.bytes >> (8 * i))); // u64 LE
-    msg.insert(msg.end(), g_mini_addr20.begin(), g_mini_addr20.end());  // 20
-    mc::Sig64 sig = mc::crypto::sign_data(msg.data(), msg.size(), g_mini_priv);
+    // Stage 2 preimage v2 — extends v1 with the SEEDER attestation:
+    //   "relay.report2" || delivery_id(16) || bytes_relayed(u64 LE)
+    //                  || mini_wallet(20) || seeder_bytes(u64 LE)
+    //                  || seeder_peer_id (ASCII, unterminated)
+    // The seeder name is INSIDE the signature — a relayed envelope passing
+    // through anyone else cannot rewrite who gets the seeder lane. Brokers
+    // still accept the v1 preimage from un-upgraded minis (no seeder claim).
+    // Both signatures are emitted, so upgrade order does not matter in either
+    // direction: an un-upgraded broker verifies `sig` (v1) and ignores the rest,
+    // an upgraded broker prefers `sig2` when a seeder is attested and falls back
+    // to `sig`. Neither end can be stranded by the other's rollout.
+    const auto seeder = a.top_sender();
+    auto build = [&](bool v2) {
+        std::vector<uint8_t> m;
+        const char* t = v2 ? "relay.report2" : "relay.report";
+        m.insert(m.end(), t, t + std::strlen(t));
+        m.insert(m.end(), a.delivery_id.begin(), a.delivery_id.end());       // 16
+        for (int i = 0; i < 8; ++i) m.push_back(uint8_t(a.bytes >> (8 * i))); // u64 LE
+        m.insert(m.end(), g_mini_addr20.begin(), g_mini_addr20.end());       // 20
+        if (v2) {
+            for (int i = 0; i < 8; ++i) m.push_back(uint8_t(seeder.second >> (8 * i)));
+            m.insert(m.end(), seeder.first.begin(), seeder.first.end());
+        }
+        return m;
+    };
+    auto msg  = build(false);
+    auto msg2 = build(true);
+    mc::Sig64 sig  = mc::crypto::sign_data(msg.data(),  msg.size(),  g_mini_priv);
+    mc::Sig64 sig2 = mc::crypto::sign_data(msg2.data(), msg2.size(), g_mini_priv);
     auto to_hex = [](const uint8_t* p, size_t n){
         static const char* hx = "0123456789abcdef"; std::string s; s.reserve(n*2);
         for (size_t i = 0; i < n; ++i) { s.push_back(hx[p[i]>>4]); s.push_back(hx[p[i]&0xF]); }
         return s; };
     nlohmann::json body = {
-        {"delivery_id",   to_hex(a.delivery_id.data(), 16)},
-        {"bytes_relayed", a.bytes},
-        {"mini_wallet",   g_wallet_address_hex},                    // EIP-55 string
-        {"mini_pubkey",   to_hex(g_mini_pub.data(), g_mini_pub.size())}, // 33-byte
-        {"sig",           to_hex(sig.data(), sig.size())},          // 64-byte compact
+        {"delivery_id",    to_hex(a.delivery_id.data(), 16)},
+        {"bytes_relayed",  a.bytes},
+        {"mini_wallet",    g_wallet_address_hex},                    // EIP-55 string
+        {"mini_pubkey",    to_hex(g_mini_pub.data(), g_mini_pub.size())}, // 33-byte
+        {"seeder_peer_id", seeder.first},
+        {"seeder_bytes",   seeder.second},
+        {"sig",            to_hex(sig.data(), sig.size())},   // v1 preimage
+        {"sig2",           to_hex(sig2.data(), sig2.size())}, // v2 preimage (+seeder)
     };
     nlohmann::json env = {
         {"req_id", new_relay_req_id()},
@@ -3196,9 +3395,22 @@ void reaper_loop() {
             std::vector<DeliveryAccum> ready;
             {
                 std::lock_guard<std::mutex> lk(g_delivery_mu);
+                // Stage 2: expire the post-flush cosign memory first.
+                for (auto it = g_delivery_done.begin(); it != g_delivery_done.end(); ) {
+                    if (it->second.flushed_ms + kCosignMemoryMs < now)
+                        it = g_delivery_done.erase(it);
+                    else ++it;
+                }
                 for (auto it = g_delivery_accum.begin();
                      it != g_delivery_accum.end(); ) {
                     if (it->second.last_ms + kDeliveryIdleMs < now) {
+                        // Stage 2: remember what we relayed for this delivery
+                        // so a later proof.cosign can be corroborated against
+                        // our own observation rather than taken on trust.
+                        auto& d = g_delivery_done[it->first];
+                        d.bytes      = it->second.bytes;
+                        d.seeder_pid = it->second.top_sender().first;
+                        d.flushed_ms = now;
                         ready.push_back(it->second);
                         it = g_delivery_accum.erase(it);
                     } else { ++it; }

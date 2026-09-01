@@ -298,7 +298,13 @@ private:
     // the mini's signed byte-report and the player's signed receipt against
     // that row; try_corroborate credits per min(relayed,received) byte once
     // all three legs agree, then retires the row (single-use ⇒ replay-proof).
-    std::string mint_delivery(const Hash256& content_hash);
+    /// `listener_peer_id` is the peer that opened the stream and
+    /// `candidate_peers` the live holders we are about to hand it; both are
+    /// resolved to wallets and recorded on the row so the seeder lane can
+    /// later only name a wallet that was genuinely eligible (Stage 2).
+    std::string mint_delivery(const Hash256& content_hash,
+                              const std::string& listener_peer_id,
+                              const std::vector<std::string>& candidate_peers);
     bool handle_relay_report(const nlohmann::json& body);
     bool handle_relay_receipt(const nlohmann::json& body);
     /// Caller MUST hold pd_mu_ (its only callers — handle_relay_report /

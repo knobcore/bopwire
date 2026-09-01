@@ -127,7 +127,8 @@ std::vector<MintOutput> compute_mint_outputs(const PlayProof& proof,
     return outputs;
 }
 
-bool check_play(const PlayProof& proof, const Database& db, std::string& error) {
+bool check_play(const PlayProof& proof, const Database& db,
+                uint32_t height, std::string& error) {
     // Session not already used on chain (replay/double-credit guard).
     if (db.is_session_used(proof.session_id)) {
         error = "session_id already used";
@@ -164,11 +165,39 @@ bool check_play(const PlayProof& proof, const Database& db, std::string& error) 
         return false;
     }
 
-    // Listener co-signature — the EARNER authorizes the mint, so a serving node
-    // can't fabricate a play (it lacks the player key). Verified whenever a
-    // player_pubkey is carried; becomes mandatory once clients sign (Stage 2).
     static const PubKey33 kZeroPubkey{};
-    if (std::memcmp(proof.player_pubkey.data(), kZeroPubkey.data(), 33) != 0) {
+    static const Address  kZeroAddr{};
+
+    // ---- Stage 2 co-signature gate (see COSIGN_ACTIVATION_HEIGHT) -----------
+    // Below the activation height this is EXACTLY the pre-Stage-2 rule
+    // ("verify if a pubkey is carried"), so every historical block — v1, v2,
+    // and the v3-with-zero-cosigs blocks currently on chain — re-validates
+    // byte-for-byte as it always did. At and above it, the presence of the
+    // co-signatures becomes mandatory. The governing invariant is:
+    //
+    //     NO LANE PAYS AN ADDRESS THAT DID NOT SIGN.
+    //
+    // node lane   -> node_signature        (always mandatory, checked above)
+    // listener    -> player_signature      (mandatory once activated)
+    // relay lane  -> mini_node_signature   (mandatory once activated, IFF the
+    //                proof actually claims a paid mini_node_address; a direct,
+    //                un-relayed play carries a zero relay lane, pays nobody for
+    //                it, and so needs no relay signature)
+    //
+    // The SEEDER lane has no signature slot in the v3 wire format, so it is
+    // instead established server-side and never from client input — see
+    // HttpServer::post_session_complete / RatsApi::resolve_delivery_lanes.
+    const bool cosign_active = (height >= COSIGN_ACTIVATION_HEIGHT);
+
+    // Listener co-signature — the EARNER authorizes the mint, so a serving node
+    // can't fabricate a play (it lacks the player key).
+    const bool has_player_pubkey =
+        std::memcmp(proof.player_pubkey.data(), kZeroPubkey.data(), 33) != 0;
+    if (cosign_active && !has_player_pubkey) {
+        error = "listener co-signature required";
+        return false;
+    }
+    if (has_player_pubkey) {
         if (crypto::address_from_pubkey(proof.player_pubkey) != proof.player_address) {
             error = "player_pubkey does not match player_address";
             return false;
@@ -178,9 +207,16 @@ bool check_play(const PlayProof& proof, const Database& db, std::string& error) 
             return false;
         }
     }
-    // Mini-node co-signature — the RELAY attests it carried the stream. Every
-    // earning play travels through a mini, so this is mandatory once minis sign.
-    if (std::memcmp(proof.mini_node_pubkey.data(), kZeroPubkey.data(), 33) != 0) {
+    // Mini-node co-signature — the RELAY attests it carried the stream.
+    const bool has_mini_pubkey =
+        std::memcmp(proof.mini_node_pubkey.data(), kZeroPubkey.data(), 33) != 0;
+    const bool claims_mini_lane =
+        std::memcmp(proof.mini_node_address.data(), kZeroAddr.data(), 20) != 0;
+    if (cosign_active && claims_mini_lane && !has_mini_pubkey) {
+        error = "mini-node co-signature required for a paid relay lane";
+        return false;
+    }
+    if (has_mini_pubkey) {
         if (crypto::address_from_pubkey(proof.mini_node_pubkey) != proof.mini_node_address) {
             error = "mini_node_pubkey does not match mini_node_address";
             return false;
@@ -219,8 +255,9 @@ bool recompute_mint(const PlayProof& proof, const Database& db,
     return true;
 }
 
-bool validate_mint(const MintTx& mint, const Database& db, std::string& error) {
-    if (!check_play(mint.proof, db, error)) return false;
+bool validate_mint(const MintTx& mint, const Database& db,
+                   uint32_t height, std::string& error) {
+    if (!check_play(mint.proof, db, height, error)) return false;
 
     // Forge gate: the declared outputs + burn MUST equal the recomputation from
     // committed state. A registered node can attest that a play happened, but it
