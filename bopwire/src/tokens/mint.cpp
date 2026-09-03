@@ -191,10 +191,35 @@ bool check_play(const PlayProof& proof, const Database& db,
 
     // Listener co-signature — the EARNER authorizes the mint, so a serving node
     // can't fabricate a play (it lacks the player key).
+    //
+    // Required only when the proof actually CLAIMS a listener lane, exactly as
+    // the relay rule below works. A web listener has no wallet of its own — the
+    // gateway plays on their behalf and player_address is zero — so that play
+    // pays the artist, the seeder and the relay but NOT a listener. Nobody is
+    // paid for the listener lane, so nobody needs to sign for it, and the
+    // invariant "no lane pays an address that did not sign" still holds
+    // exactly.
+    //
+    // This is what makes activation possible at all: requiring a listener
+    // signature unconditionally would permanently stop every web play from
+    // minting, since a browser listener has no key to sign with.
     const bool has_player_pubkey =
         std::memcmp(proof.player_pubkey.data(), kZeroPubkey.data(), 33) != 0;
-    if (cosign_active && !has_player_pubkey) {
+    const bool claims_player_lane =
+        std::memcmp(proof.player_address.data(), kZeroAddr.data(), 20) != 0;
+    if (cosign_active && claims_player_lane && !has_player_pubkey) {
         error = "listener co-signature required";
+        return false;
+    }
+    // A proof carrying a listener pubkey but no listener lane would be paying
+    // nobody while asserting an identity — reject it rather than let an
+    // unpaid-but-signed identity ride along. Gated on activation like every
+    // other Stage 2 rule: below the gate this file must stay byte-for-byte the
+    // pre-Stage-2 validator, so it cannot introduce a NEW rejection reason for
+    // history. (Vacuous on the current chain — no historical proof carries a
+    // listener pubkey at all — but the guarantee is what keeps it that way.)
+    if (cosign_active && has_player_pubkey && !claims_player_lane) {
+        error = "listener pubkey present but no listener lane claimed";
         return false;
     }
     if (has_player_pubkey) {
