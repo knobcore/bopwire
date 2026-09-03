@@ -84,6 +84,20 @@ public:
     // automatically every 15 minutes by the background thread).
     void publish_route_now();
 
+    // ---- Chain health gate ----------------------------------------------
+    // Returns an empty string when this node's chain matches the network,
+    // or a human-readable reason when it does not. Wired to
+    // Chain::chain_is_corrupt() by the node's main().
+    //
+    // A node whose history diverged must not advertise itself as a serving
+    // full node: that is exactly how one bad node ends up answering block
+    // and stats queries for every player and for bopwire.com. When the probe
+    // reports trouble, publish_route_now() withholds the route and prints the
+    // operator banner instead, every cycle, until the operator fixes it.
+    void set_chain_health_probe(std::function<std::string()> probe) {
+        chain_health_ = std::move(probe);
+    }
+
     // Wire a LoadMonitor whose current snapshot is added to every
     // outgoing routes record. Players use the published load_score +
     // is_busy + net_bps to pick the lightest full node.
@@ -104,6 +118,7 @@ public:
     }
 
 private:
+    std::function<std::string()> chain_health_;
     uint16_t       listen_port_;
     std::string    node_id_hex_;
     uint16_t       own_api_port_;
@@ -122,6 +137,7 @@ private:
     // Build the outgoing route message: a signed {route,pubkey,sig} envelope
     // when a key is wired, else the bare legacy route json.
     std::string build_route_message() const;
+
 
     // List of bootstrap mini-nodes (VPSes) we dial at startup and re-dial
     // from the watchdog whenever validated_peer_count() == 0. Populated

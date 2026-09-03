@@ -1,4 +1,5 @@
 #include "rats_link.h"
+#include "../core/chain.h"
 #include "../audio/fingerprint.h"  // base64_encode / base64_decode
 #include "../crypto/hash.h"        // to_hex / from_hex helpers
 #include "../crypto/signature.h"   // sign_data — signs published routes
@@ -200,6 +201,26 @@ std::string RatsLink::rats_peer_id() const {
 
 void RatsLink::publish_route_now() {
     if (!client_) return;
+
+    // Withhold the route while this node's chain disagrees with the network,
+    // and nag the operator on every cycle. Silently continuing to advertise
+    // is what let a divergent node serve the public explorer for weeks.
+    if (chain_health_) {
+        const std::string bad = chain_health_();
+        if (!bad.empty()) {
+            // Full banner on the first cycle so the operator gets the actual
+            // instructions; a rotating one-liner after that so the log stays
+            // readable while still being impossible to ignore.
+            static uint64_t nag_tick = 0;
+            if (nag_tick == 0) std::cout << mc::chain_corrupt_banner(bad);
+            else               std::cout << mc::chain_corrupt_nag(nag_tick) << "\n";
+            ++nag_tick;
+            std::cout << "[rats] route NOT published — not advertising a chain "
+                         "the network doesn't share\n";
+            return;
+        }
+    }
+
     const auto json = build_route_message();
 
     // Send directly to every validated peer instead of relying on the

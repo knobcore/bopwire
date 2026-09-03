@@ -803,6 +803,13 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // reject forged/tampered routes. The private key stays on this node; the
     // mini only ever sees the public key carried in the route envelope.
     rats.set_signing_key(keypair.private_key, keypair.public_key);
+    // Chain-health gate: while this node's history disagrees with the
+    // network's baked-in digest, it withholds its route (so no player or
+    // gateway can be pointed at it) and nags the operator every cycle.
+    rats.set_chain_health_probe([&chain]() -> std::string {
+        return chain.chain_is_corrupt() ? chain.chain_corrupt_detail()
+                                        : std::string();
+    });
     mc::api::RatsApi rats_api(api, chain, candidates, network, db, cfg, keypair);
     // DeepAuditor (#4) at cmd_start scope, declared AFTER rats_api so it
     // destructs (stop()+join the worker) BEFORE rats_api — the worker's

@@ -58,17 +58,91 @@ static constexpr uint64_t MAX_SUBMIT_SKEW_MS = 5'000;
 // the attacker, they can't forge a chain that re-uses our checkpoint hash
 // without already having the matching block. Update on every audited
 // release; older checkpoints can stay in the list (they all have to pass).
+// Operator-facing nags for a node whose chain does not match the network.
+//
+// This failure is otherwise completely invisible: the node keeps running,
+// keeps answering queries, and looks perfectly healthy while handing players
+// and bopwire.com a chain literally nobody else on earth has. So it gets to
+// be loud and obnoxious. It still has to say what is wrong and how to fix it
+// — snark that hides the instructions is just noise.
+inline std::string chain_corrupt_banner(const std::string& detail) {
+    return
+      "\n"
+      "  ================================================================\n"
+      "   YOUR BLOCKCHAIN IS ALL FUCKED UP\n"
+      "  ================================================================\n"
+      "   " + detail + "\n"
+      "\n"
+      "   Congratulations. Your node is running a chain that exists on\n"
+      "   exactly one computer in the universe: this one. Everybody else\n"
+      "   agreed on a different history. You are not a network. You are a\n"
+      "   guy with a database.\n"
+      "\n"
+      "   Every balance, play count and block this node reports is total\n"
+      "   horseshit. It will NOT be trusted by peers, and it will not be\n"
+      "   advertised to anyone, because shipping this to real users would\n"
+      "   be rude.\n"
+      "\n"
+      "   FIX IT, it takes two minutes:\n"
+      "     1. Grab the latest release (or build latest main yourself):\n"
+      "        https://github.com/knobcore/bopwire/releases/latest\n"
+      "     2. Delete this node's chain data directory.\n"
+      "     3. Start it again and let it sync like everyone else.\n"
+      "\n"
+      "   Until then this message is going to keep showing up, forever,\n"
+      "   every single cycle. Enjoy.\n"
+      "  ================================================================\n"
+      "\n";
+}
+
+// Rotating one-liner printed on each route-publish cycle once the chain has
+// been flagged. Rotating rather than fixed so it stays legible instead of
+// blurring into one repeated line the operator learns to scroll past.
+inline std::string chain_corrupt_nag(uint64_t tick) {
+    static const char* kNags[] = {
+        "[chain] still fucked. still not publishing a route. still your problem.",
+        "[chain] your chain is garbage and everyone can tell. update the damn node.",
+        "[chain] nope. history still doesn't match. go download the release already.",
+        "[chain] refusing to advertise this dumpster fire to real users. you're welcome.",
+        "[chain] this node is cosplaying as a blockchain. wipe the data dir.",
+        "[chain] hey champ, that chain is still bullshit. github.com/knobcore/bopwire/releases",
+        "[chain] not syncing, not serving, not trusted. fix it or turn it off.",
+        "[chain] I'll keep saying it until you listen: YOUR CHAIN IS FUCKED.",
+    };
+    return kNags[tick % (sizeof(kNags) / sizeof(kNags[0]))];
+}
+
 struct Checkpoint {
     uint32_t height;
     Hash256  hash;
 };
 inline std::vector<Checkpoint> hardcoded_checkpoints() {
-    // Empty for now — populate with (audited_height, audited_hash)
-    // values once mainnet has run long enough that we trust a height
-    // is irreversible. Until then sync still works (vacuously satisfies
-    // every checkpoint), but the eclipse defense is just the per-block
-    // validation + peer-diversity gate below.
-    return {};
+    // Populated from MC_CHECKPOINTS (block.h), which pins the audited
+    // production chain at height 1 and every 100 blocks thereafter.
+    //
+    // This list was EMPTY, which made checkpoint_ok() vacuously true and
+    // turned all three enforcement sites — connect_block (live accept and
+    // sync), reorg_to_branch, and the replay/rebuild path — into no-ops.
+    // A syncing node would therefore accept any self-consistent branch a
+    // peer fed it, adopt it, and go on to serve it. That is how a node
+    // ended up on a private 622-block chain and started answering public
+    // explorer queries for bopwire.com.
+    //
+    // With the list populated, a divergent branch is rejected at the first
+    // checkpoint height it crosses, during sync, before any of it is
+    // committed. Regenerate on every audited release; old entries stay
+    // (they all have to pass).
+    std::vector<Checkpoint> out;
+    out.reserve(std::size(MC_CHECKPOINTS));
+    for (const auto& c : MC_CHECKPOINTS) {
+        Checkpoint cp{};
+        cp.height = c.height;
+        const auto raw = crypto::from_hex(c.hash_hex);
+        if (raw.size() != 32) continue;              // malformed literal — skip
+        std::memcpy(cp.hash.data(), raw.data(), 32);
+        out.push_back(cp);
+    }
+    return out;
 }
 
 // Founder lock. There is no genesis block: the chain starts empty and the
@@ -145,6 +219,28 @@ public:
 
     // Initialize from database; rebuilds derived state if necessary.
     bool init();
+
+    // ---- Whole-chain integrity (MC_CHAIN_DIGEST) -------------------------
+    // Recomputes sha256 over every block hash from 1..MC_CHAIN_DIGEST_HEIGHT
+    // and compares it to the value baked into block.h. Any divergence at any
+    // height changes the digest, so this is a single yes/no answer to "is my
+    // copy of the history the real one". Run at init(); cheap and bounded —
+    // it stops at the pinned height, it does not grow with the chain.
+    //
+    // A node BELOW the pinned height is still syncing and is not judged.
+    bool verify_chain_digest(std::string& detail) const;
+
+    // Returns true unless `height` is a checkpoint AND `hash` differs from
+    // the pinned value. A height with no checkpoint always passes. This is
+    // the eclipse defense: even if every peer we see is the attacker, they
+    // can't reproduce an audited hash without holding the real block.
+    bool checkpoint_ok(uint32_t height, const Hash256& hash) const;
+
+    // True when verify_chain_digest() failed at init(): this node is holding a
+    // chain that is not the network's. Callers use it to refuse to serve and
+    // to nag the operator (see chain_corrupt_banner()).
+    bool chain_is_corrupt() const { return chain_corrupt_; }
+    const std::string& chain_corrupt_detail() const { return chain_corrupt_detail_; }
 
     // Merge operator-supplied checkpoints (from config.json) on top of
     // the baked-in hardcoded_checkpoints(). A config entry at a height
@@ -357,6 +453,9 @@ private:
     // at construction, extended via add_config_checkpoints(). Keyed by
     // height so checkpoint_ok() is an O(log n) lookup. Empty today (no
     // audited mainnet height yet) → the gate is a no-op until populated.
+    bool        chain_corrupt_ = false;
+    std::string chain_corrupt_detail_;
+
     std::map<uint32_t, Hash256> checkpoints_;
     // M2: a CheckpointTx stages its pin here during apply_transactions and it is
     // merged into checkpoints_ ONLY after the block's batch commits — so a block
@@ -364,11 +463,6 @@ private:
     // that makes block acceptance restart-dependent. Cleared per block.
     std::map<uint32_t, Hash256> pending_checkpoints_;
 
-    // Returns true unless `height` is a checkpoint AND `hash` differs from
-    // the pinned value. A height with no checkpoint always passes. This is
-    // the eclipse defense: even if every peer we see is the attacker, they
-    // can't reproduce an audited hash without holding the real block.
-    bool checkpoint_ok(uint32_t height, const Hash256& hash) const;
 
     // Votes recorded earlier in the *current* block but not yet
     // flushed to leveldb. We consult both this set and the persistent

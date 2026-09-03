@@ -115,6 +115,34 @@ uint64_t count_plays(const Block& block) {
 }
 } // namespace
 
+bool Chain::verify_chain_digest(std::string& detail) const {
+    if (tip_.height < MC_CHAIN_DIGEST_HEIGHT) {
+        detail = "still syncing (height " + std::to_string(tip_.height) +
+                 " < pinned " + std::to_string(MC_CHAIN_DIGEST_HEIGHT) + ")";
+        return true;   // not yet judgeable — not a failure
+    }
+    std::vector<uint8_t> acc;
+    acc.reserve(static_cast<size_t>(MC_CHAIN_DIGEST_HEIGHT) * 32);
+    for (uint32_t h = 1; h <= MC_CHAIN_DIGEST_HEIGHT; ++h) {
+        auto bh = get_block_hash(h);
+        if (!bh) {
+            detail = "missing block at height " + std::to_string(h);
+            return false;
+        }
+        acc.insert(acc.end(), bh->begin(), bh->end());
+    }
+    const std::string got = crypto::to_hex(crypto::sha256(acc.data(), acc.size()));
+    if (got != MC_CHAIN_DIGEST) {
+        detail = "history digest mismatch at height " +
+                 std::to_string(MC_CHAIN_DIGEST_HEIGHT) + " (expected " +
+                 std::string(MC_CHAIN_DIGEST).substr(0, 16) + "..., got " +
+                 got.substr(0, 16) + "...)";
+        return false;
+    }
+    detail = "verified 1.." + std::to_string(MC_CHAIN_DIGEST_HEIGHT);
+    return true;
+}
+
 bool Chain::init() {
     if (!load_tip()) return false;
     // Self-heal an interrupted reorg/rebuild. The sr:dirty marker is set before
@@ -133,6 +161,18 @@ bool Chain::init() {
     // and after a rebuild (which re-derives pp: itself, but the marker keeps
     // the scan from repeating).
     ensure_play_index();
+
+    // Whole-chain integrity gate. A node whose history diverges from the
+    // network's must find out HERE, at startup, instead of silently serving
+    // it to players and the website for weeks.
+    {
+        std::string detail;
+        if (!verify_chain_digest(detail)) {
+            chain_corrupt_        = true;
+            chain_corrupt_detail_ = detail;
+            std::cerr << chain_corrupt_banner(detail);
+        }
+    }
     return true;
 }
 
