@@ -1,4 +1,6 @@
 #include "chain.h"
+
+#include <cstdlib>
 #include "../consensus/slashing.h"    // EquivocationProof / FingerprintForgeryProof
 #include "../audio/fingerprint.h"     // chromaprint similarity on replay
 #include "../tokens/ledger.h"
@@ -1651,6 +1653,43 @@ bool Chain::validate_block(const Block& block, std::string& error) const {
     if (block.header.prev_hash != tip_.hash) {
         error = "prev_hash mismatch";
         return false;
+    }
+    // ---- Chain identity anchor (MC_GENESIS_ANCHOR) -----------------------
+    // An empty database has tip_ = {} — height 0, all-zero hash — so a block
+    // carrying prev_hash = 0 passed the check above and became "block 1" of a
+    // BRAND NEW chain. A fresh node that registered a local song therefore
+    // forked the network at genesis instead of syncing it, then advertised
+    // itself as a full node and served its private chain to players and the
+    // website. That is not hypothetical: a node doing exactly this (block 1 =
+    // a song, zero transactions, no founder tx) was found answering live
+    // explorer queries for bopwire.com.
+    //
+    // Binding height 1 to a known hash closes it. The only block 1 any node
+    // will ever accept is the canonical one, which it must obtain by SYNCING.
+    // A forked block 1 cannot be produced or accepted, so the fork can never
+    // be created in the first place.
+    //
+    // Creating a genuinely new chain is the bootstrap program's job and is
+    // gated behind BOPWIRE_ALLOW_NEW_CHAIN, which no node sets. After a
+    // clean-slate fork, bump MC_GENESIS_ANCHOR to the new block 1.
+    if (tip_.height == 0) {
+        // Read the env each call rather than caching in a function-local
+        // static: a static latches the value at whichever call happens first
+        // in the process, which silently ignores the variable in any embedder
+        // that sets it after startup (and made this untestable in-process).
+        // validate_block already hashes and serializes the block, so one
+        // getenv is not measurable.
+        if (std::getenv("BOPWIRE_ALLOW_NEW_CHAIN") == nullptr) {
+            const std::string h = crypto::to_hex(block.hash());
+            if (h != MC_GENESIS_ANCHOR) {
+                error = "block 1 does not match the chain anchor (expected "
+                        + std::string(MC_GENESIS_ANCHOR).substr(0, 16)
+                        + "..., got " + h.substr(0, 16)
+                        + "...) — this node must sync the canonical chain, "
+                          "not start its own";
+                return false;
+            }
+        }
     }
     // Reject duplicate songs. Only meaningful for song-bearing blocks;
     // heartbeats carry zero hashes by construction. Uses the SHARED

@@ -58,6 +58,32 @@ static constexpr uint32_t MAX_TXS_PER_SENDER_PER_BLOCK = 256;     // producer fa
 // preimage and ours doesn't match any of theirs.
 static constexpr uint32_t MC_CHAIN_ID        = 19780;   // bumped with the v4 clean-slate fork (P4)
 
+// ---- Chain identity anchor ------------------------------------------
+//
+// MC_CHAIN_ID binds transaction SIGNATURES, but nothing bound chain
+// IDENTITY at the peering layer: a node holding a completely different
+// chain could join, advertise itself as a full node, and be picked to
+// answer "what does the blockchain contain" for players and the website.
+// That is not hypothetical — a node serving a 622-block pre-clean-slate
+// chain (divergent from OUR block 1 onward) was found answering live
+// explorer queries for bopwire.com.
+//
+// The anchor is the hash of block MC_ANCHOR_HEIGHT on the canonical chain.
+// It is the cheapest unforgeable-in-practice identity a peer can be asked
+// to prove: a node on a different chain simply does not have this block.
+// Peers that cannot produce it are refused entry to the routing table.
+//
+// Height 1, not 0: this chain has no block at height 0 (genesis is
+// implicit; get_block_hash(0) returns nothing), so block 1 is the first
+// real anchor available.
+//
+// !! BUMP THIS WITH MC_CHAIN_ID ON ANY CLEAN-SLATE FORK !! Leaving a stale
+// anchor after a wipe would eject every honest node and admit every old
+// one — exactly backwards.
+static constexpr uint32_t MC_ANCHOR_HEIGHT = 1;
+static constexpr const char* MC_GENESIS_ANCHOR =
+    "a3bdd4224ccfabe146ac5a8bd8028bd409abeb2fe9cdfd5f00c346948ff157ba";
+
 // ---- Basic types -----------------------------------------------------
 
 using Hash256  = std::array<uint8_t, 32>;
