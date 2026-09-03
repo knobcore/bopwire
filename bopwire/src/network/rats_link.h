@@ -98,6 +98,14 @@ public:
         chain_health_ = std::move(probe);
     }
 
+    // Supplies this node's block hash at MC_CHAIN_DIGEST_HEIGHT (hex), or an
+    // empty string if it hasn't synced that far yet. Published in the signed
+    // route record so a mini-node can drop a route from a node that is on a
+    // different chain WITHOUT having to challenge it over RPC first.
+    void set_anchor_provider(std::function<std::string()> p) {
+        anchor_provider_ = std::move(p);
+    }
+
     // Wire a LoadMonitor whose current snapshot is added to every
     // outgoing routes record. Players use the published load_score +
     // is_busy + net_bps to pick the lightest full node.
@@ -119,6 +127,7 @@ public:
 
 private:
     std::function<std::string()> chain_health_;
+    std::function<std::string()> anchor_provider_;
     uint16_t       listen_port_;
     std::string    node_id_hex_;
     uint16_t       own_api_port_;

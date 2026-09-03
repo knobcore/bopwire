@@ -810,6 +810,12 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         return chain.chain_is_corrupt() ? chain.chain_corrupt_detail()
                                         : std::string();
     });
+    // Publish our hash at the pinned anchor height so mini-nodes can drop a
+    // route from a node on a different chain without challenging it first.
+    rats.set_anchor_provider([&chain]() -> std::string {
+        auto h = chain.get_block_hash(mc::MC_CHAIN_DIGEST_HEIGHT);
+        return h ? mc::crypto::to_hex(*h) : std::string();
+    });
     mc::api::RatsApi rats_api(api, chain, candidates, network, db, cfg, keypair);
     // DeepAuditor (#4) at cmd_start scope, declared AFTER rats_api so it
     // destructs (stop()+join the worker) BEFORE rats_api — the worker's

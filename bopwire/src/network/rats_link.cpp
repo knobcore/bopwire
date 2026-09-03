@@ -165,8 +165,16 @@ std::string RatsLink::build_route_json() const {
        << "\"load_score\":"        << load.load_score << ","
        << "\"cpu_load\":"          << load.cpu_load   << ","
        << "\"net_bps\":"           << load.net_bytes_per_sec << ","
-       << "\"is_busy\":"           << (load.is_busy ? "true" : "false") << ","
-       << "\"ts\":"                << ts            << "}";
+       << "\"is_busy\":"           << (load.is_busy ? "true" : "false") << ",";
+    // Chain identity proof: our hash at the pinned anchor height. A peer on a
+    // different chain publishes a different value (or none, if it never got
+    // that far) and can be dropped by the mini-node on sight.
+    {
+        const std::string anchor = anchor_provider_ ? anchor_provider_() : std::string();
+        ss << "\"anchor_height\":" << mc::MC_CHAIN_DIGEST_HEIGHT << ","
+           << "\"anchor\":\""      << anchor << "\",";
+    }
+    ss << "\"ts\":"                << ts            << "}";
     return ss.str();
 }
 

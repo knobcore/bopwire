@@ -726,7 +726,9 @@ add_executable(bopwire-web-gateway
 target_compile_features(bopwire-web-gateway PRIVATE cxx_std_17)
 target_include_directories(bopwire-web-gateway PRIVATE
   ${CMAKE_SOURCE_DIR}/deps/librats/src      # librats_c.h, json.hpp
-  ${CMAKE_SOURCE_DIR}/deps/cpp-httplib)      # httplib.h (header-only, plain HTTP)
+  ${CMAKE_SOURCE_DIR}/deps/cpp-httplib      # httplib.h (header-only, plain HTTP)
+  ${CMAKE_SOURCE_DIR}/src)                   # core/chain_anchors.h (constants only,
+                                             # header-only — does NOT link bopwire)
 # Link the librats target directly. `rats` is what deps/librats defines.
 target_link_libraries(bopwire-web-gateway PRIVATE rats)
 if(WIN32)

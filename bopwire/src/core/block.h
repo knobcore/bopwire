@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "chain_anchors.h"   // MC_GENESIS_ANCHOR / MC_CHECKPOINTS / MC_CHAIN_DIGEST
+
 namespace mc {
 
 // ---- Constants -------------------------------------------------------
@@ -57,81 +59,6 @@ static constexpr uint32_t MAX_TXS_PER_SENDER_PER_BLOCK = 256;     // producer fa
 // BSC, Base, etc. because their chain_id contributes to the sign-hash
 // preimage and ours doesn't match any of theirs.
 static constexpr uint32_t MC_CHAIN_ID        = 19780;   // bumped with the v4 clean-slate fork (P4)
-
-// ---- Chain identity anchor ------------------------------------------
-//
-// MC_CHAIN_ID binds transaction SIGNATURES, but nothing bound chain
-// IDENTITY at the peering layer: a node holding a completely different
-// chain could join, advertise itself as a full node, and be picked to
-// answer "what does the blockchain contain" for players and the website.
-// That is not hypothetical — a node serving a 622-block pre-clean-slate
-// chain (divergent from OUR block 1 onward) was found answering live
-// explorer queries for bopwire.com.
-//
-// The anchor is the hash of block MC_ANCHOR_HEIGHT on the canonical chain.
-// It is the cheapest unforgeable-in-practice identity a peer can be asked
-// to prove: a node on a different chain simply does not have this block.
-// Peers that cannot produce it are refused entry to the routing table.
-//
-// Height 1, not 0: this chain has no block at height 0 (genesis is
-// implicit; get_block_hash(0) returns nothing), so block 1 is the first
-// real anchor available.
-//
-// !! BUMP THIS WITH MC_CHAIN_ID ON ANY CLEAN-SLATE FORK !! Leaving a stale
-// anchor after a wipe would eject every honest node and admit every old
-// one — exactly backwards.
-static constexpr uint32_t MC_ANCHOR_HEIGHT = 1;
-static constexpr const char* MC_GENESIS_ANCHOR =
-    "a3bdd4224ccfabe146ac5a8bd8028bd409abeb2fe9cdfd5f00c346948ff157ba";
-
-// ---- Whole-chain anchoring (checkpoints + cumulative digest) ---------
-//
-// The genesis anchor above stops a fresh node forking at block 1. It does
-// NOT protect the rest of the chain: a peer could still feed a syncing
-// node a long divergent branch from any later height, and that node would
-// accept it, serve it, and become another dead node advertising a chain
-// nobody else has.
-//
-// Two complementary anchors close that:
-//
-//   MC_CHECKPOINTS  — height -> block hash, enforced on EVERY accepted
-//       block (live connect, sync, and branch/reorg adoption). A block
-//       landing on a checkpoint height must hash to the pinned value, so
-//       a divergent branch is rejected at the first checkpoint it crosses
-//       instead of being absorbed. Also caps reorg depth: no branch that
-//       contradicts a checkpoint can ever be adopted, however heavy.
-//
-//   MC_CHAIN_DIGEST — sha256 over EVERY block hash from 1 to
-//       MC_CHAIN_DIGEST_HEIGHT, concatenated in height order. One value
-//       committing to the entire history: any difference in any block at
-//       any height changes it. Verified on startup so a node with a
-//       corrupted or divergent database finds out immediately rather than
-//       silently serving it to players and the website.
-//
-// !! REGENERATE ALL OF THIS WITH MC_CHAIN_ID ON ANY CLEAN-SLATE FORK !!
-struct ChainCheckpoint {
-    uint32_t    height;
-    const char* hash_hex;
-};
-
-// 11 checkpoints, interval 100, chain height 920
-static constexpr ChainCheckpoint MC_CHECKPOINTS[] = {
-    {      1, "a3bdd4224ccfabe146ac5a8bd8028bd409abeb2fe9cdfd5f00c346948ff157ba" },
-    {    100, "6066b697fa7c22e0772af34b5e8edb87f32650b51587865af1a5218686613590" },
-    {    200, "d7bccc77976db555d07fccbde659cc0ffabb34a4e7eafdf56fcc01416e93cb94" },
-    {    300, "a0582d8e0edf55162f813a939a3b044bfa4885816f03b5507938eefae24bc7d8" },
-    {    400, "850bda29d51ed86788c49eba13faffb3a782400643a5330145b21d0f735a0df2" },
-    {    500, "f1a0d3e144a86ec6661cdb0c7bde112a9c1bef9c8b3913b7ff7ea350f01eec85" },
-    {    600, "608c315b60078ff364959ef6116ec64224470c74ac1e30c253dc52a3f84b08b4" },
-    {    700, "eb9174640329718e750ee41e0c434399f298a75085fcd29d4d24d2c8a1de15f3" },
-    {    800, "2a4e838d8a21cd2493e28c0111be6358133cef5b82c5653e38fbb97f4f5c893d" },
-    {    900, "bf3f9713a0d0427508680e997246546d6b9f9d65c3236b2c635a056b0e6beecc" },
-    {    920, "16a56824e93d32160b4f4f25ba1975ca065fc79f6de50a0603fe397ce3b99219" },
-};
-
-static constexpr uint32_t MC_CHAIN_DIGEST_HEIGHT = 920;
-static constexpr const char* MC_CHAIN_DIGEST =
-    "31a737c5f28c105306c62fc6faebc523fa49f8f9d40652c01e1126687ec049cd";
 
 // ---- Basic types -----------------------------------------------------
 

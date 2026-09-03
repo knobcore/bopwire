@@ -46,6 +46,13 @@ struct FullNode {
     std::string public_address;
     std::string reachability;   // "direct" | "relay" | "unknown"
     double      load_score = 1.0;
+    // Chain identity (see chain_anchors.h). UNKNOWN until challenged; a node
+    // is only eligible to answer chain queries once it has PROVEN it holds
+    // the canonical block at a pinned height. Selection ignores everything
+    // that is not VERIFIED — a node advertising a low load is not evidence
+    // that it is on our chain, and load was the ONLY criterion before.
+    enum class ChainState { Unknown, Verified, Rejected };
+    ChainState  chain = ChainState::Unknown;
 };
 
 // In-flight RPC awaiting its reply (keyed by req_id).
@@ -135,6 +142,10 @@ private:
     void dial(const std::string& address);
     void refresh_minis();           // mininodes.list → grow/dial the mesh
     void refresh_routes();          // routes.get → full-node list
+    // Challenge one peer to produce the canonical block at a pinned height
+    // and compare it against chain_anchors.h. Cached per peer_id so a node
+    // is challenged once, not on every query.
+    FullNode::ChainState verify_node_chain(const std::string& peer_id);
     void mesh_loop();
 
     const std::string boot_host_;
@@ -145,6 +156,10 @@ private:
 
     std::atomic<uint32_t> req_seq_{1};
     std::atomic<uint32_t> stream_seq_{1};
+
+    // peer_id -> last verification verdict.
+    std::mutex chain_state_mu_;
+    std::unordered_map<std::string, FullNode::ChainState> chain_state_;
 
     std::mutex pending_mu_;
     std::unordered_map<std::string, std::shared_ptr<Pending>> pending_;

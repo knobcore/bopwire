@@ -1,5 +1,6 @@
 // rats_link.cpp — see rats_link.h.
 #include "rats_link.h"
+#include "core/chain_anchors.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -236,6 +237,60 @@ void RatsLink::refresh_minis() {
     for (const auto& a : to_dial) dial(a);
 }
 
+
+// Challenge a peer to prove it is on OUR chain.
+//
+// It must return the block at a pinned height whose hash matches the value
+// baked into chain_anchors.h. A node on a different chain simply does not
+// have that block and cannot fabricate the hash without it. This is the
+// check whose absence let a node holding a private 622-block chain answer
+// public explorer queries for bopwire.com: selection used to consider only
+// self-reported load, which is a number the peer makes up about itself.
+FullNode::ChainState RatsLink::verify_node_chain(const std::string& peer_id) {
+    {
+        std::lock_guard<std::mutex> lk(chain_state_mu_);
+        auto it = chain_state_.find(peer_id);
+        if (it != chain_state_.end() && it->second != FullNode::ChainState::Unknown)
+            return it->second;
+    }
+
+    const auto& cp = mc::mc_newest_checkpoint();
+    FullNode::ChainState verdict = FullNode::ChainState::Unknown;
+    try {
+        json r = rpc_via_relay(peer_id, "blocks.get",
+                               json{{"height", cp.height}}, 12000);
+        const json body = (r.is_object() && r.contains("body") && r["body"].is_object())
+                          ? r["body"] : json::object();
+        std::string got = body.value("hash", std::string());
+        if (got.empty() && body.contains("block") && body["block"].is_object())
+            got = body["block"].value("hash", std::string());
+        if (got.empty()) {
+            // No usable answer: stay Unknown so a transient RPC failure does
+            // not permanently blacklist an honest node. It is still not
+            // eligible until it answers.
+            std::fprintf(stderr, "[link] chain check %s: no block at pinned height %u\n",
+                         peer_id.substr(0, 12).c_str(), cp.height);
+        } else if (got == cp.hash_hex) {
+            verdict = FullNode::ChainState::Verified;
+        } else {
+            verdict = FullNode::ChainState::Rejected;
+            std::fprintf(stderr,
+                "[link] REJECTED %s — different chain at height %u "
+                "(expected %.16s..., got %.16s...). Not routing queries to it.\n",
+                peer_id.substr(0, 12).c_str(), cp.height, cp.hash_hex, got.c_str());
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[link] chain check %s: %s\n",
+                     peer_id.substr(0, 12).c_str(), e.what());
+    }
+
+    if (verdict != FullNode::ChainState::Unknown) {
+        std::lock_guard<std::mutex> lk(chain_state_mu_);
+        chain_state_[peer_id] = verdict;
+    }
+    return verdict;
+}
+
 void RatsLink::refresh_routes() {
     std::vector<FullNode> out;
     try {
@@ -252,6 +307,10 @@ void RatsLink::refresh_routes() {
         std::fprintf(stderr, "[link] routes.get: %s\n", e.what());
         return;   // keep last good list
     }
+    // Challenge any node we have not judged yet. Done outside routes_mu_
+    // because it makes blocking RPCs.
+    for (auto& fn : out) fn.chain = verify_node_chain(fn.peer_id);
+
     std::lock_guard<std::mutex> lk(routes_mu_);
     full_nodes_.swap(out);
 }
@@ -273,9 +332,16 @@ std::vector<FullNode> RatsLink::full_nodes() {
 
 std::string RatsLink::pick_full_node() {
     std::lock_guard<std::mutex> lk(routes_mu_);
+    // Lightest node THAT HAS PROVEN IT IS ON OUR CHAIN. Load breaks ties
+    // among honest nodes; it is not evidence of anything on its own, and
+    // using it alone is what put a foreign chain on the public website.
+    // If nothing is verified we return empty and the caller surfaces
+    // "no_node" — serving nothing beats serving a chain that isn't ours.
     const FullNode* best = nullptr;
-    for (const auto& fn : full_nodes_)
+    for (const auto& fn : full_nodes_) {
+        if (fn.chain != FullNode::ChainState::Verified) continue;
         if (!best || fn.load_score < best->load_score) best = &fn;
+    }
     return best ? best->peer_id : std::string();
 }
 

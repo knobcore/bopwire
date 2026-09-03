@@ -14,6 +14,7 @@
 // librats (deps/librats) compiled with a QUIC backend, so consume its C
 // bindings header instead.
 #include "librats_c.h"
+#include "../src/core/chain_anchors.h"
 #include "../src/net/load_monitor.h"
 #include "../src/crypto/keys.h"
 #include "../src/crypto/hash.h"       // from_hex / to_hex for chat sig verify
@@ -329,6 +330,22 @@ constexpr size_t   kRouteGossipSeenCap = 8192;             // prune above this
 // default off so a mixed fleet keeps working during rollout. Verification
 // needs only the public key carried in the route — no private key on the VPS.
 bool g_require_signed_routes = false;
+// Chain-identity enforcement for routes (see chain_anchors.h).
+//
+// A route now carries the publisher's block hash at MC_CHAIN_DIGEST_HEIGHT.
+// A MISMATCH is always fatal — that node is demonstrably on another chain and
+// must never be handed to a player. A MISSING anchor means an old binary that
+// predates the field; that is tolerated only while g_allow_legacy_routes is
+// on, which exists purely for the rollout window.
+//
+// ROLLOUT ORDER MATTERS: update the full nodes FIRST, then turn this off.
+// Flipping it on a mesh whose full nodes are still old drops every route and
+// takes the network dark.
+bool g_allow_legacy_routes = true;
+// The block hash a healthy peer must report at MC_CHAIN_DIGEST_HEIGHT. This is
+// the newest CHECKPOINT's hash — not MC_CHAIN_DIGEST, which is the digest over
+// every block hash and is a different value entirely.
+static const char* const kExpectedAnchor = mc::mc_newest_checkpoint().hash_hex;
 // Replay window for signed routes (their `ts` is unix seconds). Republish is
 // every ~15 min, so 30 min tolerates one missed cycle; 5 min covers skew.
 constexpr uint64_t kRouteMaxAgeSec       = 30 * 60;
@@ -1018,6 +1035,29 @@ void ingest_route(const std::string& body, const char* peer_id) {
     if (e.rats_peer_id.empty() && peer_id) e.rats_peer_id = peer_id;
 
     if (e.node_id.empty()) return;
+
+    // ---- Chain identity gate -------------------------------------------
+    // Refuse to carry a route for a node that is not on our chain. Without
+    // this a node holding a private chain stayed in g_routes and was handed
+    // to players and to the web gateway as an authoritative full node.
+    {
+        const std::string anchor = json_get_string(inner, "anchor");
+        if (anchor.empty()) {
+            if (!g_allow_legacy_routes) {
+                std::cout << "[routes] DROP no-anchor route node="
+                          << e.node_id.substr(0, 12)
+                          << " (old build — tell them to update)\n";
+                return;
+            }
+        } else if (anchor != std::string(kExpectedAnchor)) {
+            std::cout << "[routes] DROP WRONG-CHAIN route node="
+                      << e.node_id.substr(0, 12)
+                      << " anchor=" << anchor.substr(0, 16)
+                      << "... expected " << std::string(kExpectedAnchor).substr(0, 16)
+                      << "... — that node is on a different chain\n";
+            return;
+        }
+    }
 
     // Replay guard for signed routes: reject stale / far-future timestamps so
     // a captured old envelope can't be re-injected. (`ts` is unix seconds.)
@@ -3747,6 +3787,10 @@ int main(int argc, char** argv) {
             g_mesh_fanout = std::atoi(argv[++i]);
         } else if (a == "--mininodes-list-max" && i + 1 < argc) {
             g_mininodes_list_max = std::atoi(argv[++i]);
+        } else if (a == "--strict-chain-routes") {
+            // Also drop routes with NO anchor (old builds). Turn this on only
+            // AFTER the full nodes are updated — see g_allow_legacy_routes.
+            g_allow_legacy_routes = false;
         } else if (a == "--require-signed-routes") {
             g_require_signed_routes = true;
         } else if (a == "--tui") {
@@ -3775,6 +3819,8 @@ int main(int argc, char** argv) {
                       << "                       (for thousands of minis; default off)\n"
                       << "  --mesh-fanout N      peers per gossip round when --sparse-mesh (default 16)\n"
                       << "  --mininodes-list-max N  cap mininodes.list to N sampled peers (default 64)\n"
+                      << "  --strict-chain-routes    also drop routes with no chain anchor\n"
+                      << "                           (old builds). Update full nodes FIRST.\n"
                       << "  --require-signed-routes  drop routes without a valid signature (default off)\n"
                       << "\n Wallet (the mini-node's only operator surface):\n"
                       << "  --tui                    run the password-protected wallet screen\n"
