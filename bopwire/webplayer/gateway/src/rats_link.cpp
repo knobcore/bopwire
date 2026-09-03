@@ -268,15 +268,18 @@ FullNode::ChainState RatsLink::verify_node_chain(const std::string& peer_id) {
             // No usable answer: stay Unknown so a transient RPC failure does
             // not permanently blacklist an honest node. It is still not
             // eligible until it answers.
-            std::fprintf(stderr, "[link] chain check %s: no block at pinned height %u\n",
-                         peer_id.substr(0, 12).c_str(), cp.height);
+            std::fprintf(stderr,
+                "[link] %s can't produce block %u. Either it's still syncing or "
+                "its \"blockchain\" is a personal art project. Not routing to it.\n",
+                peer_id.substr(0, 12).c_str(), cp.height);
         } else if (got == cp.hash_hex) {
             verdict = FullNode::ChainState::Verified;
         } else {
             verdict = FullNode::ChainState::Rejected;
             std::fprintf(stderr,
-                "[link] REJECTED %s — different chain at height %u "
-                "(expected %.16s..., got %.16s...). Not routing queries to it.\n",
+                "[link] REJECTED %s — WRONG CHAIN at height %u. real bopwire says "
+                "%.16s..., this clown says %.16s.... it can keep its numbers, "
+                "nobody's asking it anything.\n",
                 peer_id.substr(0, 12).c_str(), cp.height, cp.hash_hex, got.c_str());
         }
     } catch (const std::exception& e) {

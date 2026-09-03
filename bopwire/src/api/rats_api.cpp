@@ -199,6 +199,24 @@ void RatsApi::start(rats_client_t client) {
     for (unsigned i = 0; i < n_workers; ++i)
         rpc_workers_.emplace_back([this] { rpc_worker_loop_(); });
 
+    // Someone just refused to route to us because our chain doesn't match
+    // theirs. Print it where the operator will actually see it — std::cout,
+    // not librats logging, which the node disables outright.
+    rats_on_message(client_, MC_CHAIN_REJECT_TYPE,
+        [](void*, const char* peer, const char* data) {
+            std::string msg;
+            try {
+                auto j = nlohmann::json::parse(data ? data : "{}");
+                const auto& b = j.contains("body") ? j["body"] : j;
+                msg = b.value("msg", std::string());
+            } catch (...) {}
+            if (msg.empty())
+                msg = mc::mc_chain_reject_text("A peer refused this node's chain.");
+            std::cout << msg << "  (from peer "
+                      << (peer ? std::string(peer).substr(0, 12) : "?") << ")\n"
+                      << std::flush;
+        }, nullptr);
+
     rats_on_message(client_, MC_REQUEST_TYPE,
                     &RatsApi::on_request_cb, this);
     rats_on_message(client_, MC_MOD_TYPE,

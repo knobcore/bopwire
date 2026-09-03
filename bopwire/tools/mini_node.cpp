@@ -955,6 +955,8 @@ bool route_gossip_should_forward(const std::string& body) {
 // definition lives just below g_client — forward-declare it here.
 void enqueue_send_task(std::function<void()> task);
 void send_mini_hello(const std::string& peer_id);
+// Defined below, once g_client is in scope.
+void send_chain_rejection(const char* peer_id, const std::string& what);
 void replicate_routes_to_peer(const std::string& peer_id);
 void replicate_route_to_mininodes(const std::string& route_json,
                                   const std::string& source_peer_id);
@@ -970,6 +972,7 @@ void chat_refresh_global_mods_if_stale();
 
 // Re-test reachability if the last probe is older than this.
 constexpr uint64_t kProbeMinIntervalMs = 60'000;
+
 
 void ingest_route(const std::string& body, const char* peer_id) {
     // --- Route authentication (see route_verify / g_require_signed_routes).
@@ -1044,17 +1047,23 @@ void ingest_route(const std::string& body, const char* peer_id) {
         const std::string anchor = json_get_string(inner, "anchor");
         if (anchor.empty()) {
             if (!g_allow_legacy_routes) {
-                std::cout << "[routes] DROP no-anchor route node="
-                          << e.node_id.substr(0, 12)
-                          << " (old build — tell them to update)\n";
+                std::cout << "[routes] KICKED " << e.node_id.substr(0, 12)
+                          << " — won't say which chain it's on. Ancient build. "
+                             "Not my problem, not my routing table.\n";
+                send_chain_rejection(peer_id,
+                    "Your node never told us which chain it's on, because it's "
+                    "running a build old enough to predate the question.");
                 return;
             }
         } else if (anchor != std::string(kExpectedAnchor)) {
-            std::cout << "[routes] DROP WRONG-CHAIN route node="
-                      << e.node_id.substr(0, 12)
-                      << " anchor=" << anchor.substr(0, 16)
-                      << "... expected " << std::string(kExpectedAnchor).substr(0, 16)
-                      << "... — that node is on a different chain\n";
+            std::cout << "[routes] KICKED " << e.node_id.substr(0, 12)
+                      << " — WRONG CHAIN. it says " << anchor.substr(0, 16)
+                      << "..., the actual blockchain says "
+                      << std::string(kExpectedAnchor).substr(0, 16)
+                      << "... whatever that thing is, it isn't bopwire.\n";
+            send_chain_rejection(peer_id,
+                "Your node reported a different block than the rest of the "
+                "network at the same height. It is not on the bopwire chain.");
             return;
         }
     }
@@ -1306,6 +1315,25 @@ void sender_loop() {
 }
 
 // ---- Mini-node mesh helpers -----------------------------------------
+
+// Tell a peer, over the wire, exactly why we just refused it. Best-effort: if
+// their build has no handler for MC_CHAIN_REJECT_TYPE this lands in the void,
+// which is precisely the case for the stale builds that cause the problem —
+// see the reach limit documented in chain_anchors.h.
+void send_chain_rejection(const char* peer_id, const std::string& what) {
+    if (!g_client || !peer_id || !*peer_id) return;
+    nlohmann::json env = {
+        {"req_id", new_relay_req_id()},
+        {"type",   mc::MC_CHAIN_REJECT_TYPE},
+        {"body",   {{"msg",      mc::mc_chain_reject_text(what.c_str())},
+                    {"reason",   what},
+                    {"expected", std::string(kExpectedAnchor)},
+                    {"height",   mc::MC_CHAIN_DIGEST_HEIGHT},
+                    {"fix",      "https://github.com/knobcore/bopwire/releases/latest"}}},
+    };
+    rats_send_message(g_client, peer_id, mc::MC_CHAIN_REJECT_TYPE,
+                      env.dump().c_str());
+}
 
 void send_mini_hello(const std::string& peer_id) {
     if (!g_client || peer_id.empty()) return;

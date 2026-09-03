@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace mc {
 
@@ -1004,6 +1005,48 @@ static constexpr ChainCheckpoint MC_CHECKPOINTS[] = {
 static constexpr uint32_t MC_CHAIN_DIGEST_HEIGHT = 920;
 static constexpr const char* MC_CHAIN_DIGEST =
     "31a737c5f28c105306c62fc6faebc523fa49f8f9d40652c01e1126687ec049cd";
+
+// ---- Over-the-wire chain rejection ----------------------------------
+//
+// When a relay or gateway refuses a peer for being on another chain it sends
+// this message so the operator learns WHY instead of just silently ceasing to
+// be routed to. A node that receives it prints the payload's "msg" loudly.
+//
+// REACH LIMIT, be aware: this only lands on builds that register a handler for
+// it. A node old enough to have caused the problem in the first place has no
+// handler, logs "no handler" at DEBUG (suppressed — librats defaults to INFO),
+// and in the full node's case has called rats_set_logging_enabled(0) anyway.
+// So this does NOT rescue an already-stale node; it makes sure the NEXT one is
+// told the moment it misbehaves, rather than quietly vanishing from the mesh.
+static constexpr const char* MC_CHAIN_REJECT_TYPE = "bopwire.chain_reject";
+
+// Snark with the instructions still attached. `what` is the specific failure.
+inline std::string mc_chain_reject_text(const char* what) {
+    return
+      std::string("\n")
+      + "  ****************************************************************\n"
+      + "   HEY. YOUR NODE JUST GOT KICKED OFF THE NETWORK.\n"
+      + "  ****************************************************************\n"
+      + "   " + what + "\n"
+      + "\n"
+      + "   We asked your node to prove it has the same blockchain as\n"
+      + "   everyone else. It couldn't. So we're not sending you traffic,\n"
+      + "   we're not listing you for players, and nobody is going to see\n"
+      + "   a single thing your node says. You are talking to yourself.\n"
+      + "\n"
+      + "   This is almost certainly not your fault - older builds would\n"
+      + "   happily start their own private chain instead of syncing ours.\n"
+      + "   Yours did. Fixing it takes about two minutes:\n"
+      + "\n"
+      + "     1. Get the latest build:\n"
+      + "        https://github.com/knobcore/bopwire/releases/latest\n"
+      + "     2. Delete your node's chain data directory.\n"
+      + "     3. Start it back up and let it sync properly this time.\n"
+      + "\n"
+      + "   Do that and you're back in. Don't, and you get to keep running\n"
+      + "   the world's loneliest blockchain. Your call.\n"
+      + "  ****************************************************************\n";
+}
 
 // Convenience for the peering layer: the highest checkpoint, which is the
 // cheapest single height to challenge an unknown peer on.
